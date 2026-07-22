@@ -1,0 +1,62 @@
+# PLAT-06 — publish cambrian-agent-sdk to PyPI via Trusted Publishing (OIDC).
+#
+# No API tokens anywhere: the `pypi` environment is registered as a PyPI Trusted Publisher for
+# this repo + this workflow filename, and `id-token: write` lets the publish action mint a
+# short-lived OIDC token PyPI verifies. A push of a `v*` tag builds, checks, and publishes.
+#
+# One-time PyPI setup (a human with the PyPI account does this FIRST — it also reserves the
+# project name):
+#   PyPI → project `cambrian-agent-sdk` → Publishing → add a GitHub pending publisher:
+#     owner = cambrian-sh, repo = agent-sdk-python, workflow = publish.yml, environment = pypi
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}   # manual trigger (e.g. a TestPyPI dry run before the first real tag)
+
+jobs:
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          twine check dist/*
+      - name: Verify wheel ships _proto + py.typed, not tests
+        run: |
+          python - <<'PY'
+          import glob, zipfile, sys
+          whl = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(whl).namelist()
+          need = ["cambrian_agent_sdk/py.typed", "cambrian_agent_sdk/_proto/cambrian_pb2.py"]
+          bad = [n for n in names if "__pycache__" in n or n.endswith(".pyc") or "/tests/" in n]
+          missing = [n for n in need if n not in names]
+          if missing: sys.exit(f"wheel missing required files: {missing}")
+          if bad: sys.exit(f"wheel contains files it should not: {bad}")
+          print("wheel contents OK:", whl)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi          # must match the Trusted Publisher registration
+    permissions:
+      id-token: write          # OIDC — the ONLY credential; no PyPI token stored
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

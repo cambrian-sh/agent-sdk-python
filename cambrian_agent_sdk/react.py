@@ -331,7 +331,12 @@ def run_think(
     # ADR-0044: pass the task as the relevance query so the kernel serves only the
     # top-k task-relevant tools (the push) instead of the whole registry — a
     # task-sized menu, not ~15k tokens of every granted tool.
-    system_tools = _list_system_tools(agent, query=task.text)
+    # An agent may opt into the FULL granted tool menu (seed_tools_full=True) instead of the
+    # ADR-0044 task-relevant top-k. A domain agent (e.g. a customer-service session with a
+    # fixed MCP toolset) wants every domain tool visible every turn so it calls them directly
+    # rather than discovering them via find_tools — query="" ⇒ the kernel serves the full menu.
+    _seed_tool_query = "" if getattr(agent, "seed_tools_full", False) else task.text
+    system_tools = _list_system_tools(agent, query=_seed_tool_query)
     # ADR-0046: the loadable skill menu — agent-local skills (always present) first,
     # then task-relevant system skills (the push), with same-name system skills
     # shadowed by agent-local ones (structural prioritization, no central ranking).
