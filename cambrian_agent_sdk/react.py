@@ -79,6 +79,7 @@ _DEFAULT_MAX_INLINE_RESOLVES = 3
 def build_output_schema(
     agent, system_tools: Optional[List[Dict]] = None,
     system_skills: Optional[List[Dict]] = None,
+    allow_yield_subgoal: bool = True,
 ) -> str:
     """Describe the closed action menu + the agent's tools for the LLM (v2).
 
@@ -110,6 +111,14 @@ def build_output_schema(
     skill_lines = [f'  - {sk.get("name")}: {(sk.get("description") or "").strip()}'
                    for sk in system_skills or []]
     skills_block = "\n".join(skill_lines) if skill_lines else "  (no skills available)"
+    # yield_subgoal is only meaningful inside a coordinated plan; an opted-out agent
+    # (e.g. the chat front desk) delegates whole work via a tool instead, so we omit
+    # the action from its menu entirely rather than advertising a dead option.
+    yield_line = (
+        '- `{"action": "yield_subgoal", "intent": "<task>", "capability_hint": "<opt>"}` — delegate.\n'
+        '  Example: `{"action": "yield_subgoal", "intent": "summarise the risk factors section", "capability_hint": "summarisation"}`\n'
+        if allow_yield_subgoal else ""
+    )
     return (
         'You emit ONE JSON action per turn — {"action": "<name>", ...} — and are '
         "called again with each result. Prefer gathering evidence over guessing.\n"
@@ -141,8 +150,7 @@ def build_output_schema(
         "## Answer / delegation\n"
         '- `{"action": "final_answer", "answer": "<text>", "type": "text"}` — emit the answer.\n'
         '  Example: `{"action": "final_answer", "answer": "Q4 2024 revenue was $4.2B (verified via PDF p.5).", "type": "text"}`\n'
-        '- `{"action": "yield_subgoal", "intent": "<task>", "capability_hint": "<opt>"}` — delegate.\n'
-        '  Example: `{"action": "yield_subgoal", "intent": "summarise the risk factors section", "capability_hint": "summarisation"}`\n'
+        f"{yield_line}"
         "\n"
         "## Resolution actions (ADR-0048 residual)\n"
         "- `{\"action\": \"resolve_cid\", \"cid\": \"<cid>\", \"as\": \"offload\"|\"inline\"}` — fetch a previously-offloaded body for the next step.\n"
@@ -219,6 +227,8 @@ def run_think(
     constraints: Optional[List[str]] = None,
     result_type: Optional[str] = None,
     seed_recall: bool = True,
+    seed_system_tools: bool = True,
+    allow_yield_subgoal: bool = True,
     max_memory_queries: int = _DEFAULT_MAX_MEMORY_QUERIES,
     max_tool_rounds: int = _DEFAULT_MAX_TOOL_ROUNDS,
     max_tokens: int = 4096,  # #1: 1024 truncated substantive outputs (e.g. a tool_call
@@ -335,8 +345,12 @@ def run_think(
     # ADR-0044 task-relevant top-k. A domain agent (e.g. a customer-service session with a
     # fixed MCP toolset) wants every domain tool visible every turn so it calls them directly
     # rather than discovering them via find_tools — query="" ⇒ the kernel serves the full menu.
+    # seed_system_tools=False opts the agent OUT of kernel-owned system tools entirely: the
+    # menu then holds only the agent's in-process @tools (e.g. a chat front-desk whose only
+    # "tool" is delegate_to_planner + memory recall — it must never execute tasks itself,
+    # only hand them to the planner). find_tools is disabled too, so it cannot pull them back.
     _seed_tool_query = "" if getattr(agent, "seed_tools_full", False) else task.text
-    system_tools = _list_system_tools(agent, query=_seed_tool_query)
+    system_tools = _list_system_tools(agent, query=_seed_tool_query) if seed_system_tools else []
     # ADR-0046: the loadable skill menu — agent-local skills (always present) first,
     # then task-relevant system skills (the push), with same-name system skills
     # shadowed by agent-local ones (structural prioritization, no central ranking).
@@ -346,7 +360,8 @@ def run_think(
     # domain answer-format are fixed for the task). Compose it ONCE so it is identical
     # bytes every turn — a stable prefix a provider can cache — instead of rebuilding
     # ~25 lines of menu+rules each round.
-    action_protocol = _compose_action_protocol(agent, output_schema, system_tools, system_skills)
+    action_protocol = _compose_action_protocol(agent, output_schema, system_tools, system_skills,
+                                                allow_yield_subgoal=allow_yield_subgoal)
 
     round_no = 0
     while True:
@@ -584,6 +599,12 @@ def run_think(
             continue
 
         if kind == "find_tools":
+            # An agent that opted out of system tools (seed_system_tools=False) must not be
+            # able to pull them back in via discovery.
+            if not seed_system_tools:
+                wm.add_text("<note>Tools are not available to you. Either answer from what you "
+                            "have, or use delegate_to_planner to hand the task to the planner.</note>")
+                continue
             # ADR-0044 pull: the agent describes a capability need; the kernel
             # returns the matching tools, which we merge into the menu so the next
             # turn can tool_call one. The analogue of memory_query, for tools.
@@ -803,6 +824,19 @@ def run_think(
             # (Global RP) rather than scheduling it in-process. We just return the
             # yield — the YieldCoordinator (ADR-0037 D10) binds + dispatches it. No
             # in-agent scheduler; the loop stays single-action-per-turn.
+            # A subgoal is a sub-task WITHIN a plan, bound by a kernel YieldCoordinator
+            # (ADR-0037 D10) — only meaningful for an agent already running inside a
+            # coordinated plan. An agent that opted out (allow_yield_subgoal=False, e.g.
+            # the chat front desk, which is dispatched directly and has no coordinator)
+            # must not yield: it delegates whole work to the planner via its own tool,
+            # which creates a fresh top-level plan. Steer it there instead of returning
+            # a sentinel nobody binds.
+            if not allow_yield_subgoal:
+                wm.add_text("<note>yield_subgoal is not available to you — a subgoal only "
+                            "exists inside a plan. To hand real work off, tool_call your "
+                            "delegation tool (it asks the planner to create a plan), then "
+                            "report its result. Otherwise answer directly.</note>")
+                continue
             intent = (action.get("intent") or "").strip()
             if not intent:
                 wm.add_text("<note>yield_subgoal needs a non-empty intent describing the "
@@ -843,11 +877,13 @@ _PER_TURN_OUTPUT_CONTRACT = (
 
 
 def _compose_action_protocol(agent, domain_schema: str, system_tools: Optional[List[Dict]] = None,
-                             system_skills: Optional[List[Dict]] = None) -> str:
+                             system_skills: Optional[List[Dict]] = None,
+                             allow_yield_subgoal: bool = True) -> str:
     """The agent-loop action menu + behavioral rules (the <ActionProtocol> body),
     with the agent's domain final-answer format folded into the final_answer action
     so it is documented but not the recency-anchored closer (ADR-0048 D8)."""
-    base = build_output_schema(agent, system_tools, system_skills)
+    base = build_output_schema(agent, system_tools, system_skills,
+                               allow_yield_subgoal=allow_yield_subgoal)
     if domain_schema and domain_schema.strip():
         base += (
             "\n\nWhen you emit final_answer, the \"answer\" field MUST follow this format:\n"
@@ -1090,9 +1126,10 @@ def _schema_properties(schema_json):
 def _safe_recall(agent, query: str, session_token_id: str = ""):
     """Call the agent's memory.recall if present; degrade to empty on any failure.
 
-    ``session_token_id`` is forwarded so recall carries x-session-id and the kernel's
-    same-session step-record filter (ADR-0048 D1) can actually fire — without it D1
-    no-ops and the agent's own step output is recalled back into the same run."""
+    ``session_token_id`` (the per-step BudgetLease) is forwarded so recall carries the
+    lease header, the kernel can resolve it to this run's session, and the same-session
+    step-record filter (ADR-0048 D1) can actually fire — without it D1 no-ops and the
+    agent's own step output is recalled back into the same run."""
     memory = getattr(agent, "memory", None)
     if memory is None:
         return []

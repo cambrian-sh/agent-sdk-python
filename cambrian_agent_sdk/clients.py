@@ -29,6 +29,30 @@ class SelfDelegationError(Exception):
     """An agent attempted to delegate a task back to itself (recursion guard)."""
 
 
+def _lease_metadata(lease_id: str) -> list:
+    """gRPC identity headers for a call made under a per-step BudgetLease.
+
+    ``x-lease-id`` is the header a current kernel resolves. It looks the lease up in its
+    own registry and derives the task session SERVER-SIDE, so an agent never names a
+    session it was not dispatched under — the agent only ever presents the opaque
+    credential it was handed.
+
+    ``x-session-id`` is still sent, with the same value, for one release: an OLDER kernel
+    reads only that header, and a CURRENT kernel tries lease resolution on it before
+    falling back to treating it as a session ID. Sending both is therefore correct against
+    either side. It is deprecated and goes away once the floor kernel understands
+    ``x-lease-id``.
+
+    Historically this value was sent ONLY as ``x-session-id``, where the kernel read a
+    per-step lease as if it were a durable task session — the conflation that silently
+    disabled caller-scope narrowing, session-scoped node ownership, and the same-session
+    step-record filter.
+    """
+    if not lease_id:
+        return []
+    return [("x-lease-id", lease_id), ("x-session-id", lease_id)]
+
+
 def _is_invalid_argument(exc) -> bool:
     import grpc
 
@@ -48,17 +72,16 @@ class MemoryClient:
         """Retrieve from LTM. Results are already scope-filtered server-side; this
         request carries **no** scope params (D5/ADR-0034).
 
-        ``session_token_id`` is threaded as ``x-session-id`` so the kernel can apply
-        the same-session step-record filter (ADR-0048 D1): without it the server sees
-        an empty session and D1 silently no-ops, so the agent's OWN step output is
-        recalled straight back into the same run — the context feedback loop D1 exists
-        to break."""
+        ``session_token_id`` is the per-step BudgetLease, sent via
+        :func:`_lease_metadata`. The kernel resolves it to this run's task session and
+        applies the same-session step-record filter (ADR-0048 D1): without it the server
+        sees no session and D1 silently no-ops, so the agent's OWN step output is recalled
+        straight back into the same run — the context feedback loop D1 exists to break."""
         from ._proto import cambrian_pb2
 
         req = cambrian_pb2.MemoryRequest(query=query, top_k=top_k)
         md = self._identity_metadata()
-        if session_token_id:
-            md = md + [("x-session-id", session_token_id)]
+        md = md + _lease_metadata(session_token_id)
         resp = self._stub.QueryMemory(req, timeout=_secs(timeout_ms), metadata=md)
         return [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in resp.results]
 
@@ -72,8 +95,7 @@ class MemoryClient:
 
         req = cambrian_pb2.MemoryRequest(query=query, top_k=top_k)
         md = self._identity_metadata() + [("x-lane", "actions")]
-        if session_token_id:
-            md = md + [("x-session-id", session_token_id)]
+        md = md + _lease_metadata(session_token_id)
         resp = self._stub.QueryMemory(req, timeout=_secs(timeout_ms), metadata=md)
         return [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in resp.results]
 
@@ -89,8 +111,7 @@ class MemoryClient:
 
         req = cambrian_pb2.MemoryRequest(query=kind_id, top_k=1)
         md = self._identity_metadata() + [("x-lane", "entity")]
-        if session_token_id:
-            md = md + [("x-session-id", session_token_id)]
+        md = md + _lease_metadata(session_token_id)
         resp = self._stub.QueryMemory(req, timeout=_secs(timeout_ms), metadata=md)
         return [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in resp.results]
 
@@ -107,8 +128,7 @@ class MemoryClient:
 
         req = cambrian_pb2.MemoryRequest(query=query, top_k=top_k)
         md = self._identity_metadata() + [("x-lane", "precedents")]
-        if session_token_id:
-            md = md + [("x-session-id", session_token_id)]
+        md = md + _lease_metadata(session_token_id)
         resp = self._stub.QueryMemory(req, timeout=_secs(timeout_ms), metadata=md)
         return [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in resp.results]
 

@@ -54,6 +54,7 @@ from .base import Agent, CognitiveAgent, DeterministicAgent, DaemonAgent
 from .tools import tool, capability, ToolRegistry, ToolSpec
 from .react import ReActLoopError
 from .clients import (
+    _lease_metadata,
     ArtifactManager,
     ArtifactNotFound,
     InvalidTagError,
@@ -107,6 +108,22 @@ __all__ = [
 ]
 
 logger = logging.getLogger("cambrian.agent")
+
+# gRPC ASCII metadata values must be a single line of printable ASCII (0x20-0x7E).
+# A raw query used as a header — e.g. a multi-line user message, or one with non-ASCII
+# (Turkish, accents) — makes the whole call fail with "Illegal header value", which
+# surfaced as the chat agent silently returning an empty reply. Collapse whitespace
+# (incl. newlines/tabs) to single spaces, drop anything outside printable ASCII, and cap
+# the length so the retrieval/skill hint stays a valid header on any input.
+_MAX_HEADER_QUERY = 512
+
+def _header_safe(value: str) -> str:
+    """Make an arbitrary string safe to send as a gRPC ASCII metadata value."""
+    if not value:
+        return ""
+    cleaned = "".join(c if 0x20 <= ord(c) <= 0x7E else " " for c in value)
+    cleaned = " ".join(cleaned.split())  # collapse runs of whitespace, strip ends
+    return cleaned[:_MAX_HEADER_QUERY]
 
 def configure_logging(level: int = logging.INFO) -> None:
     """Install SlogHandler for Substrate-compatible structured JSON logs."""
@@ -189,6 +206,9 @@ class SubstrateClient:
         self._ensure()
         from ._proto import cambrian_pb2
         req = cambrian_pb2.GenerateStreamRequest(
+            # Phase 1: lease_id is the honest name; session_token_id is sent too so a
+            # kernel predating the field still authenticates the call. Same value.
+            lease_id=session_token_id,
             session_token_id=session_token_id,
             prompt=prompt,
             options=cambrian_pb2.GenerateOptions(
@@ -214,7 +234,7 @@ class SubstrateClient:
         self._ensure()
         from ._proto import cambrian_pb2
         req = cambrian_pb2.ContextNodeRequest(cid=cid)
-        md = [("x-session-id", session_token_id)] if session_token_id else None
+        md = _lease_metadata(session_token_id) or None
         resp = self._stub.GetContextNode(req, metadata=md)
         if not resp.data:
             return None
@@ -231,7 +251,7 @@ class SubstrateClient:
         from ._proto import cambrian_pb2
         payload = data.encode("utf-8") if isinstance(data, str) else bytes(data)
         req = cambrian_pb2.PutContextNodeRequest(data=payload, node_type="agent_offload")
-        md = [("x-session-id", session_token_id)] if session_token_id else None
+        md = _lease_metadata(session_token_id) or None
         try:
             resp = self._stub.PutContextNode(req, metadata=md)
             return resp.cid or None
@@ -272,6 +292,8 @@ class SubstrateClient:
         req = cambrian_pb2.ExecuteToolRequest(
             tool_name=tool_name,
             args_json=args_json or "{}",
+            # Phase 1: see generate() — both fields carry the same per-step lease.
+            lease_id=session_token_id,
             session_token_id=session_token_id,
             step_index=step_index,
         )
@@ -333,7 +355,7 @@ class SubstrateClient:
 
         md = [("x-agent-id", self._agent_id)] if self._agent_id else []
         if query:
-            md.append(("x-tool-query", query))
+            md.append(("x-tool-query", _header_safe(query)))
         if k > 0:
             md.append(("x-tool-k", str(k)))
         if names:
@@ -374,7 +396,7 @@ class SubstrateClient:
 
         md = [("x-agent-id", self._agent_id)] if self._agent_id else []
         if query:
-            md.append(("x-skill-query", query))
+            md.append(("x-skill-query", _header_safe(query)))
         if k > 0:
             md.append(("x-skill-k", str(k)))
         if names:

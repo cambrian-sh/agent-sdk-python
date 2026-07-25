@@ -19,6 +19,21 @@ class _FakeAgent:
         self.tools = _FakeRegistry()
 
 
+def test_yield_subgoal_advertised_by_default():
+    # A coordinated agent (default) may yield subgoals into its plan.
+    assert "yield_subgoal" in build_output_schema(_FakeAgent())
+
+
+def test_yield_subgoal_omitted_when_disabled():
+    # An opted-out agent (e.g. the chat front desk) delegates whole work via a tool
+    # instead; yield_subgoal must NOT appear in its menu — it would be a dead-end that
+    # returns an empty reply for a directly-dispatched worker with no coordinator.
+    schema = build_output_schema(_FakeAgent(), allow_yield_subgoal=False)
+    assert "yield_subgoal" not in schema
+    # The rest of the menu is intact.
+    assert "final_answer" in schema and "tool_call" in schema
+
+
 def test_action_menu_explains_each_action():
     schema = build_output_schema(_FakeAgent()).lower()
     # Each action is named AND described, not just listed.

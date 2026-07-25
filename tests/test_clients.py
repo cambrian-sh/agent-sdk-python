@@ -344,3 +344,60 @@ def test_execute_tool_error_non_empty():
     resp = sub.execute_tool(tool_name="blocked", args_json="{}")
     assert resp["error"] == "not allowed"
     assert resp["result_json"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 — lease/session identity split.
+#
+# The agent holds a per-step BudgetLease, never a task session ID. It presents the
+# lease on x-lease-id; the kernel resolves it to a session server-side. x-session-id
+# carries the same value for one release so a current SDK still works against an older
+# kernel that only reads that header.
+# ---------------------------------------------------------------------------
+
+def test_recall_sends_lease_header():
+    """The agent presents its lease as a CREDENTIAL on x-lease-id. The kernel resolves
+    it to the session it bound at dispatch, so the agent never names a session."""
+    stub = _FakeStub()
+    mem = MemoryClient(stub=stub, agent_id="analyst")
+
+    mem.recall("capital of france", session_token_id="sess-42")
+
+    md = dict(stub.calls["QueryMemory_metadata"] or [])
+    assert md.get("x-lease-id") == "sess-42", f"expected x-lease-id, got {md}"
+
+
+def test_recall_still_sends_legacy_session_header_for_old_kernels():
+    """Transition posture: both headers carry the lease, so a current SDK works against
+    an older kernel (reads x-session-id only) and a current kernel (resolves the lease
+    from either). Delete this once the floor kernel understands x-lease-id."""
+    stub = _FakeStub()
+    mem = MemoryClient(stub=stub, agent_id="analyst")
+
+    mem.recall("capital of france", session_token_id="sess-42")
+
+    md = dict(stub.calls["QueryMemory_metadata"] or [])
+    assert md.get("x-session-id") == md.get("x-lease-id") == "sess-42"
+
+
+def test_recall_omits_both_identity_headers_when_no_lease():
+    """No lease ⇒ neither header. An empty value must not be sent, or the kernel cannot
+    tell 'no session' from 'session with an empty ID'."""
+    stub = _FakeStub()
+    mem = MemoryClient(stub=stub, agent_id="analyst")
+
+    mem.recall("capital of france")
+
+    md = dict(stub.calls["QueryMemory_metadata"] or [])
+    assert "x-lease-id" not in md
+    assert "x-session-id" not in md
+
+
+def test_lease_metadata_helper_pairs_both_headers():
+    from cambrian_agent_sdk.clients import _lease_metadata
+
+    assert _lease_metadata("") == []
+    assert _lease_metadata("lease-1") == [
+        ("x-lease-id", "lease-1"),
+        ("x-session-id", "lease-1"),
+    ]
