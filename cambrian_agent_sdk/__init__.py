@@ -51,6 +51,8 @@ from .types import (
     yield_subgoal,
 )
 from .base import Agent, CognitiveAgent, DeterministicAgent, DaemonAgent
+from .ingress import IngressAgent, PermanentDeliveryError
+from .http_chat_ingress import HTTPChatIngress
 from .tools import tool, capability, ToolRegistry, ToolSpec
 from .react import ReActLoopError
 from .clients import (
@@ -63,7 +65,7 @@ from .clients import (
     WorkingMemory,
 )
 from .helpers import extract_code_block, find_step_ref, build_prompt
-from .errors import BudgetExceededError
+from .errors import BudgetExceededError, ToolCallingUnsupported
 
 __all__ = [
     # ADR-0036 v2 trait-aligned surface
@@ -71,6 +73,9 @@ __all__ = [
     "CognitiveAgent",
     "DeterministicAgent",
     "DaemonAgent",
+    "IngressAgent",
+    "PermanentDeliveryError",
+    "HTTPChatIngress",
     "AgentTask",
     "AgentResult",
     "SubGoal",
@@ -90,6 +95,7 @@ __all__ = [
     "assemble_context",
     "build_prompt",
     "BudgetExceededError",
+    "ToolCallingUnsupported",
     "Capability",
     "ContextNode",
     "ContextRef",
@@ -221,6 +227,99 @@ class SubstrateClient:
         for chunk in self._stub.GenerateViaModelStream(req, timeout=timeout_secs, metadata=md):
             if chunk.text:
                 yield chunk.text
+
+    def generate_with_tools(
+        self,
+        session_token_id: str,
+        messages: list,
+        tools: list,
+        max_tokens: int = 1024,
+        temperature: float = 0.7,
+        timeout_ms: int = 0,
+    ):
+        """One generation turn with NATIVE tool-calling (ADR-0097 Phase B).
+
+        ``messages`` is the CONVERSATION so far — a list of
+        ``{"role", "content", "tool_calls"?, "tool_call_id"?}`` dicts. Native
+        tool-calling is conversational: an assistant turn carrying ``tool_calls`` and a
+        ``role="tool"`` turn carrying the result under the same id are what let the model
+        see that its own call happened. Sending a single user turn per round — the first
+        cut of this method — makes every round a fresh conversation.
+
+        Returns ``(text, tool_calls, stop_reason)`` where ``tool_calls`` is a list of
+        ``{"id", "name", "arguments"}`` dicts and ``stop_reason`` is the kernel's
+        normalized value — only ``"end_turn"`` means finished.
+
+        ``tools`` is a list of ``{"name", "description", "parameters"}`` dicts, where
+        ``parameters`` is a JSON Schema object (dict or pre-encoded string).
+
+        Raises ``ToolCallingUnsupported`` when this deployment or the model allocated
+        to the step cannot do native tool-calling. That is a CAPABILITY answer, not a
+        failure: the caller is expected to fall back to the prompt-encoded action
+        protocol, which is why it is a distinct exception rather than a generic error.
+        """
+        self._ensure()
+        import grpc
+        from ._proto import cambrian_pb2
+
+        pb_tools = []
+        for t in tools or []:
+            params = t.get("parameters", "")
+            if not isinstance(params, str):
+                params = json.dumps(params)
+            pb_tools.append(cambrian_pb2.ToolDefinitionProto(
+                name=t.get("name", ""),
+                description=t.get("description", "") or "",
+                parameters_json=params,
+            ))
+
+        pb_messages = []
+        for m in messages or []:
+            pb_calls = [
+                cambrian_pb2.ModelToolCallProto(
+                    id=c.get("id", ""),
+                    name=c.get("name", ""),
+                    # The provider's own argument string, forwarded unchanged: it
+                    # matches this against its record of the call it made.
+                    arguments_json=c.get("arguments", "") or "",
+                )
+                for c in (m.get("tool_calls") or [])
+            ]
+            pb_messages.append(cambrian_pb2.ModelMessageProto(
+                role=m.get("role", "user"),
+                content=m.get("content", "") or "",
+                tool_calls=pb_calls,
+                tool_call_id=m.get("tool_call_id", "") or "",
+            ))
+
+        req = cambrian_pb2.GenerateWithToolsRequest(
+            lease_id=session_token_id,
+            options=cambrian_pb2.GenerateOptions(
+                max_tokens=max_tokens,
+                temperature=temperature,
+            ),
+            tools=pb_tools,
+            messages=pb_messages,
+        )
+        timeout_secs = (timeout_ms / 1000.0) if timeout_ms > 0 else None
+        md = [("x-agent-id", self._agent_id)] if self._agent_id else []
+        try:
+            resp = self._stub.GenerateWithTools(req, timeout=timeout_secs, metadata=md)
+        except grpc.RpcError as exc:
+            code = exc.code()
+            # UNIMPLEMENTED: kernel predates this RPC. FAILED_PRECONDITION: the RPC
+            # exists but this step's model cannot do it. Both mean "use the fallback",
+            # and both must stay distinct from a real generation error so the loop
+            # does not silently degrade on an outage.
+            if code in (grpc.StatusCode.UNIMPLEMENTED, grpc.StatusCode.FAILED_PRECONDITION):
+                raise ToolCallingUnsupported(str(exc.details() or code)) from exc
+            raise
+
+        calls = [
+            {"id": tc.id, "name": tc.name, "arguments": tc.arguments_json}
+            for tc in resp.tool_calls
+        ]
+        return resp.text, calls, resp.stop_reason
 
     def get_context_node(self, cid: str, session_token_id: str = "") -> Optional["ContextNode"]:
         """Resolve a CID from the ContentStore. Drill-down for offloaded content.

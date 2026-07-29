@@ -5,6 +5,36 @@ The manual for the `cambrian-agent-sdk` Python package. It complements
 what's in the package: the trait taxonomy, the local-recurrent loop,
 the agent skill model, and the gRPC contract surface.
 
+## Ingress agents (ADR-0090)
+
+`cambrian_agent_sdk.IngressAgent` is the base class for an entry point into Cambrian —
+Telegram, a webhook receiver, a websocket listener, an inbound API. Chat is one payload type
+riding through one.
+
+It exists because neither other base class can express it: `DaemonAgent` produces signals but
+is never called (no delivery path), `CognitiveAgent` is called but produces none (no inbound
+path). `IngressAgent` does both — it serves the gRPC endpoint the kernel delivers to on the
+daemon's existing UDS socket, and runs the signal stream on a background thread. The server
+owns the process lifetime, so an ingress that can no longer poll can still deliver.
+
+Two methods, one per direction, and neither waits for the other:
+
+- `listen()` — your inbound loop; call `receive(external_id, text)` per message. Supervised,
+  so a dropped connection is restarted with backoff rather than ending the ingress.
+- `on_deliver(recipient, text, conversation_id)` — send one outbound message. No return value,
+  because nothing is correlated with it. Raise `PermanentDeliveryError` for something a retry
+  can never fix (blocked, deleted); raise anything else for something that might clear, which
+  the kernel treats as transient.
+
+**There is no way to declare your own surface and no way to choose a recipient.** The surface
+comes from the registration an operator made out of band; the recipient is resolved by the
+kernel from the conversation. A daemon is a black box, and a black box that asserts its own
+privilege level is not a security boundary (INV-5) — so the API simply cannot express it.
+
+Reference implementation: `example-agents/example_ingress_agent.py` (a polled file stands in
+for the network, so it runs with no credentials).
+
+
 ## Implementation Status
 
 | Area | Source | Status |

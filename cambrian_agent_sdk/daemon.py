@@ -81,9 +81,23 @@ def start_daemon(agent, substrate_addr: Optional[str] = None) -> None:
         logger.info("SIGTERM received — stopping daemon '%s'", agent.agent_id)
         shutdown["flag"] = True
 
-    signal.signal(signal.SIGTERM, _handle_sigterm)
-    if sys.platform != "win32":
-        signal.signal(signal.SIGHUP, _handle_sigterm)
+    # Signal handlers may only be installed from the main thread, and an ingress
+    # runs this loop on a background one (IngressAgent.serve keeps the main thread
+    # for the delivery server). Installing unconditionally raised ValueError there
+    # and killed the inbound half on startup while the outbound half kept serving —
+    # a half-dead ingress that accepts deliveries and never sends anything inbound.
+    #
+    # Off the main thread the process owns shutdown anyway: the server that holds
+    # the main thread stops, and this loop's own `_should_continue` falls away with
+    # the process. So skipping registration here loses nothing.
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+        if sys.platform != "win32":
+            signal.signal(signal.SIGHUP, _handle_sigterm)
+    else:
+        logger.debug(
+            "daemon '%s': not the main thread, skipping signal handlers", agent.agent_id
+        )
 
     def _should_continue():
         return not shutdown["flag"]

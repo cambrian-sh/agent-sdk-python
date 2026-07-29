@@ -33,3 +33,18 @@ class BudgetExceededError(Exception):
         super().__init__(reason)
         self.reason = reason
         self.estimated_cost = estimated_cost
+
+
+class ToolCallingUnsupported(Exception):
+    """Native tool-calling is not available for this call (ADR-0097 Phase B).
+
+    Raised by ``substrate.generate_with_tools`` when the kernel answers
+    ``UNIMPLEMENTED`` (a build predating the RPC) or ``FAILED_PRECONDITION`` (the RPC
+    exists, but the model allocated to this step cannot do tool-calling).
+
+    It is a CAPABILITY answer, not a failure. The ReAct loop catches it and falls back
+    to the prompt-encoded action protocol for the rest of the run. It is a distinct
+    exception precisely so that a real outage — a timeout, an auth error, a degraded
+    model — cannot be mistaken for "no tool support" and silently downgrade every
+    subsequent turn.
+    """

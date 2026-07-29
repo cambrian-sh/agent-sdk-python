@@ -109,3 +109,51 @@ def test_daemon_uses_signalstream_not_agentservice():
     # and the trait class has no task-responder surface
     assert not hasattr(DaemonAgent, "run")
     assert DaemonAgent.trait == "daemon"
+
+
+def test_start_daemon_off_main_thread_does_not_raise_on_signals():
+    """Regression: an ingress runs the daemon loop on a background thread.
+
+    `signal.signal` only works on the main thread, so installing handlers
+    unconditionally raised ValueError there and killed the inbound half on
+    startup while the outbound half kept serving — a half-dead ingress that
+    accepts deliveries and never sends anything inbound. That is why the SDK
+    ingresses were "built but not measured".
+    """
+    import threading
+
+    from cambrian_agent_sdk import daemon as daemon_mod
+
+    outcome = {}
+
+    def run():
+        try:
+            # Fails later on the gRPC dial, which is fine — we only care that it
+            # got PAST signal registration without raising ValueError.
+            daemon_mod.start_daemon(_StubAgent(), substrate_addr="127.0.0.1:1")
+        except ValueError as exc:  # the bug
+            outcome["err"] = f"ValueError: {exc}"
+        except Exception:  # noqa: BLE001 — anything else means signals were fine
+            outcome["ok"] = True
+        else:
+            outcome["ok"] = True
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=15)
+
+    assert "err" not in outcome, outcome["err"]
+
+
+class _StubAgent:
+    agent_id = "stub_ingress"
+
+    def __init__(self):
+        import queue
+
+        self._signal_queue = queue.Queue()
+        self.stream_id = ""
+        self.params = {}
+
+    def daemon_loop(self):
+        raise RuntimeError("stop")

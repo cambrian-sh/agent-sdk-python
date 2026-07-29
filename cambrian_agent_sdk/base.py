@@ -125,11 +125,27 @@ class CognitiveAgent(Agent):
         self,
         task: "AgentTask",
         *,
-        max_memory_queries: int = 3,
-        max_tool_rounds: int = 5,
+        max_memory_queries: int | None = None,
+        max_tool_rounds: int | None = None,
     ) -> "AgentResult":
-        """ReAct-style reason/retrieve/act loop (issue 0036-04)."""
-        from .react import run_think
+        """ReAct-style reason/retrieve/act loop (issue 0036-04).
+
+        The budgets default to None and are resolved from react.py rather than
+        restated here. They used to be literal 3/5 in this signature, which SHADOWED
+        react.py's constants — `think()` passed its own 5 on every call, so raising
+        `_DEFAULT_MAX_TOOL_ROUNDS` there had no effect on any agent that goes through
+        this method (i.e. all of them). One default, one place.
+        """
+        from .react import (
+            _DEFAULT_MAX_MEMORY_QUERIES,
+            _DEFAULT_MAX_TOOL_ROUNDS,
+            run_think,
+        )
+
+        if max_memory_queries is None:
+            max_memory_queries = _DEFAULT_MAX_MEMORY_QUERIES
+        if max_tool_rounds is None:
+            max_tool_rounds = _DEFAULT_MAX_TOOL_ROUNDS
 
         return run_think(
             self,

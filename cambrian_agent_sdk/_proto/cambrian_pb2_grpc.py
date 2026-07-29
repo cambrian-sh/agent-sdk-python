@@ -5,7 +5,7 @@ import warnings
 
 from . import cambrian_pb2 as cambrian__pb2
 
-GRPC_GENERATED_VERSION = '1.80.0'
+GRPC_GENERATED_VERSION = '1.81.1'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -25,7 +25,7 @@ if _version_not_supported:
     )
 
 
-class OrchestratorStub(object):
+class OrchestratorStub:
     """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
@@ -63,6 +63,11 @@ class OrchestratorStub(object):
                 '/cambrian.Orchestrator/GenerateViaModelStream',
                 request_serializer=cambrian__pb2.GenerateStreamRequest.SerializeToString,
                 response_deserializer=cambrian__pb2.GenerateChunk.FromString,
+                _registered_method=True)
+        self.GenerateWithTools = channel.unary_unary(
+                '/cambrian.Orchestrator/GenerateWithTools',
+                request_serializer=cambrian__pb2.GenerateWithToolsRequest.SerializeToString,
+                response_deserializer=cambrian__pb2.GenerateWithToolsResponse.FromString,
                 _registered_method=True)
         self.GetContextNode = channel.unary_unary(
                 '/cambrian.Orchestrator/GetContextNode',
@@ -146,7 +151,7 @@ class OrchestratorStub(object):
                 _registered_method=True)
 
 
-class OrchestratorServicer(object):
+class OrchestratorServicer:
     """Missing associated documentation comment in .proto file."""
 
     def Execute(self, request, context):
@@ -190,6 +195,21 @@ class OrchestratorServicer(object):
         """Managed LLM call: the Substrate acts as a metered proxy, forwarding chunks
         from the allocated TraitModel to the agent with per-chunk token accounting.
         ADR-0018.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GenerateWithTools(self, request, context):
+        """ADR-0097 Phase B: one managed generation turn WITH native tool-calling.
+
+        Unary, not streaming, deliberately. A tool call is only actionable once it is
+        complete — name plus a fully-formed argument object — so streaming it buys
+        nothing an agent can use and forces every client to reassemble partial calls.
+        Text-only generation keeps using GenerateViaModelStream, which still streams.
+
+        Callers must treat Unimplemented / FailedPrecondition as "this deployment has
+        no native tool support" and fall back to the prompt-encoded action protocol.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -359,6 +379,11 @@ def add_OrchestratorServicer_to_server(servicer, server):
                     request_deserializer=cambrian__pb2.GenerateStreamRequest.FromString,
                     response_serializer=cambrian__pb2.GenerateChunk.SerializeToString,
             ),
+            'GenerateWithTools': grpc.unary_unary_rpc_method_handler(
+                    servicer.GenerateWithTools,
+                    request_deserializer=cambrian__pb2.GenerateWithToolsRequest.FromString,
+                    response_serializer=cambrian__pb2.GenerateWithToolsResponse.SerializeToString,
+            ),
             'GetContextNode': grpc.unary_unary_rpc_method_handler(
                     servicer.GetContextNode,
                     request_deserializer=cambrian__pb2.ContextNodeRequest.FromString,
@@ -447,7 +472,7 @@ def add_OrchestratorServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class Orchestrator(object):
+class Orchestrator:
     """Missing associated documentation comment in .proto file."""
 
     @staticmethod
@@ -602,6 +627,33 @@ class Orchestrator(object):
             '/cambrian.Orchestrator/GenerateViaModelStream',
             cambrian__pb2.GenerateStreamRequest.SerializeToString,
             cambrian__pb2.GenerateChunk.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GenerateWithTools(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cambrian.Orchestrator/GenerateWithTools',
+            cambrian__pb2.GenerateWithToolsRequest.SerializeToString,
+            cambrian__pb2.GenerateWithToolsResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -1045,7 +1097,7 @@ class Orchestrator(object):
             _registered_method=True)
 
 
-class AgentServiceStub(object):
+class AgentServiceStub:
     """Service that agents register with, or that agents implement (AgentService)
     """
 
@@ -1072,7 +1124,7 @@ class AgentServiceStub(object):
                 _registered_method=True)
 
 
-class AgentServiceServicer(object):
+class AgentServiceServicer:
     """Service that agents register with, or that agents implement (AgentService)
     """
 
@@ -1120,7 +1172,7 @@ def add_AgentServiceServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class AgentService(object):
+class AgentService:
     """Service that agents register with, or that agents implement (AgentService)
     """
 

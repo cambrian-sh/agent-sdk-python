@@ -31,11 +31,14 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+import os
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 from .helpers import _esc, build_prompt
 from .recurrence import count_failed_duplicates, count_successful_duplicates
 from .reflection import DEFAULT_MAX_REFLECTION_TOKENS, build_reflection_prompt
+from .errors import ToolCallingUnsupported
 from .types import AgentResult, AgentTask, yield_subgoal
 from .working_memory import (
     Step,
@@ -44,6 +47,7 @@ from .working_memory import (
     action_text,
     memory_provenance_attrs,
     render_entry_xml,
+    _render_memory_results,
 )
 
 logger = logging.getLogger("cambrian.react")
@@ -54,7 +58,18 @@ class ReActLoopError(Exception):
 
 
 _DEFAULT_MAX_MEMORY_QUERIES = 3
-_DEFAULT_MAX_TOOL_ROUNDS = 5
+# Raised 5 -> 12 (2026-07-28). 5 was below the floor for ordinary multi-file work:
+# create a directory, write a source file, read it back, create an output directory,
+# write a derived file is already five calls, so a single step doing routine file work
+# died on the guard rather than on anything runaway. Measured on the repeat-task suite,
+# it was the difference between a task completing and a ReActLoopError.
+#
+# 12 is chosen to clear that floor with headroom while still bounding a genuine loop.
+# The budget is NOT the primary runaway defence and should not be tuned as if it were:
+# content-keyed success-dedup (recurrence_veto_depth) already catches the common spin,
+# where a model re-proposes an action that already succeeded. This cap is the backstop
+# for the case those miss.
+_DEFAULT_MAX_TOOL_ROUNDS = 12
 # ADR-0045: cap describe_tool fetches to avoid a describe loop.
 _DEFAULT_MAX_DESCRIBE_CALLS = 5
 # ADR-0046: cap use_skill loads per run.
@@ -62,10 +77,18 @@ _DEFAULT_MAX_SKILL_LOADS = 5
 # ADR-0044: default size of the task-relevant tool menu the kernel serves (the
 # push). The kernel ranks the granted tools against the task and returns this many;
 # the find_tools pull fetches more on demand, so this can stay small.
-_DEFAULT_TOOL_MENU_K = 3
+# The ADR-0044 seed size: how many task-relevant system tools are pushed into the menu
+# without the agent asking. 3 is a small guess, and a wrong guess is expensive —
+# measured 2026-07-28, a create-a-file suite was seeded `edit_file, read_file,
+# fast_edit_blocks` with no write_file, and the model spent its budget editing files that
+# did not exist. Overridable so the size can be measured as an arm rather than argued.
+_DEFAULT_TOOL_MENU_K = int(os.getenv("CAMBRIAN_TOOL_MENU_K", "3") or 3)
 # #2: how many consecutive token-limit truncations the loop re-prompts (steering
 # toward chunked authoring) before giving up gracefully rather than spinning.
 _MAX_TRUNCATION_RETRIES = 3
+# How many times a non-action response is re-prompted before it is accepted as the
+# answer. 1 = nudge once. See INFERRED_FINAL_ANSWER_NOTE for why this exists at all.
+_MAX_INFERRED_ANSWER_RETRIES = 1
 # ADR-0052: how many verbal reflections the loop will extract per run. Each costs one
 # small LLM call on a hard-veto; bounded so a thrashing run cannot reflect endlessly.
 _DEFAULT_MAX_REFLECTIONS = 3
@@ -76,10 +99,45 @@ _DEFAULT_MAX_REFLECTIONS = 3
 _DEFAULT_MAX_INLINE_RESOLVES = 3
 
 
+# The Tool-actions half of the menu, in its two encodings.
+#
+# Under native tool-calling the JSON tool_call action must NOT be advertised. Telling a
+# model to emit `{"action":"tool_call",...}` while ALSO attaching real tool schemas
+# gives it two ways to do one thing, and it takes the one that does nothing. Measured
+# 2026-07-28: with both present the suite scored 3/6 against 5/6 on the pure text path,
+# and every failure was a model describing the work instead of performing it.
+_JSON_TOOL_SECTION = (
+    "## Tool actions\n"
+    '- `{"action": "tool_call", "tool": "<name>", "args": {<json>}}` — invoke a granted tool.\n'
+    '  Example: `{"action": "tool_call", "tool": "web_search", "args": {"query": "Paris population 2024"}}`\n'
+    "- **cid handoff (ADR-0048 #1)**: for an arg value you already have a cid for\n"
+    "  (a recalled fact shows `[full content cid:…]`, OR a workspace block / tool\n"
+    '  result shows `offloaded_cid="…"` in the trajectory), pass `{"$cid": "<cid>"}`\n'
+    "  instead of pasting the whole content — the kernel resolves it. The tool\n"
+    "  sees the full body; you don't have to re-emit it. This is how you write\n"
+    "  large offloaded workspace content to a file in a single tool_call.\n"
+    '- `{"action": "find_tools", "need": "<capability>"}` — discover more tools (verb-first).\n'
+    '  Example: `{"action": "find_tools", "need": "search the web for a person"}`\n'
+    '- `{"action": "describe_tool", "tool": "<name>"}` — fetch the FULL arg schema.\n'
+    '  Example: `{"action": "describe_tool", "tool": "mcp:pdf-reader/read_pdf"}`\n'
+    "\n"
+)
+
+_NATIVE_TOOL_SECTION = """## Tools
+- Your tools are attached to this request directly. CALL them — do not describe
+  calling them, and do not emit a JSON tool_call action; there is no such action.
+- Use an action from the menu below ONLY when you are not calling a tool.
+- Describing what you are about to do is not doing it. If the task needs a tool,
+  call it now; if the task is finished, say so as a final answer.
+
+"""
+
+
 def build_output_schema(
     agent, system_tools: Optional[List[Dict]] = None,
     system_skills: Optional[List[Dict]] = None,
     allow_yield_subgoal: bool = True,
+    native_tools: bool = False,
 ) -> str:
     """Describe the closed action menu + the agent's tools for the LLM (v2).
 
@@ -127,20 +185,7 @@ def build_output_schema(
         '- `{"action": "memory_query", "query": "<text>"}` — retrieve from org long-term memory (knowledge base). Do this FIRST; ground claims in retrieved facts before answering from your own training.\n'
         '  Example: `{"action": "memory_query", "query": "Q4 2024 revenue"}`\n'
         "\n"
-        "## Tool actions\n"
-        '- `{"action": "tool_call", "tool": "<name>", "args": {<json>}}` — invoke a granted tool.\n'
-        '  Example: `{"action": "tool_call", "tool": "web_search", "args": {"query": "Paris population 2024"}}`\n'
-        "- **cid handoff (ADR-0048 #1)**: for an arg value you already have a cid for\n"
-        "  (a recalled fact shows `[full content cid:…]`, OR a workspace block / tool\n"
-        '  result shows `offloaded_cid="…"` in the trajectory), pass `{"$cid": "<cid>"}`\n'
-        "  instead of pasting the whole content — the kernel resolves it. The tool\n"
-        "  sees the full body; you don't have to re-emit it. This is how you write\n"
-        "  large offloaded workspace content to a file in a single tool_call.\n"
-        '- `{"action": "find_tools", "need": "<capability>"}` — discover more tools (verb-first).\n'
-        '  Example: `{"action": "find_tools", "need": "search the web for a person"}`\n'
-        '- `{"action": "describe_tool", "tool": "<name>"}` — fetch the FULL arg schema.\n'
-        '  Example: `{"action": "describe_tool", "tool": "mcp:pdf-reader/read_pdf"}`\n'
-        "\n"
+        + (_NATIVE_TOOL_SECTION if native_tools else _JSON_TOOL_SECTION) +
         "## Skill actions\n"
         '- `{"action": "use_skill", "skill": "<name>"}` — load a skill\'s steps + tools.\n'
         '  Example: `{"action": "use_skill", "skill": "codebase-investigation"}`\n'
@@ -172,11 +217,12 @@ def build_output_schema(
         "procedure) — never conclude a task is impossible or a tool 'missing' before "
         "trying find_tools.\n"
         "\n"
-        "## Tools (tool_call may name only these)\n"
-        f"{tools_block}\n"
-        "\n"
-        "## Skills (use_skill may name only these)\n"
-        f"{skills_block}"
+        + ("## Tools\n  (attached directly to this request - call them)\n"
+           if native_tools else
+           "## Tools (tool_call may name only these)\n" + tools_block + "\n")
+        + "\n"
+        + "## Skills (use_skill may name only these)\n"
+        + skills_block
     )
 
 
@@ -196,13 +242,303 @@ def _looks_like_truncated_action(text: str) -> bool:
     return '"action"' in text[brace : brace + 40]
 
 
+# Sent back when the model produces something that is not an action. Names both
+# legitimate continuations so the model does not read it as "you must call a tool".
+INFERRED_FINAL_ANSWER_NOTE = (
+    "<note>That response was not a valid action, so nothing was executed. If the task "
+    "still needs work, emit the next action. If the task is genuinely complete, emit "
+    '{"action": "final_answer", "answer": "..."} explicitly. Do not describe what you '
+    "are about to do — either do it, or declare the answer.</note>"
+)
+
+
+# OpenAI (and every gateway that mirrors it) constrains a function name to
+# ^[A-Za-z0-9_-]{1,64}$. Cambrian's kernel-owned tools are named
+# "mcp:filesystem/write_file" — colons and slashes — so offering them verbatim is
+# rejected with an opaque HTTP 400 ("Upstream request failed") that names nothing.
+# Measured 2026-07-28: "write_file" 200, "mcp:filesystem/write_file" 400,
+# "mcp_filesystem_write_file" 200.
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def sanitize_tool_name(name: str, taken: Dict[str, str]) -> str:
+    """Map a Cambrian tool name onto a provider-legal function name.
+
+    ``taken`` is the sanitized→original map built so far; it is BOTH the collision
+    check and the reverse map. Collisions are disambiguated deterministically, because
+    two runs of the same agent must offer the same names or a provider-side cache and
+    our own logs stop lining up.
+    """
+    candidate = name if _TOOL_NAME_RE.match(name) else re.sub(r"[^A-Za-z0-9_-]", "_", name)[:64]
+    if not candidate:
+        candidate = "tool"
+    if taken.get(candidate, name) != name:
+        base, i = candidate[:60], 2
+        while taken.get(f"{base}_{i}", name) != name:
+            i += 1
+        candidate = f"{base}_{i}"
+    return candidate
+
+
+def normalize_tool_parameters(params: Any) -> Dict[str, Any]:
+    """Coerce a tool's argument schema into one a provider will accept.
+
+    Cambrian's kernel-owned tool registry stores MCP schemas in a degenerate form —
+    `{"properties": {"content": {}, "path": {}}}` — with no top-level "type". That is
+    fine for the prompt-encoded menu, which only ever renders the property NAMES, and
+    it is rejected outright by a provider, which validates the schema.
+
+    Measured 2026-07-28 against the live endpoint, holding everything else constant:
+
+        {"properties": {...}}                    -> HTTP 400
+        {"type": "object", "properties": {...}}  -> 200, tool_calls
+
+    The 400 body says only "Upstream request failed" and names no field, so this is
+    worth stating precisely rather than leaving to be rediscovered.
+
+    Deliberately does NOT invent property types: an empty `{}` property means "any",
+    which is valid and which the provider accepts once the top-level type is present.
+    Guessing "string" would be a lie the provider then enforces.
+    """
+    if not isinstance(params, dict) or not params:
+        return {"type": "object", "properties": {}}
+    out = dict(params)
+    out.setdefault("type", "object")
+    if out.get("type") == "object":
+        out.setdefault("properties", {})
+    return out
+
+
+class _ConversationMirror:
+    """Wraps WorkingMemory so its writes ALSO land in the provider conversation.
+
+    Under native tool-calling the model's history is the message list, not the prompt —
+    the prompt is built once and never rebuilt. Everything the loop would otherwise
+    communicate by re-rendering working memory (nudges, ALREADY-DONE notes, discovery
+    results, memory-query results) has to become a real turn or the model never sees it.
+
+    A wrapper rather than ~30 edited call sites: the loop keeps writing to `wm` exactly
+    as it does on the text path, and one place decides what that means for the
+    conversation. Tool RESULTS are deliberately NOT mirrored here — they are appended as
+    proper `role="tool"` turns keyed by tool_call_id, and mirroring them as prose too
+    would tell the model the same thing twice in two formats.
+    """
+
+    _MIRRORED = ("add_text", "add_reflection")
+
+    def __init__(self, wm, conversation: List[Dict[str, Any]]):
+        self._wm = wm
+        self._conv = conversation
+        # A tool turn MUST immediately follow the assistant turn that requested it.
+        # Measured against the live endpoint, everything else held constant:
+        #   user, assistant(call), tool          -> 200
+        #   user, assistant(call), NOTE, tool    -> 400
+        #   user, assistant(call), tool, NOTE    -> 200
+        # The loop writes notes (recurrence vetoes, nudges, discovery results) between
+        # requesting a tool and executing it, so mirroring them immediately would land
+        # them in exactly that gap. They are held and flushed after the tool turn.
+        self._holding = False
+        self._held: List[Dict[str, Any]] = []
+
+    def hold(self) -> None:
+        """Stop appending directly: a tool call is awaiting its result turn."""
+        self._holding = True
+
+    def release(self) -> None:
+        """Tool turn is in place; flush anything written while holding."""
+        self._holding = False
+        if self._held:
+            self._conv.extend(self._held)
+            self._held.clear()
+
+    def _emit(self, message: Dict[str, Any]) -> None:
+        (self._held if self._holding else self._conv).append(message)
+
+    def __getattr__(self, name):
+        attr = getattr(self._wm, name)
+        if name not in self._MIRRORED:
+            return attr
+
+        def wrapped(content, *a, **kw):
+            result = attr(content, *a, **kw)
+            if isinstance(content, str) and content.strip():
+                self._emit({"role": "user", "content": content})
+            return result
+
+        return wrapped
+
+    def add_step(self, kind: str, pinned: bool = False, **fields):
+        """Memory-query steps carry retrieved facts the model must see; tool_call steps
+        are already represented by their tool turn."""
+        result = self._wm.add_step(kind, pinned=pinned, **fields)
+        if kind == "memory_query":
+            rendered = _render_memory_results(fields.get("results") or [])
+            self._emit({
+                "role": "user",
+                "content": ("<memory_query query=" + repr(fields.get("query")) + ">"
+                            + chr(10) + rendered + chr(10) + "</memory_query>"),
+            })
+        return result
+
+
+# Discovery actions, expressed as NATIVE tool definitions.
+#
+# D7.3 withdrew the JSON `tool_call` action under native tool-calling, correctly: two
+# ways to invoke one thing means the model picks the one that does nothing. But it also
+# withdrew find_tools and describe_tool, which are not invocation — they are how the
+# model widens a menu that is only ever a top-k GUESS at what the task needs.
+#
+# Measured 2026-07-28 (runs/rt_native_final, 2/6 against the text path's 5/6): the seeded
+# subset was `edit_file, read_file, fast_edit_blocks` — no write_file, for a suite whose
+# whole job is creating files. The model called edit_file 14 times on files that did not
+# exist, searched 11 times looking for a way through, and then declared success. On the
+# text path the same bad subset is survivable because discovery is one action away.
+#
+# So discovery comes back — find_tools ONLY, as a tool rather than a competing action
+# encoding.
+#
+# describe_tool is deliberately NOT here. It exists to fetch the ADR-0045 Tier-2 spec
+# because the PROSE menu renders argument names without types. A native tool definition
+# already carries the full schema the provider validates against, so describe_tool would
+# spend a round fetching what is already in front of the model. It stays on the text
+# path, where the abbreviation is real.
+_DISCOVERY_TOOL_DEFS = [
+    {
+        "name": "find_tools",
+        "description": (
+            "Find additional tools by capability when your current tools cannot do the "
+            "job. Describe the need verb-first, e.g. 'write a file to disk'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"need": {"type": "string", "description": "capability needed"}},
+            "required": ["need"],
+        },
+    },
+]
+
+# Names the loop handles itself rather than dispatching to the tool plane.
+_DISCOVERY_TOOL_NAMES = {d["name"] for d in _DISCOVERY_TOOL_DEFS}
+
+
+def build_tool_definitions(agent, system_tools) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+    """Render the agent's tool menu as native tool definitions (ADR-0097 Phase B).
+
+    Returns ``(definitions, name_map)`` where ``name_map`` is sanitized→original. The
+    map is not optional: the provider echoes back the name IT was given, and the
+    kernel's tool registry only knows the original, so a call would be dispatched to a
+    tool that does not exist.
+
+    Same two sources as the prompt-encoded menu — local ``@tool`` functions and
+    kernel-owned system tools — so the model is offered exactly the same set either
+    way. Only the ENCODING differs: a schema the provider enforces, rather than a JSON
+    example the model is asked to imitate.
+    """
+    defs: List[Dict[str, Any]] = []
+    name_map: Dict[str, str] = {}
+
+    # Added FIRST so they keep their plain names; a real tool that happens to share one
+    # is disambiguated by sanitize_tool_name instead.
+    for d in _DISCOVERY_TOOL_DEFS:
+        name_map[d["name"]] = d["name"]
+        defs.append(dict(d))
+
+    def _add(name: str, description: str, params: Any) -> None:
+        if not name:
+            return
+        safe = sanitize_tool_name(name, name_map)
+        name_map[safe] = name
+        defs.append({"name": safe, "description": description,
+                     "parameters": normalize_tool_parameters(params)})
+
+    for spec in agent.tools.specs():
+        _add(spec.name, (getattr(spec, "description", "") or "").strip(),
+             spec.schema or {"type": "object", "properties": {}})
+
+    for t in system_tools or []:
+        raw = t.get("schema_json")
+        params: Any = {"type": "object", "properties": {}}
+        if isinstance(raw, str) and raw.strip():
+            try:
+                params = json.loads(raw)
+            except ValueError:
+                pass
+        elif isinstance(raw, dict):
+            params = raw
+        _add(t.get("name", ""), (t.get("description") or "").strip(), params)
+
+    return defs, name_map
+
+
+def action_from_native_turn(text: str, calls: List[Dict[str, str]], stop_reason: str,
+                            name_map: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Map a native tool-calling turn onto the loop's internal action dict.
+
+    Both paths converge here so the loop keeps ONE shape and one set of guards —
+    recurrence veto, tool-round budget, the inferred-answer re-prompt (ADR-0097 D5).
+
+    Three cases, in the order that matters:
+
+    1. A tool call is present -> act on it, WHATEVER the stop reason says. Some
+       providers report "stop" while returning calls (opencode #14972), so the action
+       outranks the narration.
+    2. No call and an explicit "end_turn" -> a DECLARED final answer.
+    3. Anything else — "max_tokens", "refusal", "unknown", a blank reason — is
+       stopped-but-not-finished. Marked `_inferred` so the existing re-prompt handles
+       it, which is the same treatment unparseable prose gets on the text path.
+    """
+    if calls:
+        first = calls[0]
+        args: Any = {}
+        raw = first.get("arguments") or ""
+        if raw:
+            try:
+                args = json.loads(raw)
+            except ValueError:
+                # A malformed argument blob is a failed action, not a final answer.
+                return {"action": "_truncated", "raw": raw}
+        if not isinstance(args, dict):
+            args = {"value": args}
+        provider_name = first.get("name", "")
+        # Discovery is handled by the loop, not dispatched to the tool plane.
+        if provider_name in _DISCOVERY_TOOL_NAMES:
+            act: Dict[str, Any] = {"action": provider_name}
+            act.update(args)
+            return act
+        # Back to the name the kernel's tool registry knows. Dispatching the
+        # sanitized name would look up a tool that does not exist.
+        real_name = (name_map or {}).get(provider_name, provider_name)
+        return {"action": "tool_call", "tool": real_name, "args": args}
+
+    # The model may write a CONTROL ENVELOPE as plain text instead of emitting a native
+    # tool call — `{"action": "memory_query", ...}` arriving as prose. Wrapping that as a
+    # final answer hands the user raw JSON and silently drops the step the model asked for,
+    # so honour the envelope instead. parse_action already knows this shape; reusing it
+    # keeps the two paths from drifting apart.
+    # NOT just a leading "{": the envelope usually TRAILS a sentence of the model narrating
+    # itself -- a line of prose, then the action object. Requiring the brace at the START
+    # is exactly what let that shape through. parse_action already scans for the object.
+    if text and "{" in text and '"action"' in text:
+        parsed = parse_action(text)
+        if parsed.get("action") not in ("final_answer", "_truncated"):
+            return parsed
+
+    if stop_reason == "end_turn":
+        return {"action": "final_answer", "answer": text, "type": "text"}
+
+    return {"action": "final_answer", "answer": text, "type": "text", "_inferred": True}
+
+
 def parse_action(raw: str) -> Dict[str, Any]:
     """Parse the LLM's JSON action, tolerating surrounding prose/code fences.
 
-    A response that cannot be parsed is treated as a plain final answer (the LLM
-    answered in natural language) so the loop always terminates gracefully — UNLESS
-    it looks like a truncated action (#2), which the loop handles as a recoverable
-    error rather than a final answer.
+    A response that cannot be parsed is returned as a final_answer envelope carrying
+    ``_inferred: True``. The flag matters: an INFERRED answer is a guess that the
+    model meant to stop, not a declaration that it did. The loop treats the two
+    differently (see INFERRED_FINAL_ANSWER_NOTE); ``_reflect`` still only cares that
+    prose parses to a final_answer at all, so its contract is unchanged.
+
+    A truncated action (#2) is neither — the loop handles it as a recoverable error.
     """
     text = (raw or "").strip()
     start, end = text.find("{"), text.rfind("}")
@@ -215,7 +551,7 @@ def parse_action(raw: str) -> Dict[str, Any]:
             pass
     if _looks_like_truncated_action(text):
         return {"action": "_truncated", "raw": text}
-    return {"action": "final_answer", "answer": text, "type": "text"}
+    return {"action": "final_answer", "answer": text, "type": "text", "_inferred": True}
 
 
 def run_think(
@@ -281,6 +617,7 @@ def run_think(
     veto_counts: Dict[str, int] = {}  # ADR-0041 D4: per-action hard-veto tally
     success_dedup_counts: Dict[str, int] = {}  # ADR-0041 D4: per-action already-succeeded tally
     truncation_retries = 0  # #2: consecutive token-limit truncations re-prompted
+    inferred_answer_retries = 0  # non-action responses re-prompted (see note above)
     reflections: List[str] = []  # ADR-0052: verbal reflections extracted on hard-veto
     inline_resolves: int = 0   # ADR-0048 residual: budget for resolve_cid as="inline"
 
@@ -350,7 +687,11 @@ def run_think(
     # "tool" is delegate_to_planner + memory recall — it must never execute tasks itself,
     # only hand them to the planner). find_tools is disabled too, so it cannot pull them back.
     _seed_tool_query = "" if getattr(agent, "seed_tools_full", False) else task.text
-    system_tools = _list_system_tools(agent, query=_seed_tool_query) if seed_system_tools else []
+    # Seeded at Tier-2 because the native path is assumed available (it is latched off
+    # on the first refusal, which also refetches Tier-1 and recomposes the menu). One
+    # fetch, not two: under native tool-calling the prose menu no longer lists tools at
+    # all, so Tier-1 has no consumer.
+    system_tools = _list_system_tools(agent, query=_seed_tool_query, full=True) if seed_system_tools else []
     # ADR-0046: the loadable skill menu — agent-local skills (always present) first,
     # then task-relevant system skills (the push), with same-name system skills
     # shadowed by agent-local ones (structural prioritization, no central ranking).
@@ -360,8 +701,24 @@ def run_think(
     # domain answer-format are fixed for the task). Compose it ONCE so it is identical
     # bytes every turn — a stable prefix a provider can cache — instead of rebuilding
     # ~25 lines of menu+rules each round.
+    # ADR-0097 Phase B. Assumed available and latched off on the first
+    # ToolCallingUnsupported — optimistic because the common deployment HAS it, and a
+    # capability probe per run would cost a round-trip to learn what the first real
+    # call tells us anyway.
+    native_tools = True
+    tool_defs, tool_name_map = build_tool_definitions(agent, system_tools)
+    # ADR-0097 D8: under native tool-calling the model's history is THIS list, not a
+    # re-rendered prompt. It is seeded once with the composed prompt and thereafter
+    # grows by real turns — assistant turns carrying tool_calls, tool turns carrying
+    # their results. Empty on the text path, which keeps rebuilding the prompt.
+    conversation: List[Dict[str, Any]] = []
+    # The id of the call awaiting its tool turn. Providers correlate on it and
+    # reject a synthesized one, so it is carried rather than regenerated.
+    pending_tool_call_id = ""
+
     action_protocol = _compose_action_protocol(agent, output_schema, system_tools, system_skills,
-                                                allow_yield_subgoal=allow_yield_subgoal)
+                                                allow_yield_subgoal=allow_yield_subgoal,
+                                                native_tools=bool(native_tools and tool_defs))
 
     round_no = 0
     while True:
@@ -388,14 +745,115 @@ def run_think(
         # slow model (esp. the graded interview, where there is no step deadline to
         # respect). timeout_ms=0 ⇒ the SDK sends no gRPC deadline; cancellation is
         # governed by the model client's ctx, not a fixed wall-clock cap.
-        raw = agent.substrate.generate(
-            task.session_token_id,
-            prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            timeout_ms=0,
-        )
-        action = parse_action(raw)
+        # ADR-0097 Phase B: prefer the provider's STRUCTURED signal when this
+        # deployment has it. The text path below is the documented fallback, not a
+        # deprecated branch — local and self-hosted models keep using it.
+        action = None
+        # getattr, not a direct call: a substrate predating this method (an older SDK,
+        # or any custom transport) must take the fallback, not raise AttributeError
+        # mid-loop. "The capability is absent" and "the object cannot express it" are
+        # the same answer to the caller.
+        # Every requested call must be answered before the next turn. A call can go
+        # unexecuted — the recurrence veto blocks a repeat, a budget trips, the tool is
+        # not granted — and leaving it unanswered dangles the assistant turn, which a
+        # strict provider rejects. Close it explicitly, then release the mirror so held
+        # notes land AFTER the tool turn rather than inside the assistant/tool pair.
+        if pending_tool_call_id and conversation:
+            conversation.append({
+                "role": "tool",
+                "tool_call_id": pending_tool_call_id,
+                "content": json.dumps({"error": "call was not executed"}),
+            })
+            pending_tool_call_id = ""
+            if isinstance(wm, _ConversationMirror):
+                wm.release()
+
+        native_fn = getattr(agent.substrate, "generate_with_tools", None) if native_tools else None
+        if native_tools and native_fn is None:
+            # The substrate cannot express native tool-calling at all (an older SDK, a
+            # custom transport, a test double). That is the SAME answer as a refusal and
+            # must latch identically — otherwise the prompt stays composed for native
+            # mode, which OMITS the tool list, while the loop runs the text path that
+            # depends on it. The model would then see no tools at all: attached to
+            # nothing, listed nowhere.
+            native_tools = False
+            logger.info("react_native_tools_absent")
+            if isinstance(wm, _ConversationMirror):
+                wm = wm._wm
+            conversation.clear()
+            pending_tool_call_id = ""
+            if seed_system_tools:
+                system_tools = _list_system_tools(agent, query=_seed_tool_query, full=False)
+            action_protocol = _compose_action_protocol(
+                agent, output_schema, system_tools, system_skills,
+                allow_yield_subgoal=allow_yield_subgoal, native_tools=False)
+            continue
+        if native_fn is not None and tool_defs:
+            if not conversation:
+                # Seed once. The prompt carries role, task and the action menu; from
+                # here the conversation carries what happened, so the prompt is never
+                # rebuilt — re-narrating the model's own actions back at it as prose is
+                # what made it summarise its history instead of continuing it.
+                conversation.append({"role": "user", "content": prompt})
+                wm = _ConversationMirror(wm, conversation)
+            try:
+                n_text, n_calls, n_stop = native_fn(
+                    task.session_token_id,
+                    conversation,
+                    tool_defs,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    timeout_ms=0,
+                )
+                # Echo the assistant turn back VERBATIM, tool_calls included. This is
+                # what lets the model see that the call was its own.
+                assistant_turn: Dict[str, Any] = {"role": "assistant", "content": n_text or ""}
+                if n_calls:
+                    assistant_turn["tool_calls"] = n_calls
+                conversation.append(assistant_turn)
+                action = action_from_native_turn(n_text, n_calls, n_stop, tool_name_map)
+                if n_calls:
+                    pending_tool_call_id = n_calls[0].get("id", "")
+                    if isinstance(wm, _ConversationMirror):
+                        wm.hold()
+            except ToolCallingUnsupported as exc:
+                # Latch OFF for the rest of the run rather than re-asking every turn:
+                # the answer cannot change mid-run, and retrying would add a failed
+                # RPC per round. Logged at INFO because taking the fallback is a
+                # normal deployment state, not a fault.
+                native_tools = False
+                logger.info("react_native_tools_unavailable", extra={"reason": str(exc)})
+                # Back to the text path: the prompt is rebuilt from working memory each
+                # turn, so the half-built conversation is dead weight and the mirror
+                # would keep duplicating writes into it.
+                if isinstance(wm, _ConversationMirror):
+                    wm = wm._wm
+                conversation.clear()
+                pending_tool_call_id = ""
+                # Back on the prose menu, which wants Tier-1: full schemas would bloat
+                # every prompt with detail the menu never renders.
+                if seed_system_tools:
+                    system_tools = _list_system_tools(agent, query=_seed_tool_query, full=False)
+                # The action menu is composed ONCE before the loop and currently says
+                # "your tools are attached to this request". That is now false, so
+                # recompose and retake the turn — one extra call, only in the rare
+                # latch case, versus a whole run prompted for tools it will never be
+                # given.
+                action_protocol = _compose_action_protocol(
+                    agent, output_schema, system_tools, system_skills,
+                    allow_yield_subgoal=allow_yield_subgoal,
+                    native_tools=False)
+                continue
+
+        if action is None:
+            raw = agent.substrate.generate(
+                task.session_token_id,
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                timeout_ms=0,
+            )
+            action = parse_action(raw)
         kind = action.get("action")
 
         round_no += 1
@@ -576,6 +1034,26 @@ def run_think(
                 name, args, out, summarizer=getattr(agent, "tool_summarizer", None),
             )
             wm.add_tool_card(card)
+            # ADR-0097 D8: close the tool-calling loop. The provider correlates this
+            # against the call it made, under ITS id — a synthesized one is rejected.
+            # Without this turn the model never learns the call happened, which is what
+            # made the first cut re-explore every round and never write a file.
+            #
+            # The result is sent as JSON where possible; a provider expects a string,
+            # and a Python repr would be a shape the model has to guess at.
+            if conversation and pending_tool_call_id:
+                try:
+                    tool_content = json.dumps(out, default=str)
+                except (TypeError, ValueError):
+                    tool_content = str(out)
+                conversation.append({
+                    "role": "tool",
+                    "tool_call_id": pending_tool_call_id,
+                    "content": tool_content,
+                })
+                pending_tool_call_id = ""
+                if isinstance(wm, _ConversationMirror):
+                    wm.release()
             # v2: also emit a typed Step so the trajectory has the rich XML
             # (call site as named children, offloaded result with summary, etc.).
             #
@@ -618,12 +1096,20 @@ def run_think(
                 wm.add_text("<note>tool-discovery budget exhausted; use a tool already "
                             "in your menu, or answer/yield.</note>")
                 continue
-            found = _list_system_tools(agent, query=need)
+            found = _list_system_tools(agent, query=need, full=native_tools)
             seen = {t.get("name") for t in system_tools}
             added = [t for t in found if t.get("name") not in seen]
             system_tools = system_tools + added
+            # Under native tool-calling the menu the model can ACT on is tool_defs, not
+            # the prose list — so a discovery that does not rebuild it teaches the model
+            # names it still cannot call. Rebuild both the definitions and the
+            # sanitized→original map together; they must stay in step or a discovered
+            # tool dispatches to a name the registry has never heard of.
+            if native_tools:
+                tool_defs, tool_name_map = build_tool_definitions(agent, system_tools)
             logger.info("react_find_tools", extra={"round": round_no, "need": need,
-                                                   "added": [t.get("name") for t in added]})
+                                                   "added": [t.get("name") for t in added],
+                                                   "offered": len(tool_defs)})
             if added:
                 wm.add_text("<note>Found tools for {!r}: {}. Call one with tool_call.</note>".format(
                     need, ", ".join(t.get("name") for t in added)))
@@ -845,8 +1331,36 @@ def run_think(
             logger.info("react_yield_subgoal", extra={"round": round_no, "intent": intent})
             return yield_subgoal(intent, capability_hint=(action.get("capability_hint") or None))
 
-        # final_answer (or an unparseable/natural-language response). result_type
-        # (the agent's output contract) wins over the LLM-declared type when set.
+        # INVERTED DEFAULT (2026-07-28). "Finished" must be DECLARED, not inferred
+        # from a parse failure.
+        #
+        # Previously any output without a parseable action became a final_answer and
+        # returned immediately, so a model narrating its next step ("I need to write a
+        # one-line summary to the output file") or dumping its working-memory markup
+        # ended the task REPORTING SUCCESS with the work undone — silent, and strictly
+        # worse than the loud ReActLoopError it displaced.
+        #
+        # Every mature agent loop routes on a structured signal instead: Anthropic's
+        # rule is "when stop_reason is NOT end_turn, treat the response as incomplete";
+        # LangChain feeds a parse failure BACK to the model (handle_parsing_errors /
+        # RetryWithErrorOutputParser) rather than accepting it as an answer. This is
+        # that contract, bounded: re-prompt once, then accept so the loop still always
+        # terminates. The real fix is native tool-calling, which removes the guess.
+        if action.get("_inferred") and inferred_answer_retries < _MAX_INFERRED_ANSWER_RETRIES:
+            inferred_answer_retries += 1
+            logger.info(
+                "react_inferred_answer_reprompt",
+                extra={"round": round_no, "retry": inferred_answer_retries,
+                       "text_preview": str(action.get("answer", ""))[:200]},
+            )
+            wm.add_text(INFERRED_FINAL_ANSWER_NOTE)
+            continue
+
+        # final_answer. result_type (the agent's output contract) wins over the
+        # LLM-declared type when set. An inferred answer that survived the re-prompt
+        # above is accepted here — logged distinctly so it stays visible.
+        if action.get("_inferred"):
+            logger.warning("react_inferred_answer_accepted", extra={"round": round_no})
         answer = action.get("answer", "")
         # An LLM may return a structured (dict/list/number) answer despite the
         # string contract; serialize it rather than crashing on answer[:200] or
@@ -878,12 +1392,14 @@ _PER_TURN_OUTPUT_CONTRACT = (
 
 def _compose_action_protocol(agent, domain_schema: str, system_tools: Optional[List[Dict]] = None,
                              system_skills: Optional[List[Dict]] = None,
-                             allow_yield_subgoal: bool = True) -> str:
+                             allow_yield_subgoal: bool = True,
+                             native_tools: bool = False) -> str:
     """The agent-loop action menu + behavioral rules (the <ActionProtocol> body),
     with the agent's domain final-answer format folded into the final_answer action
     so it is documented but not the recency-anchored closer (ADR-0048 D8)."""
     base = build_output_schema(agent, system_tools, system_skills,
-                               allow_yield_subgoal=allow_yield_subgoal)
+                               allow_yield_subgoal=allow_yield_subgoal,
+                               native_tools=native_tools)
     if domain_schema and domain_schema.strip():
         base += (
             "\n\nWhen you emit final_answer, the \"answer\" field MUST follow this format:\n"
@@ -974,11 +1490,18 @@ def _call_system_tool(agent, name: str, args: dict, session_token_id: str = "", 
         return {"result": rj, "tool": name}
 
 
-def _list_system_tools(agent, query: str = "") -> List[Dict]:
+def _list_system_tools(agent, query: str = "", full: bool = False) -> List[Dict]:
     """Fetch the agent's granted kernel system tools for the prompt menu (ADR-0039).
 
     ADR-0044: when ``query`` is given, the kernel returns only the top-k
     task-relevant tools (semantic retrieval) instead of the full granted set.
+
+    ``full`` selects the ADR-0045 disclosure tier. Tier-1 (default) is an
+    arg-names-only schema — right for the PROSE menu, which renders property names and
+    nothing else. Tier-2 is the real JSON Schema, which is what a native tool
+    definition needs: the provider VALIDATES against it, so types and ``required`` are
+    load-bearing rather than decorative. Asking for Tier-1 and handing it to a provider
+    is what produced the opaque 400s (no top-level ``type``) and type-less arguments.
     Degrades to an empty list when the substrate is absent or has no tool plane —
     a cognitive agent with only local @tools, or a kernel without a registry,
     simply gets the @tool menu. Never raises into the loop."""
@@ -986,7 +1509,7 @@ def _list_system_tools(agent, query: str = "") -> List[Dict]:
     if substrate is None or not hasattr(substrate, "list_tools"):
         return []
     try:
-        return substrate.list_tools(query=query, k=_DEFAULT_TOOL_MENU_K)
+        return substrate.list_tools(query=query, k=_DEFAULT_TOOL_MENU_K, full=full)
     except TypeError:
         # Substrate/test fake without the ADR-0044 query parameter — full menu.
         try:

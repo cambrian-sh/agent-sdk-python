@@ -26,3 +26,6 @@ htmlcov/
 # OS / editor
 .DS_Store
 *.swp
+
+# Agent tooling (contains local worktrees — must never enter a release commit)
+.claude/
