@@ -51,6 +51,26 @@ def _parse_substrate_addr() -> str:
     return "localhost:50051"
 
 
+def agent_id_override() -> str:
+    """The registry id the kernel launched this process as (``--agent-id``).
+
+    Empty when the kernel did not pass one, which is every non-daemon launch and
+    any kernel older than this flag.
+
+    Why it exists: discovery derives an agent's REGISTRY id from its filename,
+    while a signal's sender is the id the process declares for itself. Nothing
+    made the two agree, and when they diverge a reply is generated and then has
+    nowhere to go. It is also what lets one script run as several distinct
+    principals — N ingress bots, N registrations, N surfaces, one file.
+    """
+    argv = sys.argv
+    if "--agent-id" in argv:
+        idx = argv.index("--agent-id")
+        if idx + 1 < len(argv):
+            return argv[idx + 1]
+    return ""
+
+
 def is_daemon_mode() -> bool:
     """Return True if ``--daemon-mode`` was passed as a CLI arg. ADR-0033."""
     return "--daemon-mode" in sys.argv

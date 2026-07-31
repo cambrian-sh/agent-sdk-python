@@ -67,12 +67,31 @@ def start_daemon(agent, substrate_addr: Optional[str] = None) -> None:
 
     import grpc
 
-    from .server import _parse_daemon_cli
+    from .server import _parse_daemon_cli, agent_id_override
     from ._proto import cambrian_pb2, cambrian_pb2_grpc
 
     stream_id, parsed_addr, params = _parse_daemon_cli()
     agent.stream_id = stream_id
     agent.params = params
+
+    # Adopt the identity the kernel launched us as.
+    #
+    # Discovery derives an agent's REGISTRY id from its filename, while a signal's
+    # sender is the id the process declared for itself. Nothing made the two
+    # agree, and when they diverge a reply is generated and then has nowhere to
+    # go — the divergence is silent on the way in and only shows up as a missing
+    # answer. Adopting the kernel's id removes it by construction.
+    #
+    # It is also what lets ONE script run as several distinct principals: N
+    # ingress bots, N registrations, N surfaces, one file. Absent on an older
+    # kernel, in which case the agent keeps the id it chose.
+    launched_as = agent_id_override()
+    if launched_as and launched_as != agent.agent_id:
+        logger.info(
+            "daemon '%s' adopting the registry id it was launched as: %s",
+            agent.agent_id, launched_as,
+        )
+        agent.agent_id = launched_as
     addr = substrate_addr or parsed_addr
 
     shutdown = {"flag": False}
