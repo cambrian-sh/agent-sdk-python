@@ -138,6 +138,7 @@ def build_output_schema(
     system_skills: Optional[List[Dict]] = None,
     allow_yield_subgoal: bool = True,
     native_tools: bool = False,
+    allow_memory: bool = True,
 ) -> str:
     """Describe the closed action menu + the agent's tools for the LLM (v2).
 
@@ -181,10 +182,23 @@ def build_output_schema(
         'You emit ONE JSON action per turn — {"action": "<name>", ...} — and are '
         "called again with each result. Prefer gathering evidence over guessing.\n"
         "\n"
-        "## Memory actions\n"
-        '- `{"action": "memory_query", "query": "<text>"}` — retrieve from org long-term memory (knowledge base). Do this FIRST; ground claims in retrieved facts before answering from your own training.\n'
-        '  Example: `{"action": "memory_query", "query": "Q4 2024 revenue"}`\n'
-        "\n"
+        # Advertised only when the agent may actually use it.
+        #
+        # Listing it unconditionally while `max_memory_queries` is 0 is the
+        # same inconsistent middle that broke the tool path: the menu says "Do
+        # this FIRST", the model obeys, the budget refuses it, the model obeys
+        # the menu again, and the SECOND refusal returns working memory as the
+        # final answer — so the caller receives "<note>memory query budget
+        # exhausted</note>" as though it were the agent's considered reply.
+        #
+        # Advertise a capability and allow it, or advertise neither.
+        + ("## Memory actions\n"
+           '- `{"action": "memory_query", "query": "<text>"}` — retrieve from org long-term memory (knowledge base). Do this FIRST; ground claims in retrieved facts before answering from your own training.\n'
+           '  Example: `{"action": "memory_query", "query": "Q4 2024 revenue"}`\n'
+           "\n" if allow_memory else
+           "## Memory\n"
+           "- You have NO memory access in this session. There is no `memory_query` action; do not attempt one.\n"
+           "\n")
         + (_NATIVE_TOOL_SECTION if native_tools else _JSON_TOOL_SECTION) +
         "## Skill actions\n"
         '- `{"action": "use_skill", "skill": "<name>"}` — load a skill\'s steps + tools.\n'
@@ -420,8 +434,34 @@ _DISCOVERY_TOOL_DEFS = [
 # Names the loop handles itself rather than dispatching to the tool plane.
 _DISCOVERY_TOOL_NAMES = {d["name"] for d in _DISCOVERY_TOOL_DEFS}
 
+# The loop's OWN vocabulary, as the model may emit it under native tool-calling.
+#
+# <ActionProtocol> advertises these as actions. A model given native tools
+# expresses an action the only way that interface offers — as a tool call — so
+# `final_answer` arrives as `{"name": "final_answer"}` rather than as text. Only
+# `find_tools` was recognised, so every other verb was forwarded to the kernel's
+# tool registry and refused as an unknown tool.
+#
+# `final_answer` made that fatal rather than untidy: the model tried to FINISH,
+# was told the tool does not exist, tried again, was refused again, and
+# eventually summarised in prose — which is what a caller saw as "the planner
+# answered in prose". The loop was refusing its own protocol.
+#
+# A kernel tool that happens to share one of these names is shadowed. That is the
+# right way round: these words belong to the loop, and a deployment that wants a
+# tool called `final_answer` can name it something else.
+_CONTROL_ACTION_NAMES = _DISCOVERY_TOOL_NAMES | {
+    "final_answer",
+    "memory_query",
+    "describe_tool",
+    "use_skill",
+    "find_skills",
+    "yield_subgoal",
+    "resolve_cid",
+}
 
-def build_tool_definitions(agent, system_tools) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+
+def build_tool_definitions(agent, system_tools, include_discovery: bool = True) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """Render the agent's tool menu as native tool definitions (ADR-0097 Phase B).
 
     Returns ``(definitions, name_map)`` where ``name_map`` is sanitized→original. The
@@ -433,15 +473,26 @@ def build_tool_definitions(agent, system_tools) -> Tuple[List[Dict[str, Any]], D
     kernel-owned system tools — so the model is offered exactly the same set either
     way. Only the ENCODING differs: a schema the provider enforces, rather than a JSON
     example the model is asked to imitate.
+
+    ``include_discovery=False`` drops ``find_tools``. It follows ``seed_system_tools``,
+    because OFFERING a tool the loop will refuse to run is not a smaller version of
+    granting it — it is worse. The execution side already refuses ``find_tools`` for an
+    opted-out agent ("must not be able to pull them back in via discovery"), but this
+    side advertised it anyway, so an opted-out agent was shown a tool it could only be
+    denied for using. For an agent with a zero tool-round budget that is fatal rather
+    than merely untidy: the model calls it, the loop will not execute it, and the next
+    request carries an assistant turn with ``tool_calls`` and no tool turn answering
+    them — which every OpenAI-compatible provider rejects with a 400.
     """
     defs: List[Dict[str, Any]] = []
     name_map: Dict[str, str] = {}
 
     # Added FIRST so they keep their plain names; a real tool that happens to share one
     # is disambiguated by sanitize_tool_name instead.
-    for d in _DISCOVERY_TOOL_DEFS:
-        name_map[d["name"]] = d["name"]
-        defs.append(dict(d))
+    if include_discovery:
+        for d in _DISCOVERY_TOOL_DEFS:
+            name_map[d["name"]] = d["name"]
+            defs.append(dict(d))
 
     def _add(name: str, description: str, params: Any) -> None:
         if not name:
@@ -500,8 +551,8 @@ def action_from_native_turn(text: str, calls: List[Dict[str, str]], stop_reason:
         if not isinstance(args, dict):
             args = {"value": args}
         provider_name = first.get("name", "")
-        # Discovery is handled by the loop, not dispatched to the tool plane.
-        if provider_name in _DISCOVERY_TOOL_NAMES:
+        # The loop's own verbs are handled HERE, not dispatched to the tool plane.
+        if provider_name in _CONTROL_ACTION_NAMES:
             act: Dict[str, Any] = {"action": provider_name}
             act.update(args)
             return act
@@ -522,11 +573,56 @@ def action_from_native_turn(text: str, calls: List[Dict[str, str]], stop_reason:
         parsed = parse_action(text)
         if parsed.get("action") not in ("final_answer", "_truncated"):
             return parsed
+        # A DECLARED final_answer is honoured as written, including its "answer".
+        #
+        # Falling through to the wrapper below discarded the envelope and made the
+        # whole raw string the answer — so an agent whose output contract puts a
+        # structured payload in "answer" (which is what _PER_TURN_OUTPUT_CONTRACT
+        # instructs: "its answer field MUST follow this format") received its own
+        # envelope back, JSON and all, instead of the payload. Every consumer then
+        # had to re-parse a shape the loop had already parsed and thrown away.
+        #
+        # Nor is it "inferred": the model said final_answer. Marking a declared
+        # answer as a guess triggers the re-prompt meant for models that merely
+        # stopped talking.
+        if parsed.get("action") == "final_answer" and "answer" in parsed:
+            return parsed
 
     if stop_reason == "end_turn":
         return {"action": "final_answer", "answer": text, "type": "text"}
 
     return {"action": "final_answer", "answer": text, "type": "text", "_inferred": True}
+
+
+def _answer_unexecuted(conversation: List[Dict[str, Any]], call_ids: List[str]) -> List[str]:
+    """Close out tool calls the loop chose not to run, and return the emptied list.
+
+    A model may emit SEVERAL tool calls in one turn. This loop runs one action per
+    turn, so only the first is executed — but the assistant turn is echoed back
+    verbatim carrying all of them, and every OpenAI-compatible provider requires a
+    tool message per tool_call_id:
+
+        An assistant message with 'tool_calls' must be followed by tool messages
+        responding to each 'tool_call_id'. (insufficient tool messages following
+        tool_calls message)
+
+    Leaving the extras unanswered therefore 400s the NEXT request, which reads as
+    the model being unavailable rather than as a malformed conversation we built.
+    Answering them explicitly keeps the transcript valid AND tells the model why
+    its second call produced nothing, so it retries deliberately instead of
+    assuming the tool is broken.
+    """
+    for cid in call_ids:
+        if not cid:
+            continue
+        conversation.append({
+            "role": "tool",
+            "tool_call_id": cid,
+            "content": json.dumps({
+                "error": "not executed: one action per turn. Re-issue this call on its own turn if you still need it.",
+            }),
+        })
+    return []
 
 
 def parse_action(raw: str) -> Dict[str, Any]:
@@ -564,6 +660,7 @@ def run_think(
     result_type: Optional[str] = None,
     seed_recall: bool = True,
     seed_system_tools: bool = True,
+    allow_find_tools: Optional[bool] = None,
     allow_yield_subgoal: bool = True,
     max_memory_queries: int = _DEFAULT_MAX_MEMORY_QUERIES,
     max_tool_rounds: int = _DEFAULT_MAX_TOOL_ROUNDS,
@@ -614,6 +711,7 @@ def run_think(
     skill_loads = 0  # ADR-0046: cap use_skill loads
     loaded_skills = set()  # ADR-0046: skills already loaded this run (idempotent)
     mem_exhausted = False
+    tool_exhausted = False
     veto_counts: Dict[str, int] = {}  # ADR-0041 D4: per-action hard-veto tally
     success_dedup_counts: Dict[str, int] = {}  # ADR-0041 D4: per-action already-succeeded tally
     truncation_retries = 0  # #2: consecutive token-limit truncations re-prompted
@@ -691,6 +789,19 @@ def run_think(
     # on the first refusal, which also refetches Tier-1 and recomposes the menu). One
     # fetch, not two: under native tool-calling the prose menu no longer lists tools at
     # all, so Tier-1 has no consumer.
+    # find_tools is separable from the seeded menu, and the distinction is the
+    # difference between two legitimate agent shapes:
+    #
+    #   - A front desk with NO tools at all (chat): seed nothing, and disable
+    #     discovery too, or it pulls back the menu it was denied.
+    #   - A researcher that should DISCOVER what it needs (source discovery):
+    #     seed nothing, because a preloaded top-k menu of every tool in the
+    #     deployment is mostly noise — but keep find_tools, which is how it asks
+    #     for a capability by name when it knows what it wants.
+    #
+    # Defaulting to seed_system_tools preserves the first shape for callers that
+    # say nothing; the second asks for it explicitly.
+    find_tools_enabled = seed_system_tools if allow_find_tools is None else bool(allow_find_tools)
     system_tools = _list_system_tools(agent, query=_seed_tool_query, full=True) if seed_system_tools else []
     # ADR-0046: the loadable skill menu — agent-local skills (always present) first,
     # then task-relevant system skills (the push), with same-name system skills
@@ -706,7 +817,9 @@ def run_think(
     # capability probe per run would cost a round-trip to learn what the first real
     # call tells us anyway.
     native_tools = True
-    tool_defs, tool_name_map = build_tool_definitions(agent, system_tools)
+    # find_tools follows the same opt-out as the system menu it exists to reach.
+    tool_defs, tool_name_map = build_tool_definitions(
+        agent, system_tools, include_discovery=find_tools_enabled)
     # ADR-0097 D8: under native tool-calling the model's history is THIS list, not a
     # re-rendered prompt. It is seeded once with the composed prompt and thereafter
     # grows by real turns — assistant turns carrying tool_calls, tool turns carrying
@@ -715,10 +828,26 @@ def run_think(
     # The id of the call awaiting its tool turn. Providers correlate on it and
     # reject a synthesized one, so it is carried rather than regenerated.
     pending_tool_call_id = ""
+    # The OTHER ids from the same turn, when the model emitted parallel calls.
+    #
+    # This loop runs one action per turn, so only the first is executed — but the
+    # assistant turn is echoed back verbatim with ALL of them, and a provider
+    # requires a tool message per tool_call_id:
+    #
+    #   An assistant message with 'tool_calls' must be followed by tool messages
+    #   responding to each 'tool_call_id'.
+    #
+    # Answering only the first therefore 400s the NEXT request and takes the whole
+    # run down. These ids get an explicit "not executed" reply instead, which
+    # satisfies the invariant and tells the model why its other call did not run.
+    pending_extra_call_ids: List[str] = []
 
+    # The menu follows the BUDGET, so it never advertises what the loop refuses.
+    allow_memory = max_memory_queries > 0
     action_protocol = _compose_action_protocol(agent, output_schema, system_tools, system_skills,
                                                 allow_yield_subgoal=allow_yield_subgoal,
-                                                native_tools=bool(native_tools and tool_defs))
+                                                native_tools=bool(native_tools and tool_defs),
+                                                allow_memory=allow_memory)
 
     round_no = 0
     while True:
@@ -765,6 +894,7 @@ def run_think(
                 "content": json.dumps({"error": "call was not executed"}),
             })
             pending_tool_call_id = ""
+            pending_extra_call_ids = _answer_unexecuted(conversation, pending_extra_call_ids)
             if isinstance(wm, _ConversationMirror):
                 wm.release()
 
@@ -782,11 +912,13 @@ def run_think(
                 wm = wm._wm
             conversation.clear()
             pending_tool_call_id = ""
+            pending_extra_call_ids = []
             if seed_system_tools:
                 system_tools = _list_system_tools(agent, query=_seed_tool_query, full=False)
             action_protocol = _compose_action_protocol(
                 agent, output_schema, system_tools, system_skills,
-                allow_yield_subgoal=allow_yield_subgoal, native_tools=False)
+                allow_yield_subgoal=allow_yield_subgoal, native_tools=False,
+                allow_memory=allow_memory)
             continue
         if native_fn is not None and tool_defs:
             if not conversation:
@@ -814,6 +946,11 @@ def run_think(
                 action = action_from_native_turn(n_text, n_calls, n_stop, tool_name_map)
                 if n_calls:
                     pending_tool_call_id = n_calls[0].get("id", "")
+                    # Parallel calls: the turn carries all of them, so all of them
+                    # must be answered even though only the first is executed.
+                    pending_extra_call_ids = [
+                        c.get("id", "") for c in n_calls[1:] if c.get("id", "")
+                    ]
                     if isinstance(wm, _ConversationMirror):
                         wm.hold()
             except ToolCallingUnsupported as exc:
@@ -830,6 +967,7 @@ def run_think(
                     wm = wm._wm
                 conversation.clear()
                 pending_tool_call_id = ""
+                pending_extra_call_ids = []
                 # Back on the prose menu, which wants Tier-1: full schemas would bloat
                 # every prompt with detail the menu never renders.
                 if seed_system_tools:
@@ -842,7 +980,7 @@ def run_think(
                 action_protocol = _compose_action_protocol(
                     agent, output_schema, system_tools, system_skills,
                     allow_yield_subgoal=allow_yield_subgoal,
-                    native_tools=False)
+                    native_tools=False, allow_memory=allow_memory)
                 continue
 
         if action is None:
@@ -1001,7 +1139,34 @@ def run_think(
 
             tool_rounds += 1
             if tool_rounds > max_tool_rounds:
-                raise ReActLoopError(f"tool-round budget ({max_tool_rounds}) exceeded")
+                # Graceful first, fatal second — the same shape the memory budget
+                # already uses, and for the same reason.
+                #
+                # Raising immediately threw away a whole run's gathered evidence
+                # because the model had not been TOLD it was nearly out. It cannot
+                # ration a budget it cannot see: a research agent will keep
+                # searching until something stops it, and what stopped it was an
+                # exception the caller could only report as a failure.
+                #
+                # One explicit chance to conclude turns that into an answer built
+                # from what it actually found. If it spends that chance on another
+                # tool call, the runaway guard still fires.
+                #
+                # `continue` is safe with a tool call outstanding: the top of the
+                # loop closes an unanswered tool_call_id before the next request,
+                # which is what keeps the conversation valid for the provider.
+                if tool_exhausted:
+                    raise ReActLoopError(f"tool-round budget ({max_tool_rounds}) exceeded")
+                tool_exhausted = True
+                logger.info("react_tool_budget_exhausted",
+                            extra={"round": round_no, "budget": max_tool_rounds})
+                wm.add_text(
+                    f"<note>TOOL BUDGET EXHAUSTED after {max_tool_rounds} calls. No further "
+                    "tool call will run. Answer NOW, in your required output format, using "
+                    "what you have already gathered. If what you have is not enough to "
+                    "conclude, say so in that format rather than searching again.</note>"
+                )
+                continue
             # Local @tool → run in-process. Otherwise it is a kernel-owned system
             # tool (ADR-0039): the agent marshalled the args here; the kernel
             # authorizes and executes it in a confined process via ExecuteTool.
@@ -1052,6 +1217,7 @@ def run_think(
                     "content": tool_content,
                 })
                 pending_tool_call_id = ""
+                pending_extra_call_ids = _answer_unexecuted(conversation, pending_extra_call_ids)
                 if isinstance(wm, _ConversationMirror):
                     wm.release()
             # v2: also emit a typed Step so the trajectory has the rich XML
@@ -1077,9 +1243,11 @@ def run_think(
             continue
 
         if kind == "find_tools":
-            # An agent that opted out of system tools (seed_system_tools=False) must not be
-            # able to pull them back in via discovery.
-            if not seed_system_tools:
+            # An agent that opted out of DISCOVERY must not be able to pull tools
+            # back in through it. Keyed on find_tools_enabled rather than on the
+            # seeded menu: an agent may legitimately want no preloaded menu and
+            # still want to ask for a capability by name.
+            if not find_tools_enabled:
                 wm.add_text("<note>Tools are not available to you. Either answer from what you "
                             "have, or use delegate_to_planner to hand the task to the planner.</note>")
                 continue
@@ -1393,13 +1561,15 @@ _PER_TURN_OUTPUT_CONTRACT = (
 def _compose_action_protocol(agent, domain_schema: str, system_tools: Optional[List[Dict]] = None,
                              system_skills: Optional[List[Dict]] = None,
                              allow_yield_subgoal: bool = True,
-                             native_tools: bool = False) -> str:
+                             native_tools: bool = False,
+                             allow_memory: bool = True) -> str:
     """The agent-loop action menu + behavioral rules (the <ActionProtocol> body),
     with the agent's domain final-answer format folded into the final_answer action
     so it is documented but not the recency-anchored closer (ADR-0048 D8)."""
     base = build_output_schema(agent, system_tools, system_skills,
                                allow_yield_subgoal=allow_yield_subgoal,
-                               native_tools=native_tools)
+                               native_tools=native_tools,
+                               allow_memory=allow_memory)
     if domain_schema and domain_schema.strip():
         base += (
             "\n\nWhen you emit final_answer, the \"answer\" field MUST follow this format:\n"
