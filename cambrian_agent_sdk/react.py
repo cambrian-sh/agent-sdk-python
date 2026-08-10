@@ -36,6 +36,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .helpers import _esc, build_prompt
+from .host import host_block
 from .recurrence import count_failed_duplicates, count_successful_duplicates
 from .reflection import DEFAULT_MAX_REFLECTION_TOKENS, build_reflection_prompt
 from .errors import ToolCallingUnsupported
@@ -849,9 +850,23 @@ def run_think(
                                                 native_tools=bool(native_tools and tool_defs),
                                                 allow_memory=allow_memory)
 
+    # Host facts + the path rules that make them usable (ADR-0100 P3 residual #3).
+    # Composed ONCE, before the loop: the values are cached and constant for the
+    # process, so keeping this out of the per-round list preserves the byte-identical
+    # cacheable prefix that the v2 prompt layout exists to protect.
+    #
+    # This is the executing half of the split with the kernel's planner prompt. The
+    # planner is told the OS and told that paths are not its job; the agent runs on
+    # the host, so it is told the absolute values and is the one that resolves "a
+    # folder on the desktop" into a real path. Empty when nothing could be
+    # determined, which stays silent rather than asserting a guessed path.
+    host_constraint = host_block()
+
     round_no = 0
     while True:
         extra = list(constraints or [])
+        if host_constraint:
+            extra.append(host_constraint)
         if mem_exhausted:
             extra.append("Memory budget is exhausted — answer best-effort from what you have.")
         prompt = build_prompt(

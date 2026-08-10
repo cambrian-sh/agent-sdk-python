@@ -47,7 +47,7 @@ for the network, so it runs with no credentials).
 | Typed working memory (`ToolCard`, `TextEntry`, `Step`, bounded assembly) | `working_memory.py`, `types.py`; ADR-0041 D1-D3 | Implemented |
 | gRPC clients (`SubstrateClient`, `MemoryClient`, `ArtifactManager`) | `__init__.py` (`SubstrateClient`), `clients.py` (memory, artifacts) | Implemented |
 | gRPC server base for `AgentService` and health | `runtime.py`, `server.py`; ADR-0036 D2 | Implemented |
-| Daemon-agent path: `SignalStream` runtime + supervised `daemon_loop` | `daemon.py`; ADR-0033, ADR-0036 issue 0036-06 | Implemented |
+| Daemon-agent path: `SignalStream` runtime + supervised `daemon_loop` | `daemon.py`; ADR-0033, ADR-0036 issue 0036-06 | Implemented. **Fixed 2026-08-08: one loop per daemon, not one per reconnect** — see Known Gaps. |
 | Agent skills: lexical scoping of local vs system skills | ADR-0046 | Proposed |
 | Typed errors (`BudgetExceededError`, `InvalidTagError`, `ArtifactNotFound`, `SelfDelegationError`) | `errors.py`, `clients.py` | Implemented |
 | Structured logging (`SlogHandler` writing slog-compatible JSON to stdout) | `_logging.py` | Implemented |
@@ -87,9 +87,10 @@ it by lexical scoping, with no central ranking involved.
 | `cambrian_agent_sdk/__init__.py` | Public surface, `assemble_context`, top-level `configure_logging`, the `SubstrateClient` definition |
 | `cambrian_agent_sdk/base.py` | `Agent` abstract + the three trait classes; wires `run_think` into the cognitive trait |
 | `cambrian_agent_sdk/clients.py` | `MemoryClient` (recall lanes + remember), `ArtifactManager` (save/get/list_from_step), read-only `WorkingMemory` view, plus `InvalidTagError`, `ArtifactNotFound`, `SelfDelegationError` |
-| `cambrian_agent_sdk/daemon.py` | `start_daemon` + `run_supervised`: the `SignalStream` runtime with crash supervision (capped exponential backoff, 30s cap) |
+| `cambrian_agent_sdk/daemon.py` | `start_daemon` + `run_supervised`: the `SignalStream` runtime with crash supervision (capped exponential backoff, 30s cap). The supervised loop is started ONCE, **outside** the reconnect loop — that placement is load-bearing, see Known Gaps |
 | `cambrian_agent_sdk/errors.py` | `BudgetExceededError`, the typed signal that a task refused on budget grounds |
 | `cambrian_agent_sdk/helpers.py` | `build_prompt` (v2 cache-friendly layout), `extract_code_block`, `find_step_ref`, `DEFAULT_CONSTRAINTS`, `DEFAULT_ANTI_PATTERNS`, XML escape |
+| `cambrian_agent_sdk/host.py` | `host_facts` / `host_block` / `goos`: the host the agent is running ON (`os`, `home`, `desktop`, `cwd`, `path_separator`) plus the path rules that make those values usable, appended once to the ReAct prompt's loop-invariant prefix. **This is the executing half of a split with the kernel's planner prompt:** the planner is told only the OS and told explicitly that paths are not its job, because it cannot see the host and because its plans are replayed as `<PlanLTM>` precedents (an absolute path with a username in it is wrong under another account). Three rules to preserve: `goos()` uses **Go's** `runtime.GOOS` spelling so plan and agent name the machine identically; a fact that cannot be determined is **omitted rather than guessed** (the model treats what it is given as authoritative); and `host_facts` is cached so the prompt prefix stays byte-identical across turns. Desktop resolution is redirection-aware — Windows reads Explorer's Shell Folders registry value (OneDrive Known-Folder redirection means `home/Desktop` can exist as a shadow folder while the real desktop is under `OneDrive`), Linux reads `XDG_DESKTOP_DIR` (a localised desktop is `~/Escritorio`). Origin: ADR-0100 P3 residual #3 — the Scout carried the only "never write `~/Desktop`" rule and took it with it when retired |
 | `cambrian_agent_sdk/react.py` | `run_think` (the ReAct loop), `ReActLoopError`, prompt/action-protocol composition, all per-action handlers |
 | `cambrian_agent_sdk/recurrence.py` | `count_failed_duplicates` and `count_successful_duplicates`: the local recurrent reconciliation gate |
 | `cambrian_agent_sdk/reflection.py` | `build_reflection_prompt`: pure prompt builder for the verbal self-reflection (ADR-0052) |
@@ -137,6 +138,30 @@ License 1.1 (matching the kernel license per ADR-0057 D6/D10). Python
 
 ## Known Gaps
 
+**A reconnecting SignalStream used to start a SECOND daemon_loop — FIXED 2026-08-08.**
+`start_daemon` created its supervised `daemon_loop` thread *inside* the reconnect loop, so
+every `SignalStream` disconnect spawned another one while the previous thread kept running:
+`should_continue` only flips at shutdown, so nothing ever stopped the old one. A flapping
+stream therefore left N concurrent copies of the author's loop running for the life of the
+process.
+
+How it presented, and why it went unnoticed: the telegram ingress reconnected 6 times and
+then logged 133 × `409 conflict — another getUpdates poller is running on this token`. The
+"other poller" was itself, five times over. Telegram refuses concurrent `getUpdates` on one
+token, so the 409 made the duplication VISIBLE — **a daemon without that server-side
+interlock would instead have silently done every unit of work N times**, which is the worse
+version of this bug and the reason it is fixed here rather than in the telegram agent. Any
+daemon whose stream flapped was affected.
+
+Fixed by hoisting the thread start above the reconnect loop. Safe because `daemon_loop`
+never touches the channel — it hands work to `agent._signal_queue`, which `_request_iter`
+drains on whichever stream is currently open, so signals queue across a disconnect and flush
+on reconnect. Pinned by `tests/test_daemon.py::test_reconnecting_the_stream_does_not_start_a_second_daemon_loop`,
+which is mutation-checked: with the start moved back inside the loop it fails `3 == 1` and
+names `Thread-2/3/4 (run_supervised)`. Live-verified over an 8-minute window — 5 stream
+reconnects per agent, **0** conflicts and **0** loop crashes, against 133 of each before.
+
+
 - **Go API is unstable in v0.x.** Only the gRPC proto surface and the `pyproject.toml` config schema are held stable; the Go package API can change at any minor release (per ADR-0057 D8). The SDK pins to the vendored proto in `_proto/`, so a kernel-side proto bump needs re-vendoring and a new SDK release, not just a `pip install --upgrade`.
 - **BSL 1.1, not OSI-open.** The Business Source License restricts production use; the four-years-after-change date is the eventual Apache 2.0 conversion. Treat the package as source-available.
 - **Cross-run `LessonsLearned` write-back is open.** ADR-0052 ships the per-run reflection, but it lives in working memory only. Writing reflections back to LTM (the FORGE / `LessonsLearned` lane per ADR-0049) is the natural follow-up, and is a kernel change, not an SDK one.
@@ -147,7 +172,7 @@ License 1.1 (matching the kernel license per ADR-0057 D6/D10). Python
 
 - **Agent**: the abstract base class in `base.py`. Cannot be instantiated directly; the structural enforcement of ADR-0036 D1 is that authors must pick a trait.
 - **CognitiveAgent**: an LLM-reasoning trait with `run()`, `think()`, memory, and `@tool` actions. The ReAct loop is wired through `react.run_think`; the default `run()` catches `ReActLoopError` and returns a typed `type="error"` result.
-- **DeterministicAgent**: a scripted cell with a typed `run()` and no `think()`. Bids statically in the auction (confidence 1.0, latency 5 ms), so the auction treats it as a tool, not a reasoning capability.
+- **DeterministicAgent**: a scripted cell with a typed `run()` and no `think()`. It answers `RequestProposal` with a static 1.0-confidence / 5 ms proposal, which is what made a selection mechanism treat it as a tool rather than a reasoning capability. **As of 2026-08-07 the kernel never asks.** ADR-0100 P3 deleted the auction and its bid round, so nothing in the kernel calls `RequestProposal` any more — `runtime.proposal_bid` and `TraitServicer.RequestProposal` are still served because the RPC is still in the proto (deliberately unchanged, so the operator contract stays `0093`), but on a current kernel they are unreachable. What distinguishes a DeterministicAgent to the Dispatcher now is its declared capabilities in its manifest, not a bid.
 - **DaemonAgent**: a long-running signal producer on `SignalStream` (not `AgentService`). The author overrides `daemon_loop()` and calls `send_signal()`; the runtime supervises crashes with exponential backoff capped at 30 seconds.
 - **React**: shorthand for the reasoning pattern itself, not a class. The pattern lives in `react.run_think` and is invoked from `CognitiveAgent.think()`. The class hierarchy uses `CognitiveAgent`, not `React`, as the trait name.
 - **ReAct**: the original Yao et al. 2022 paper ("ReAct: Synergizing Reasoning and Acting in Language Models"). Cambrian's loop generalises ReAct with the LRW gate, the v2 prompt layout, and verbal reflection.

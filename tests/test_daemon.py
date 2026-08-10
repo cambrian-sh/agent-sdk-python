@@ -5,6 +5,9 @@ AgentService). A crashing daemon_loop() restarts with exponential backoff capped
 30s — never silent death. One process per stream_id (ADR-0033) ⇒ no shared-self bleed.
 """
 
+import contextlib
+import time
+
 import pytest
 
 from cambrian_agent_sdk import DaemonAgent
@@ -143,6 +146,99 @@ def test_start_daemon_off_main_thread_does_not_raise_on_signals():
     t.join(timeout=15)
 
     assert "err" not in outcome, outcome["err"]
+
+
+def test_reconnecting_the_stream_does_not_start_a_second_daemon_loop(monkeypatch):
+    """Regression: N stream reconnects must not leave N copies of daemon_loop running.
+
+    `start_daemon` started the supervised loop INSIDE its reconnect loop, so every
+    SignalStream disconnect spawned another one while the previous thread kept going
+    (`should_continue` only flips at shutdown). A flapping stream left N concurrent
+    copies of the author's loop.
+
+    Observed live: the telegram ingress reconnected 6 times and then logged 133
+    `409 conflict — another getUpdates poller is running on this token`. The "other
+    poller" was itself. The 409 only made it VISIBLE — Telegram refuses concurrent
+    getUpdates on one token. A daemon without that server-side interlock would have
+    silently done every unit of work N times instead, which is why this is asserted
+    at the SDK and not in the telegram agent.
+    """
+    import threading
+
+    from cambrian_agent_sdk import daemon as daemon_mod
+
+    starts = []
+    shutdown_after = 3  # let the reconnect loop go round three times
+
+    class _FlappingAgent:
+        agent_id = "flapping"
+
+        def __init__(self):
+            import queue
+
+            self._signal_queue = queue.Queue()
+            self.stream_id = ""
+            self.params = {}
+
+        def daemon_loop(self):
+            starts.append(threading.current_thread().name)
+            # Block, the way a real long-poll does. A loop that returned here would
+            # end supervision and mask a second start.
+            while True:
+                time.sleep(0.05)
+
+    reconnects = {"n": 0}
+
+    class _Err(Exception):
+        pass
+
+    def _fake_channel(_addr, options=None):  # noqa: ARG001
+        class _Ch:
+            def close(self):
+                pass
+
+        return _Ch()
+
+    class _FakeStub:
+        def __init__(self, _ch):
+            pass
+
+        def SignalStream(self, _it):  # noqa: N802 — mirrors the generated stub
+            reconnects["n"] += 1
+            if reconnects["n"] >= shutdown_after:
+                # Stop the outer while-loop the same way SIGTERM would.
+                raise KeyboardInterrupt
+            raise _rpc_error()
+
+    def _rpc_error():
+        import grpc
+
+        class _E(grpc.RpcError):
+            def code(self):
+                return "UNAVAILABLE"
+
+        return _E()
+
+    monkeypatch.setattr(daemon_mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        daemon_mod, "_parse_daemon_cli", lambda: ("s1", "127.0.0.1:1", {}), raising=False
+    )
+
+    import grpc as _grpc
+
+    monkeypatch.setattr(_grpc, "insecure_channel", _fake_channel)
+    from cambrian_agent_sdk._proto import cambrian_pb2_grpc
+
+    monkeypatch.setattr(cambrian_pb2_grpc, "OrchestratorStub", _FakeStub)
+
+    with contextlib.suppress(KeyboardInterrupt):
+        daemon_mod.start_daemon(_FlappingAgent(), substrate_addr="127.0.0.1:1")
+
+    assert reconnects["n"] >= 2, "the test did not actually exercise a reconnect"
+    assert len(starts) == 1, (
+        f"daemon_loop was started {len(starts)} times across "
+        f"{reconnects['n']} stream connections; it must be started exactly once"
+    )
 
 
 class _StubAgent:

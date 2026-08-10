@@ -135,6 +135,34 @@ def start_daemon(agent, substrate_addr: Optional[str] = None) -> None:
                 payload=cambrian_pb2.Object(type="signal", data=json.dumps(payload_dict).encode()),
             )
 
+    # Supervise the author's loop in a background thread so the stream drains
+    # concurrently; a crash restarts with backoff (capped 30s), never silent.
+    #
+    # Started ONCE, outside the reconnect loop, and this placement is load-bearing.
+    # It used to be started inside the loop, so every SignalStream reconnect spawned
+    # ANOTHER supervised daemon_loop while the previous thread kept running —
+    # `_should_continue` only flips at shutdown, so nothing ever stopped the old one.
+    # A flapping stream therefore left N copies of the author's loop running forever.
+    #
+    # How it presented: the telegram ingress reconnected 6 times and then logged 133
+    # `409 conflict — another getUpdates poller is running on this token`. The "other
+    # poller" was itself, five times over. The 409 made it visible because Telegram
+    # refuses concurrent getUpdates on one token; a daemon with no such server-side
+    # interlock would instead have silently processed every signal N times, which is
+    # the worse version of this bug and the reason to fix it here rather than in the
+    # telegram agent.
+    #
+    # Safe to hoist: daemon_loop does not touch the channel. It hands work to
+    # `agent._signal_queue`, which `_request_iter` drains on whichever stream is
+    # currently open — so signals queue across a disconnect and flush on reconnect.
+    loop_thread = threading.Thread(
+        target=run_supervised,
+        args=(agent.daemon_loop,),
+        kwargs={"should_continue": _should_continue},
+        daemon=True,
+    )
+    loop_thread.start()
+
     backoff = 1.0
     while _should_continue():
         try:
@@ -147,16 +175,6 @@ def start_daemon(agent, substrate_addr: Optional[str] = None) -> None:
             )
             stub = cambrian_pb2_grpc.OrchestratorStub(channel)
             logger.info("Daemon '%s' opening SignalStream (stream_id=%s)", agent.agent_id, stream_id)
-
-            # Supervise the author's loop in a background thread so the stream drains
-            # concurrently; a crash restarts with backoff (capped 30s), never silent.
-            t = threading.Thread(
-                target=run_supervised,
-                args=(agent.daemon_loop,),
-                kwargs={"should_continue": _should_continue},
-                daemon=True,
-            )
-            t.start()
 
             for _response in stub.SignalStream(_request_iter()):
                 pass  # plan telemetry from the Substrate is fire-and-forget
