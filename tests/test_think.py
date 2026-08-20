@@ -452,6 +452,96 @@ def test_think_memory_query_branch_then_final():
     assert "paris is the capital" in bot.substrate.prompts[1]
 
 
+class _FakePrecedentMemory(_FakeMemory):
+    """A memory client that also serves the world-model PULL lane (ADR-0049 D11):
+    each hit is a prior TRANSITION whose metadata carries the outcome."""
+
+    def __init__(self, results, precedents):
+        super().__init__(results)
+        self.precedents = precedents
+        self.precedent_queries = []
+
+    def recall_precedents(self, query, **kw):
+        self.precedent_queries.append(query)
+        return self.precedents
+
+
+def test_think_recall_precedents_branch_pulls_the_lane_and_renders_it():
+    """ADR-0049 D11/Issue 014: a recall_precedents action reaches
+    MemoryClient.recall_precedents (NOT recall), and the returned transitions —
+    with their outcomes — are rendered into the next prompt."""
+    bot = Bot(agent_id="b")
+    bot.memory = _FakePrecedentMemory(
+        [{"text": "a fact"}],
+        [{"text": "restarted payments at peak -> 4m outage",
+          "metadata": {"outcome": "failure"}}],
+    )
+    bot.substrate = _FakeLLM([
+        json.dumps({"action": "recall_precedents",
+                    "query": "about to restart payments at peak"}),
+        json.dumps({"action": "final_answer", "answer": "drain first"}),
+    ])
+
+    res = bot.think(AgentTask(text="restart payments"))
+    assert res.text == "drain first"
+    # Exactly one pull, on the precedent lane, with the query the model asked for.
+    assert bot.memory.precedent_queries == ["about to restart payments at peak"]
+    assert bot.memory.calls == 1  # the seed fact recall only — NOT a second recall()
+    nxt = bot.substrate.prompts[1]
+    assert 'type="recall_precedents"' in nxt
+    assert 'query="about to restart payments at peak"' in nxt
+    assert "<precedent " in nxt and "outcome='failure'" in nxt
+    assert "restarted payments at peak -&gt; 4m outage" in nxt
+
+
+def test_think_recall_precedents_empty_says_no_precedent():
+    """The lane is similarity-gated: empty means "no comparable prior situation",
+    which the trajectory must SAY, so the model does not read a blank block as a
+    licence to invent an analogy."""
+    bot = Bot(agent_id="b")
+    bot.memory = _FakePrecedentMemory([{"text": "a fact"}], [])
+    bot.substrate = _FakeLLM([
+        json.dumps({"action": "recall_precedents", "query": "never seen before"}),
+        json.dumps({"action": "final_answer", "answer": "proceeding"}),
+    ])
+
+    bot.think(AgentTask(text="do a novel thing"))
+    nxt = bot.substrate.prompts[1]
+    assert 'status="empty"' in nxt
+    assert "no precedent found" in nxt
+
+
+def test_recall_precedents_shares_the_memory_budget():
+    """A precedent round is still a retrieval round: it spends the SAME budget as
+    memory_query, so an LLM that only ever retrieves cannot evade the cap by
+    alternating lanes."""
+    bot = Bot(agent_id="b")
+    bot.memory = _FakePrecedentMemory([{"text": "f"}], [{"text": "p"}])
+    bot.substrate = _FakeLLM(
+        [json.dumps({"action": "recall_precedents", "query": "x"})] * 20)
+
+    res = bot.think(AgentTask(text="q"), max_memory_queries=3)
+    assert isinstance(res, AgentResult)  # graceful, no crash
+    # 1 seed recall + 2 precedent pulls = the 3-round budget.
+    assert bot.memory.calls == 1
+    assert len(bot.memory.precedent_queries) == 2
+
+
+def test_recall_precedents_degrades_when_client_predates_the_lane():
+    """An older MemoryClient has no recall_precedents. That is answered the same way
+    the kernel answers a gated miss — no precedent — never an AttributeError crash."""
+    bot = Bot(agent_id="b")
+    bot.memory = _FakeMemory([{"text": "a fact"}])  # no recall_precedents method
+    bot.substrate = _FakeLLM([
+        json.dumps({"action": "recall_precedents", "query": "x"}),
+        json.dumps({"action": "final_answer", "answer": "ok"}),
+    ])
+
+    res = bot.think(AgentTask(text="q"))
+    assert res.text == "ok"
+    assert "no precedent found" in bot.substrate.prompts[1]
+
+
 def test_seed_recall_always_fires_even_without_llm_memory_query():
     """Every cognitive run consults LTM at least once — the retrieval loop is on."""
     bot = Bot(agent_id="b")

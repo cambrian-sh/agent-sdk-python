@@ -243,6 +243,8 @@ class Step:
 
     Kinds:
         memory_query   — ``query``, ``results`` (list of LTM hit dicts)
+        recall_precedents — ``query``, ``results`` (list of prior-TRANSITION hits;
+                         each result's ``metadata`` may carry an ``outcome``)
         tool_call      — ``tool``, ``args``, ``body``/``summary``,
                          optional ``cid``+``chars`` (offload),
                          ``status`` ('ok'|'error'|'denied')
@@ -310,6 +312,17 @@ def render_step_xml(s) -> str:
             f' status="{_esc(s.status)}"'
         )
         body = _render_memory_results(s.results or [])
+        return f"<step n={n!r}{attrs}>\n{body}\n</step>"
+
+    if kind == "recall_precedents":
+        # ADR-0049 D11/Issue 014: prior transitions, not facts — same attribute shape
+        # as memory_query (the query is what was ASKED), different children.
+        attrs = (
+            f' type="recall_precedents"'
+            f' query="{_esc(s.query)}"'
+            f' status="{_esc(s.status)}"'
+        )
+        body = _render_precedent_results(s.results or [])
         return f"<step n={n!r}{attrs}>\n{body}\n</step>"
 
     if kind == "tool_call":
@@ -579,6 +592,31 @@ def _render_memory_results(results) -> str:
     for r in results:
         text = r.get("text", r) if isinstance(r, dict) else getattr(r, "text", r)
         items.append(f"  <memory {memory_provenance_attrs(r)}>{_esc(text)}</memory>")
+    return "\n".join(items)
+
+
+def _render_precedent_results(results) -> str:
+    """Render a recall_precedents round's results as ``<precedent>`` children.
+
+    Same provenance/freshness attributes as a recalled fact (ADR-0048 A1), led by the
+    ``outcome`` the kernel stamps on each transition — the one field that decides how
+    the agent should read the precedent (the lane is failure-weighted, so the negative
+    ones arrive first and must be legible as such).
+
+    An empty result is a REAL answer on this lane — "no comparable prior situation" —
+    and is rendered as such (ADR-0049 Issue 014: similarity-gated, never a fabricated
+    analogy), so the model does not read a blank block as licence to invent one."""
+    if not results:
+        return ("  <note>no precedent found — no comparable prior situation is on "
+                "record; proceed on your own judgment</note>")
+    items = []
+    for r in results:
+        text = r.get("text", r) if isinstance(r, dict) else getattr(r, "text", r)
+        outcome = str(_memory_meta(r).get("outcome", "") or "")
+        attrs = memory_provenance_attrs(r)
+        if outcome:
+            attrs = f"outcome={_esc(outcome)!r} " + attrs
+        items.append(f"  <precedent {attrs}>{_esc(text)}</precedent>")
     return "\n".join(items)
 
 

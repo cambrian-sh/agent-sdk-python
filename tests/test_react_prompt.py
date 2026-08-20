@@ -55,6 +55,28 @@ def test_action_menu_instructs_memory_before_answering():
     assert "own knowledge" in schema or "your own knowledge" in schema or "training" in schema
 
 
+def test_action_menu_offers_recall_precedents_when_memory_exists():
+    """ADR-0049 D11/Issue 014: the world-model PULL lane is only reachable if the
+    action menu advertises it. Regression for the lane being unreachable in practice —
+    the kernel served precedents and no agent could ever ask for them."""
+    schema = build_output_schema(_FakeAgent())
+    assert '"action": "recall_precedents"' in schema
+    lower = schema.lower()
+    # WHEN to use it, and what an empty result means (never a fabricated analogy).
+    assert "before committing" in lower
+    assert "transitions" in lower
+    assert "no precedent" in lower
+
+
+def test_recall_precedents_absent_without_memory_access():
+    """The menu follows the BUDGET: an agent with no memory access must not be shown
+    a retrieval action the loop will refuse — the same rule that already governs
+    memory_query."""
+    schema = build_output_schema(_FakeAgent(), allow_memory=False)
+    assert "recall_precedents" not in schema
+    assert "NO memory access" in schema
+
+
 def test_action_menu_steers_find_tools_on_capability_gap():
     """Regression: small models declared tasks impossible when a needed tool was
     absent from the (task-relevant SUBSET) menu, instead of pulling more via
@@ -162,6 +184,33 @@ def test_render_recall_v2_empty_has_query_attribute():
     assert 'query="Q4 2024 revenue"' in block
     assert "status=" in block
     assert "empty" in block
+
+
+def test_render_precedent_step_surfaces_query_and_outcome():
+    """A precedent round renders like a memory round — query + status as attributes —
+    but its children are ``<precedent>`` blocks led by the kernel-stamped outcome,
+    which is what tells the agent whether the transition is a warning or a template."""
+    from cambrian_agent_sdk.react import _render_precedent_step
+
+    block = _render_precedent_step(
+        "restart payments at peak", "ok",
+        [{"text": "restarted at peak", "metadata": {"outcome": "failure"}}],
+    )
+    assert 'type="recall_precedents"' in block
+    assert 'query="restart payments at peak"' in block
+    assert "outcome='failure'" in block
+    assert "<precedent " in block and "restarted at peak" in block
+
+
+def test_render_precedent_step_empty_is_explicit_no_precedent():
+    """Similarity-gated: an empty result is the ANSWER ("no comparable prior
+    situation"), and must be stated so the model does not invent an analogy."""
+    from cambrian_agent_sdk.react import _render_precedent_step
+
+    block = _render_precedent_step("something novel", "empty", [])
+    assert 'status="empty"' in block
+    assert "no precedent found" in block
+    assert "judgment" in block
 
 
 def test_action_menu_documents_cid_handoff():

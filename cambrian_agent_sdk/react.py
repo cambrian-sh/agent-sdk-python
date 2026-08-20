@@ -4,7 +4,8 @@ A reason/retrieve/act loop with three branches:
 
 - **memory-query** — capped re-queries with *graceful degradation*: once the budget
   is spent the loop stops retrieving and asks the LLM to answer best-effort; it never
-  crashes at the cap;
+  crashes at the cap. ``recall_precedents`` (the world-model PULL lane, ADR-0049 D11)
+  is a second retrieval action on the SAME budget;
 - **tool-call** — capped rounds; exceeding the cap raises :class:`ReActLoopError`,
   a *typed* error the default ``run()`` catches and turns into ``type="error"``;
 - **final-answer** — parsed and returned as an :class:`AgentResult`.
@@ -22,7 +23,7 @@ v2 additions (see docs/research/agent-prompting/SUMMARY.md):
 - The 4 Rules also live in ``<Constraints>`` at the top of <System> (via
   ``helpers.DEFAULT_CONSTRAINTS``) for recency-priority visibility.
 - Trajectory entries are emitted via :func:`working_memory.add_step` for typed
-  steps (memory_query, tool_call) — the v2 rich XML renderer produces
+  steps (memory_query, recall_precedents, tool_call) — the v2 rich XML renderer produces
   self-describing ``<step n="N" type="..." status="...">`` blocks with named
   ``<call>`` children and ``<result offloaded_cid="...">`` summaries.
 """
@@ -49,6 +50,7 @@ from .working_memory import (
     memory_provenance_attrs,
     render_entry_xml,
     _render_memory_results,
+    _render_precedent_results,
 )
 
 logger = logging.getLogger("cambrian.react")
@@ -196,6 +198,8 @@ def build_output_schema(
         + ("## Memory actions\n"
            '- `{"action": "memory_query", "query": "<text>"}` — retrieve from org long-term memory (knowledge base). Do this FIRST; ground claims in retrieved facts before answering from your own training.\n'
            '  Example: `{"action": "memory_query", "query": "Q4 2024 revenue"}`\n'
+           '- `{"action": "recall_precedents", "query": "<the situation you are about to act in>"}` — before committing to an approach in a situation that may have occurred before, pull prior TRANSITIONS (what was done, what followed), failures first; an empty result means no precedent — proceed on your own judgment.\n'
+           '  Example: `{"action": "recall_precedents", "query": "about to restart the payments service during peak traffic"}`\n'
            "\n" if allow_memory else
            "## Memory\n"
            "- You have NO memory access in this session. There is no `memory_query` action; do not attempt one.\n"
@@ -383,8 +387,8 @@ class _ConversationMirror:
         return wrapped
 
     def add_step(self, kind: str, pinned: bool = False, **fields):
-        """Memory-query steps carry retrieved facts the model must see; tool_call steps
-        are already represented by their tool turn."""
+        """Memory-query and precedent steps carry retrieved content the model must see;
+        tool_call steps are already represented by their tool turn."""
         result = self._wm.add_step(kind, pinned=pinned, **fields)
         if kind == "memory_query":
             rendered = _render_memory_results(fields.get("results") or [])
@@ -392,6 +396,13 @@ class _ConversationMirror:
                 "role": "user",
                 "content": ("<memory_query query=" + repr(fields.get("query")) + ">"
                             + chr(10) + rendered + chr(10) + "</memory_query>"),
+            })
+        elif kind == "recall_precedents":
+            rendered = _render_precedent_results(fields.get("results") or [])
+            self._emit({
+                "role": "user",
+                "content": ("<recall_precedents query=" + repr(fields.get("query")) + ">"
+                            + chr(10) + rendered + chr(10) + "</recall_precedents>"),
             })
         return result
 
@@ -454,6 +465,7 @@ _DISCOVERY_TOOL_NAMES = {d["name"] for d in _DISCOVERY_TOOL_DEFS}
 _CONTROL_ACTION_NAMES = _DISCOVERY_TOOL_NAMES | {
     "final_answer",
     "memory_query",
+    "recall_precedents",
     "describe_tool",
     "use_skill",
     "find_skills",
@@ -1067,6 +1079,38 @@ def run_think(
             # v2: emit as a typed Step so the query is visible in the trajectory.
             wm.add_step(
                 kind="memory_query",
+                query=query,
+                status="ok" if results else "empty",
+                results=results,
+            )
+            continue
+
+        if kind == "recall_precedents":
+            # ADR-0049 D11/Issue 014: the world-model PULL lane. A different QUESTION
+            # from memory_query ("what happened last time in a situation like this?"
+            # vs "what do I know?"), but the same RETRIEVAL budget — a precedent round
+            # is still a round spent retrieving instead of acting, and giving it its
+            # own budget would let an LLM that only ever retrieves evade the cap by
+            # alternating between the two lanes.
+            query = action.get("query", "")
+            if mem_queries >= max_memory_queries:
+                if mem_exhausted:
+                    logger.warning("react_memory_budget_exceeded", extra={"round": round_no})
+                    return AgentResult.from_text(_best_effort(wm), type=result_type or "text")
+                mem_exhausted = True
+                wm.add_text("<note>memory query budget exhausted; answer best-effort</note>")
+                continue
+            mem_queries += 1
+            results = _safe_recall_precedents(agent, query, task.session_token_id)
+            logger.info(
+                "react_recall_precedents",
+                extra={"round": round_no, "query": query, "results_count": len(results)},
+            )
+            # Empty is a REAL answer here ("no precedent"), not a failed retrieval — the
+            # renderer says so explicitly rather than leaving a blank the model reads as
+            # a licence to invent an analogy.
+            wm.add_step(
+                kind="recall_precedents",
                 query=query,
                 status="ok" if results else "empty",
                 results=results,
@@ -1851,6 +1895,27 @@ def _safe_recall(agent, query: str, session_token_id: str = ""):
         return []
 
 
+def _safe_recall_precedents(agent, query: str, session_token_id: str = ""):
+    """Call the agent's memory.recall_precedents if present; degrade to empty on any
+    failure — including a memory client that predates the lane (``AttributeError``),
+    which is answered the same way the kernel answers a similarity-gated miss: no
+    precedent. An empty list is a legitimate result here, so degradation is silent by
+    design and never becomes a fabricated analogy."""
+    memory = getattr(agent, "memory", None)
+    if memory is None:
+        return []
+    fn = getattr(memory, "recall_precedents", None)
+    if fn is None:
+        return []
+    try:
+        return fn(query, session_token_id=session_token_id)
+    except TypeError:
+        # A client that predates the session_token_id param — degrade rather than break.
+        return fn(query)
+    except Exception:
+        return []
+
+
 def _content_cid(r) -> str:
     """The full-body CID a recalled fact carries (ADR-0048 #1), parsed from its
     metadata. Recall returns the fact's one-line SUMMARY as the text and the full
@@ -1910,6 +1975,19 @@ def _render_memory_children(results) -> str:
         text = r.get("text", r) if isinstance(r, dict) else getattr(r, "text", r)
         items.append(f"  <memory {memory_provenance_attrs(r)}>{_esc(text)}</memory>")
     return "\n".join(items)
+
+
+# v2 typed-Step renderer for recall_precedents (ADR-0049 D11/Issue 014) — the same
+# shape as the memory_query renderer, because a precedent round is read the same way:
+# the query is surfaced as an attribute so the next round sees WHAT SITUATION was
+# asked about. Used by the loop via WorkingMemory.add_step(kind="recall_precedents").
+def _render_precedent_step(query: str, status: str, results) -> str:
+    """Build a typed Step for a recall_precedents round (v2 trajectory)."""
+    return (
+        f'<step type="recall_precedents" query="{_esc(query)}" status="{_esc(status)}">\n'
+        + _render_precedent_results(results)
+        + "\n</step>"
+    )
 
 
 # ADR-0048 #1: the recall block carried into the prompt. When the kernel's

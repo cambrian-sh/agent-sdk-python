@@ -26,7 +26,8 @@ if __name__ == "__main__":
 ```
 
 The kernel spawns your agent, hands it tasks over the agent plane, and your `run()`/`think()`
-loop can call **memory** (`memory_query`), **tools** (`tool_call` — kernel-owned or your own
+loop can call **memory** (`memory_query` for facts, `recall_precedents` for prior transitions
+with their outcomes), **tools** (`tool_call` — kernel-owned or your own
 `@tool` methods), and **delegate** (`yield_subgoal`) to the planner.
 
 ## Agent shapes

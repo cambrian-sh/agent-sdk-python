@@ -14,6 +14,7 @@ Error surfaces: a coined hint → :class:`InvalidTagError`; a scope-denied read 
 
 from __future__ import annotations
 
+import warnings
 from typing import List, Optional
 
 
@@ -101,14 +102,30 @@ class MemoryClient:
 
     def recall_entity(self, kind_id: str, timeout_ms: int = 0,
                       session_token_id: str = "") -> List[dict]:
-        """Resolve ONE entity's current reconstructed state by its canonical ``kind:id``
-        (ADR-0049 Issue 012) — e.g. ``file:c:/repo/a.md`` or ``api:https://x.com``. This
-        is an EXACT lookup ("what is true of that thing now?"), not a semantic search:
-        the returned text is the materialized field-LWW view (a deleted file reads
-        ``exists=false``) plus the link to its most-recent engaging scene. Routed by
-        ``x-lane=entity``. Empty list when the entity is unknown."""
+        """**Deprecated.** The kernel REMOVED the entity lane on 2026-08-14 (the
+        world-model entity records are gone), and now routes ``x-lane=entity`` to the
+        default FACT lane. This call therefore no longer resolves an entity's
+        reconstructed state: it is a semantic fact search whose query happens to be a
+        ``kind:id`` string, which almost never retrieves anything useful. Use
+        :meth:`recall` for facts or :meth:`recall_precedents` for prior transitions.
+
+        Kept (it is published API surface) with unchanged wire behaviour — it still
+        sends ``x-lane=entity``, because an OLDER kernel that still serves the lane must
+        keep answering it — and emits a :class:`DeprecationWarning` on call.
+
+        Historically (ADR-0049 Issue 012): an EXACT lookup by canonical ``kind:id`` —
+        e.g. ``file:c:/repo/a.md`` — returning the materialized field-LWW view (a
+        deleted file read ``exists=false``) plus the link to its most-recent engaging
+        scene."""
         from ._proto import cambrian_pb2
 
+        warnings.warn(
+            "MemoryClient.recall_entity is deprecated: the kernel removed the entity "
+            "lane on 2026-08-14 and now serves x-lane=entity from the default fact "
+            "lane. Use recall() for facts or recall_precedents() for prior transitions.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         req = cambrian_pb2.MemoryRequest(query=kind_id, top_k=1)
         md = self._identity_metadata() + [("x-lane", "entity")]
         md = md + _lease_metadata(session_token_id)

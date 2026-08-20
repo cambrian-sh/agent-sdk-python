@@ -157,16 +157,31 @@ def test_recall_does_not_send_actions_lane():
 
 
 def test_recall_entity_routes_entity_lane():
-    """ADR-0049 Issue 012: recall_entity is an exact lookup — it sends x-lane=entity and
-    the canonical kind:id as the query."""
+    """recall_entity still sends x-lane=entity and the canonical kind:id as the query.
+
+    Deprecated (the kernel removed the entity lane on 2026-08-14) but the WIRE
+    behaviour is deliberately unchanged: an older kernel that still serves the lane
+    must keep answering it."""
     stub = _FakeStub()
     mem = MemoryClient(stub=stub, agent_id="analyst")
 
-    mem.recall_entity("file:c:/repo/a.md", session_token_id="sess-1")
+    with pytest.warns(DeprecationWarning):
+        mem.recall_entity("file:c:/repo/a.md", session_token_id="sess-1")
 
     md = dict(stub.calls["QueryMemory_metadata"] or [])
     assert md.get("x-lane") == "entity"
     assert stub.calls["QueryMemory"].query == "file:c:/repo/a.md"
+
+
+def test_recall_entity_is_deprecated():
+    """The kernel removed the entity lane on 2026-08-14 and now serves x-lane=entity
+    from the default FACT lane, so the call no longer resolves an entity. The method
+    stays (published API surface) and says so on call."""
+    stub = _FakeStub()
+    mem = MemoryClient(stub=stub, agent_id="analyst")
+
+    with pytest.warns(DeprecationWarning, match="entity lane"):
+        mem.recall_entity("file:c:/repo/a.md")
 
 
 def test_recall_precedents_routes_precedent_lane():
