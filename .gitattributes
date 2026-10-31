@@ -1,0 +1,33 @@
+# Line-ending normalisation — kept identical across every Cambrian repo.
+#
+# The sibling repos disagreed: cambrian-core was CRLF, ui/ and cli/ were LF. Since
+# ui/ and cli/ VENDOR core's operator.proto, every cross-repo comparison reported
+# the whole file as changed and hid the real drift inside the noise.
+#
+# `text=auto eol=lf` normalises to LF in the repository and on checkout, and
+# overrides core.autocrlf, so the tree is identical on every platform.
+#
+# Adopting on an existing checkout (CLEAN tree only — this rewrites most files):
+#     git add --renormalize . && git commit -m "chore: normalise line endings to LF"
+
+* text=auto eol=lf
+
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.rar  binary
+*.exe  binary
+*.dll  binary
+*.so   binary
+*.dylib binary
+*.db   binary
+*.pyc  binary
+
+*_pb2.py      linguist-generated=true
+*_pb2_grpc.py linguist-generated=true
+*_pb2.pyi     linguist-generated=true
