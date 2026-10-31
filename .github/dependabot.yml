@@ -1,0 +1,10 @@
+# Keeps the SHA-pinned actions in .github/workflows current (2026-10-31 audit,
+# T-20261031-github-actions-are-pinned-by-major-tag-not-sha). The PyPI publish
+# action is among them, so this is the one place a moved tag could reach a
+# publishing credential.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

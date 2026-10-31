@@ -53,3 +53,11 @@ exclude = ["**/__pycache__", "**/*.pyc", "tests", "**/*_test.py", "**/test_*.py"
 [tool.hatch.build.targets.sdist]
 include = ["cambrian_agent_sdk", "README.md", "LICENSE", "pyproject.toml"]
 exclude = ["**/__pycache__", "**/*.pyc"]
+
+[tool.pytest.ini_options]
+# The example agents are imported directly by tests/test_terminal_agent.py and
+# tests/test_code_executor_agent.py, and tests/test_wiring.py reads their source.
+# Without this a clean-checkout `pytest` failed collection
+# (T-20261031-sdk-test-suite-does-not-pass-from-a-clean).
+pythonpath = ["example-agents"]
+testpaths = ["tests"]

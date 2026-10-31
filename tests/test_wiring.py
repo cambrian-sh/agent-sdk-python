@@ -46,7 +46,10 @@ def test_bind_clients_wires_memory_artifacts_substrate():
     assert bot.memory.recall("q")[0]["text"] == "bound"
 
 
-_AGENTS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "agents")
+# The migrated example agents ship inside this repo (sdk/example-agents). The old
+# "../../agents" path assumed the pre-split monorepo layout and pointed outside
+# the checkout (T-20261031-sdk-test-wiring-reads-agents-analyst-agent-py).
+_AGENTS_DIR = os.path.join(os.path.dirname(__file__), "..", "example-agents")
 _MIGRATED = [
     "analyst_agent.py",
     "code_generator_agent.py",
