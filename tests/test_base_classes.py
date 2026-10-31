@@ -57,9 +57,11 @@ def test_subclassing_requires_no_proto_import():
 
 
 def test_deterministic_subclass_runs_without_reasoning_surface():
-    class Doubler(DeterministicAgent):
-        def run(self, task):
-            return "42"
+    with pytest.deprecated_call():  # DeterministicAgent is deprecated (2026-10-31)
+
+        class Doubler(DeterministicAgent):
+            def run(self, task):
+                return "42"
 
     d = Doubler(agent_id="doubler")
     assert d.run(None) == "42"

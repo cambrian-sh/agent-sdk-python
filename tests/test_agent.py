@@ -132,9 +132,12 @@ def test_cognitive_agent_react_loop_error_caught():
 # ── DeterministicAgent ──────────────────────────────────────────────────────
 
 
-class _AddTool(DeterministicAgent):
-    def run(self, task):
-        return AgentResult(data=str(int(task.text) + 1).encode())
+# DeterministicAgent is deprecated; subclassing warns (see tests/test_deterministic.py).
+with pytest.deprecated_call():
+
+    class _AddTool(DeterministicAgent):
+        def run(self, task):
+            return AgentResult(data=str(int(task.text) + 1).encode())
 
 
 def test_deterministic_static_bid():

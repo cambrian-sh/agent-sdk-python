@@ -33,7 +33,12 @@ with their outcomes), **tools** (`tool_call` — kernel-owned or your own
 ## Agent shapes
 
 - **`CognitiveAgent`** — LLM reasoning: `run()` → `think()` ReAct loop, memory, and `@tool` actions.
-- **`DeterministicAgent`** — a scripted cell: typed `run()` only, no reasoning (a fast tool).
+- **`DeterministicAgent`** — *deprecated.* A scripted cell: typed `run()` only, no reasoning.
+  Subclassing it emits a `DeprecationWarning`: the kernel no longer selects agents by static
+  bid (default dispatch matches the capabilities your manifest declares) and has deprecated
+  trait `"tool"`. Subclass `CognitiveAgent` and override `run()` with your scripted logic
+  instead; deterministic kernel functions are kernel-owned tools (`ExecuteTool`). See
+  `CHANGELOG.md` in the repository.
 - **`DaemonAgent`** — a persistent background producer on the `SignalStream` contract.
 
 Declare tools with the `@tool` decorator (auto-injected into the agent's action menu) and

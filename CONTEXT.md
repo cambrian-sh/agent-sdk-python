@@ -52,7 +52,7 @@ for the network, so it runs with no credentials).
 
 | Area | Source | Status |
 | --- | --- | --- |
-| Trait taxonomy (`Agent` abstract + `CognitiveAgent` / `DeterministicAgent` / `DaemonAgent`) | `base.py`; ADR-0036 D1 | Implemented |
+| Trait taxonomy (`Agent` abstract + `CognitiveAgent` / `DeterministicAgent` / `DaemonAgent`) | `base.py`; ADR-0036 D1 | Implemented. `DeterministicAgent` **deprecated 2026-10-31** (owner decision; `DeprecationWarning` on subclassing, unreleased — see `CHANGELOG.md`, T-20261031-sdk-deterministicagent-still-advertises-trait) |
 | ReAct pattern: `run_think` driven by the cognitive trait's `think()` | `react.py` | Implemented |
 | Local Recurrent Workspace gate (recurrent reconciliation) | `recurrence.py`; ADR-0041 D4 | Implemented |
 | Verbal self-reflection on the gate (pinned working-memory lesson) | `reflection.py`; ADR-0052 | Implemented (residual) |
@@ -78,6 +78,7 @@ literals before the Python process boots. The gRPC proto is the only
 contract with the Go kernel: the SDK ships its own vendored stubs under
 `cambrian_agent_sdk/_proto/` and never imports the Go runtime. The
 trait taxonomy maps 1:1 to the class structure, so a `DeterministicAgent`
+(deprecated 2026-10-31; new agents use `CognitiveAgent` with an overridden `run()`)
 literally has no `think()` and a `DaemonAgent` serves a different
 contract (`SignalStream`) than the task-responders.
 
@@ -181,13 +182,14 @@ reconnects per agent, **0** conflicts and **0** loop crashes, against 133 of eac
 - **Licence: Apache-2.0** (ADR-0057 D10, amended 2026-10-31; the original BSL 1.1 plan was dropped). OSI-open, unlike the ELv2 kernel.
 - **Cross-run `LessonsLearned` write-back is open.** ADR-0052 ships the per-run reflection, but it lives in working memory only. Writing reflections back to LTM (the FORGE / `LessonsLearned` lane per ADR-0049) is the natural follow-up, and is a kernel change, not an SDK one.
 - **The A2A server in `server.py` is minimal.** The current daemon runtime handles a `SignalStream` round-trip, but is not a full Agent2Agent protocol implementation. A canonical A2A stack would add an AgentCard, server-side skills index, and JSON-RPC translation. Deferred.
+- **`DeterministicAgent` is deprecated but not removed**, and three cambrian-core system agents (`agents/system/{docling,kg_extractor,reranker}_agent`) still subclass it, so they print the `DeprecationWarning` at boot once they run on an SDK containing it. Migrating them flips their trait from `"tool"` to `"cognitive"` (interview / verifier-pool eligibility), so it is an owner decision — T-20261031-core-system-agents-docling-kg-extractor.
 - **Proto is vendored, not generated.** Re-vendoring requires running `grpcio-tools` against the kernel's `.proto` and overwriting `_proto/`. There is no automatic check that the vendored stubs match the kernel's current proto; treat any drift as a build break.
 
 ## Terminology Glossary
 
 - **Agent**: the abstract base class in `base.py`. Cannot be instantiated directly; the structural enforcement of ADR-0036 D1 is that authors must pick a trait.
 - **CognitiveAgent**: an LLM-reasoning trait with `run()`, `think()`, memory, and `@tool` actions. The ReAct loop is wired through `react.run_think`; the default `run()` catches `ReActLoopError` and returns a typed `type="error"` result.
-- **DeterministicAgent**: a scripted cell with a typed `run()` and no `think()`. It answers `RequestProposal` with a static 1.0-confidence / 5 ms proposal, which is what made a selection mechanism treat it as a tool rather than a reasoning capability. **As of 2026-08-07 the kernel never asks.** ADR-0100 P3 deleted the auction and its bid round, so nothing in the kernel calls `RequestProposal` any more — `runtime.proposal_bid` and `TraitServicer.RequestProposal` are still served because the RPC is still in the proto (deliberately unchanged, so the operator contract stays `0093`), but on a current kernel they are unreachable. What distinguishes a DeterministicAgent to the Dispatcher now is its declared capabilities in its manifest, not a bid.
+- **DeterministicAgent**: a scripted cell with a typed `run()` and no `think()`. It answers `RequestProposal` with a static 1.0-confidence / 5 ms proposal, which is what made a selection mechanism treat it as a tool rather than a reasoning capability. **As of 2026-08-07 the kernel never asks.** ADR-0100 P3 deleted the auction and its bid round, so nothing in the kernel calls `RequestProposal` any more — `runtime.proposal_bid` and `TraitServicer.RequestProposal` are still served because the RPC is still in the proto (deliberately unchanged, so the operator contract stays `0093`), but on a current kernel they are unreachable. What distinguishes a DeterministicAgent to the Dispatcher now is its declared capabilities in its manifest, not a bid. **Deprecated 2026-10-31** (owner decision, T-20261031-sdk-deterministicagent-still-advertises-trait): defining a subclass emits a `DeprecationWarning` once per subclass (`DeterministicAgent.__init_subclass__`, `stacklevel=3` so it is attributed to the author's module — an agent run as `python agent.py` sees it under the default filter) naming the replacement: `CognitiveAgent` with an overridden `run()`, or a kernel-owned tool via `ExecuteTool` (ADR-0039 A1.3). Behaviour is otherwise unchanged (`trait = "tool"`, static `propose()`); the class goes when the kernel drops `TraitTool`. Three cambrian-core system agents (docling, kg_extractor, reranker) still subclass it; migrating them changes their trait and is an owner decision — T-20261031-core-system-agents-docling-kg-extractor.
 - **DaemonAgent**: a long-running signal producer on `SignalStream` (not `AgentService`). The author overrides `daemon_loop()` and calls `send_signal()`; the runtime supervises crashes with exponential backoff capped at 30 seconds.
 - **React**: shorthand for the reasoning pattern itself, not a class. The pattern lives in `react.run_think` and is invoked from `CognitiveAgent.think()`. The class hierarchy uses `CognitiveAgent`, not `React`, as the trait name.
 - **ReAct**: the original Yao et al. 2022 paper ("ReAct: Synergizing Reasoning and Acting in Language Models"). Cambrian's loop generalises ReAct with the LRW gate, the v2 prompt layout, and verbal reflection.

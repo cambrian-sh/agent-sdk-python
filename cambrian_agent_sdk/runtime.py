@@ -137,7 +137,8 @@ def dispatch_run(agent: "Agent", task: AgentTask) -> AgentResult:
 
 def proposal_bid(agent, request):
     """Resolve an agent's auction bid. Uses ``agent.propose()`` when present (the
-    DeterministicAgent static bid); otherwise a generic best-effort bid."""
+    deprecated DeterministicAgent static bid); otherwise a generic best-effort bid.
+    The kernel's default capability-typed dispatch (ADR-0100) solicits no bids."""
     from .types import ProposalResponse
 
     propose = getattr(agent, "propose", None)

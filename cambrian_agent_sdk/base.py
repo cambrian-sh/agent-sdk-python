@@ -5,6 +5,7 @@ abstract :class:`Agent`. Trait contracts are enforced by **class structure**:
 
 - :class:`CognitiveAgent` — LLM reasoning (``think()``), memory, ``@tool`` actions.
 - :class:`DeterministicAgent` — a scripted cell; **no** ``think()`` / memory surface.
+  *Deprecated* (2026-10-31): subclassing it emits a ``DeprecationWarning``; see the class.
 - :class:`DaemonAgent` — a persistent signal producer on a *different* gRPC contract
   (``SignalStream``, not ``AgentService``); it is a **sibling, not a mixin**, because it
   cannot be both a task-responder and a signal-producer in one lifecycle.
@@ -16,6 +17,7 @@ Authors subclass a trait and override ``run()`` (cognitive/deterministic) or
 from __future__ import annotations
 
 import json
+import warnings
 from abc import ABC, abstractmethod
 from typing import Optional, Union
 
@@ -214,17 +216,72 @@ class CognitiveAgent(Agent):
         return sorted(out)
 
 
+#: Message for the DeterministicAgent deprecation. Module-level so tests can match it.
+_DETERMINISTIC_AGENT_DEPRECATION = (
+    "{name} subclasses DeterministicAgent, which is deprecated and will be removed once "
+    "the kernel drops trait \"tool\" (deprecated there by ADR-0039 A1.3). The kernel no "
+    "longer selects agents by static bid: default dispatch matches the capabilities an "
+    "agent's manifest declares (ADR-0100) and solicits no bids. Subclass CognitiveAgent "
+    "and override run() with the scripted logic, or implement the capability as a "
+    "kernel-owned tool invoked via ExecuteTool."
+)
+
+
 class DeterministicAgent(Agent):
     """A scripted cell: typed ``run()`` only — no reasoning, memory, or tools.
 
-    Has no ``think()`` by construction (structural trait enforcement). Bids
-    statically in the auction (``Confidence=1.0``, ``Latency=5ms``) — issue 0036-07.
+    Has no ``think()`` by construction (structural trait enforcement).
+
+    What ``trait = "tool"`` means to the kernel today: the agent skips the LLM
+    capability interview (its ``AGENT_DESCRIPTION`` is embedded directly) and is
+    never drafted as a verifier. It does NOT win the auction by bidding statically:
+    the kernel's Confidence=1.0 static-bid bypass was removed (ADR-0023), the kernel
+    marks ``"tool"`` deprecated in favour of kernel-owned tools invoked via
+    ExecuteTool (ADR-0039 A1.3), and default capability-typed dispatch solicits no
+    bids at all (ADR-0100). :meth:`propose` only answers if a caller still asks.
+    For a deterministic capability, prefer a kernel tool.
+
+    .. deprecated:: unreleased (after 0.1.5)
+        Owner decision 2026-10-31 (ticket
+        T-20261031-sdk-deterministicagent-still-advertises-trait). Defining a
+        subclass emits a :class:`DeprecationWarning` once per subclass (from
+        :meth:`__init_subclass__`, so instantiating does not repeat it). Use instead:
+
+        - :class:`CognitiveAgent` with ``run()`` overridden to hold the scripted
+          logic — the kernel's default dispatch picks agents by the capabilities their
+          manifest declares (ADR-0100), not by trait or bid. Note the trait change
+          does matter in two places: a ``"cognitive"`` agent goes through the kernel's
+          LLM capability interview and can be drafted as a verifier, which a
+          ``"tool"`` agent is not (kernel system agents are interview-exempt either
+          way). This is how ``example-agents/terminal_agent.py`` was migrated.
+        - a kernel-owned tool, invoked via ``ExecuteTool`` (ADR-0039 A1.3), when the
+          capability is a deterministic kernel function rather than an agent.
+
+        Behaviour is unchanged while deprecated: ``trait`` stays ``"tool"`` (the kernel
+        still parses it, skips the interview and excludes it from verifier pools) and
+        :meth:`propose` still returns the static bid. The class will be removed once the
+        kernel drops ``TraitTool`` (cambrian-core ``domain/agent.go``).
     """
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        super().__init_subclass__(**kwargs)
+        # stacklevel=3 attributes the warning to the module running the ``class``
+        # statement: frame 1 is this hook, frame 2 is ``ABCMeta.__new__`` (Agent is an
+        # ABC, and abc's metaclass __new__ is a Python frame), frame 3 is the author's
+        # module. That module is what Python's default filter checks: an agent run as
+        # ``python agent.py`` defines its class in __main__ and sees the warning;
+        # library imports do not unless warnings are enabled (pytest, -W default).
+        # tests/test_deterministic.py pins the attributed filename.
+        warnings.warn(
+            _DETERMINISTIC_AGENT_DEPRECATION.format(name=cls.__qualname__),
+            DeprecationWarning,
+            stacklevel=3,
+        )
 
     trait = "tool"
 
-    #: A scripted cell bids statically — it always can, and fast. The auction treats
-    #: it as a deterministic tool rather than scoring a reasoning capability.
+    #: The bid :meth:`propose` returns if a bid is solicited (issue 0036-07). The
+    #: kernel gives it no special weight; see the class docstring.
     STATIC_CONFIDENCE = 1.0
     STATIC_LATENCY_MS = 5
 
@@ -234,7 +291,8 @@ class DeterministicAgent(Agent):
         raise NotImplementedError
 
     def propose(self, task: "AgentTask" = None):
-        """The automatic static bid (Confidence=1.0, Latency=5ms) — no override needed."""
+        """The fixed bid (Confidence=1.0, Latency=5ms) if one is solicited; the default
+        capability-typed dispatch (ADR-0100) does not solicit bids."""
         from .types import ProposalResponse
 
         return ProposalResponse(

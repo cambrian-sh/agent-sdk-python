@@ -37,9 +37,10 @@ literals before the Python process boots.
 ## What this is
 
 The SDK builds Cambrian agents in Python with zero boilerplate. Authors import
-`CognitiveAgent`, `DeterministicAgent`, or `DaemonAgent` from
-`cambrian_agent_sdk`, override `run()` (or `think()` for the cognitive trait),
-and call `agent.serve()`. On PyPI, the package is `cambrian-agent-sdk` on its
+`CognitiveAgent` or `DaemonAgent` from `cambrian_agent_sdk` (`DeterministicAgent`
+still exists but is deprecated since 2026-10-31 and warns on subclassing; new agents
+use `CognitiveAgent` with an overridden `run()`), override `run()` (or `think()` for
+the cognitive trait), and call `agent.serve()`. On PyPI, the package is `cambrian-agent-sdk` on its
 own version line (currently `0.1.5`) under the Apache License 2.0 (ADR-0057 D10,
 amended 2026-10-31).
 The gRPC proto is the only contract with the kernel: the SDK ships its own
@@ -64,7 +65,7 @@ kernel.
 | Path | Role |
 | --- | --- |
 | `cambrian_agent_sdk/` | The SDK package; load-bearing files: |
-| | `base.py` (agent loop bases: `Agent` abstract + `CognitiveAgent` / `DeterministicAgent` / `DaemonAgent` traits; the ReAct pattern wires through `react.run_think`, ADR-0036 D1) |
+| | `base.py` (agent loop bases: `Agent` abstract + `CognitiveAgent` / `DeterministicAgent` (deprecated) / `DaemonAgent` traits; the ReAct pattern wires through `react.run_think`, ADR-0036 D1) |
 | | `runtime.py` (gRPC server base for `AgentService` and `SignalStream`) |
 | | `tools.py` (in-process `@tool` registration and `ToolRegistry`) |
 | | `recurrence.py` (Local Recurrent Workspace gate, ADR-0041 D4) |
