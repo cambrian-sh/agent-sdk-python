@@ -5,6 +5,12 @@ Authoritative ADR: ../cambrian-core/docs/adr/0036-trait-aligned-cognitive-agent-
 
 # sdk, AGENTS.md
 
+## Knowledge system (MANDATORY)
+- **All ADRs, measurements, and decisions live in `cambrian-knowledge/adrs/`.** Query the
+  graph (`search_graph`, `query_graph`) before assuming anything about ADR status or design.
+  Never write new ADRs to `docs/adr/` — use `cambrian-knowledge/adrs/NNNN-slug.md` per
+  `cambrian-knowledge/meta/SCHEMA.md`. Full rules: root [`../AGENTS.md` §0](../AGENTS.md).
+
 The Python agent SDK. Authors subclass one of three trait-aligned bases, decorate
 `@tool` methods, and call `agent.serve()`. The kernel auto-discovers the agent
 file by name and reads the `AGENT_DESCRIPTION` / `AGENT_MANIFEST` module-level
