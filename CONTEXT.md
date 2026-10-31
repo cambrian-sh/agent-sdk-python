@@ -144,8 +144,10 @@ ruff check
 mypy
 ```
 
-`cambrian-agent-sdk` on PyPI, at `0.1.0`, under the Business Source
-License 1.1 (matching the kernel license per ADR-0057 D6/D10). Python
+`cambrian-agent-sdk` on PyPI, at `0.1.5` (`pyproject.toml`), under the
+Apache License 2.0 (`license = "Apache-2.0"`, `LICENSE`), per ADR-0057 D10 as
+amended 2026-10-31. The kernel is Elastic License 2.0; the SDK is deliberately the
+permissive one so third-party agents can depend on it freely. Python
 `>=3.10` is required; runtime dependencies are `grpcio>=1.60.0`,
 `grpcio-health-checking>=1.60.0`, and `protobuf>=4.25.0`.
 
@@ -176,7 +178,7 @@ reconnects per agent, **0** conflicts and **0** loop crashes, against 133 of eac
 
 
 - **Go API is unstable in v0.x.** Only the gRPC proto surface and the `pyproject.toml` config schema are held stable; the Go package API can change at any minor release (per ADR-0057 D8). The SDK pins to the vendored proto in `_proto/`, so a kernel-side proto bump needs re-vendoring and a new SDK release, not just a `pip install --upgrade`.
-- **BSL 1.1, not OSI-open.** The Business Source License restricts production use; the four-years-after-change date is the eventual Apache 2.0 conversion. Treat the package as source-available.
+- **Licence: Apache-2.0** (ADR-0057 D10, amended 2026-10-31; the original BSL 1.1 plan was dropped). OSI-open, unlike the ELv2 kernel.
 - **Cross-run `LessonsLearned` write-back is open.** ADR-0052 ships the per-run reflection, but it lives in working memory only. Writing reflections back to LTM (the FORGE / `LessonsLearned` lane per ADR-0049) is the natural follow-up, and is a kernel change, not an SDK one.
 - **The A2A server in `server.py` is minimal.** The current daemon runtime handles a `SignalStream` round-trip, but is not a full Agent2Agent protocol implementation. A canonical A2A stack would add an AgentCard, server-side skills index, and JSON-RPC translation. Deferred.
 - **Proto is vendored, not generated.** Re-vendoring requires running `grpcio-tools` against the kernel's `.proto` and overwriting `_proto/`. There is no automatic check that the vendored stubs match the kernel's current proto; treat any drift as a build break.

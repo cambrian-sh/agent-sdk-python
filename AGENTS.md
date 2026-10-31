@@ -40,7 +40,8 @@ The SDK builds Cambrian agents in Python with zero boilerplate. Authors import
 `CognitiveAgent`, `DeterministicAgent`, or `DaemonAgent` from
 `cambrian_agent_sdk`, override `run()` (or `think()` for the cognitive trait),
 and call `agent.serve()`. On PyPI, the package is `cambrian-agent-sdk` on its
-own version line (currently `0.1.0`) under the Business Source License 1.1.
+own version line (currently `0.1.5`) under the Apache License 2.0 (ADR-0057 D10,
+amended 2026-10-31).
 The gRPC proto is the only contract with the kernel: the SDK ships its own
 vendored stubs under `cambrian_agent_sdk/_proto/` and never imports the Go
 kernel.
