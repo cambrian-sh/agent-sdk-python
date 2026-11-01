@@ -5,6 +5,19 @@ described by their git history.
 
 ## Unreleased
 
+### Added
+
+- **One channel builder, with a credential and a TLS path** (ADR-0130 D1/D4,
+  `cambrian_agent_sdk/channel.py`). Every dial to the kernel — `Agent.serve`, the daemon
+  `SignalStream`, the lazily-dialed `SubstrateClient` — now goes through `build_channel`.
+  It reads `CAMBRIAN_AGENT_TOKEN` (the agent's own secret, presented as
+  `authorization: Bearer` on every RPC), `CAMBRIAN_AGENT_ID` (sent as `x-agent-id` where
+  the call did not set one) and `CAMBRIAN_TLS_CA` (a PEM root; set ⇒ TLS channel, with
+  `CAMBRIAN_TLS_SERVER_NAME` to override the verified hostname). The kernel injects the
+  token and id into the agents it spawns. Without a root the channel is plaintext and the
+  SDK logs one WARN per process, which is the expected shape on a loopback kernel running
+  with `server.insecure_localhost=true` — nothing changes for that deployment.
+
 ### Deprecated
 
 - **`DeterministicAgent`** (owner decision 2026-10-31). Defining a subclass now emits a

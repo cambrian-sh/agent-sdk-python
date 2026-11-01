@@ -44,6 +44,20 @@ with their outcomes), **tools** (`tool_call` — kernel-owned or your own
 Declare tools with the `@tool` decorator (auto-injected into the agent's action menu) and
 capabilities with `@capability`. See `example-agents/` in the repo.
 
+## Connecting to a kernel
+
+The SDK dials the Substrate through one builder (`cambrian_agent_sdk.channel.build_channel`),
+configured from the environment:
+
+| Variable | Meaning |
+| --- | --- |
+| `CAMBRIAN_AGENT_TOKEN` | The agent's own credential (the kernel's named secret `agent:<id>:token`), sent as `authorization: Bearer` on every RPC. The kernel sets it for the agents it spawns. |
+| `CAMBRIAN_AGENT_ID` | The agent the token was issued to; sent as `x-agent-id` when a call does not set one. |
+| `CAMBRIAN_TLS_CA` | PEM root the kernel's certificate chains to. Set ⇒ TLS. Unset ⇒ plaintext, warned once. |
+| `CAMBRIAN_TLS_SERVER_NAME` | Optional hostname override for certificate verification. |
+
+A loopback kernel started with `server.insecure_localhost=true` needs none of these.
+
 ## Versioning
 
 The SDK's minor version tracks the agent-plane proto contract it targets. Pin it like any

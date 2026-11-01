@@ -178,13 +178,14 @@ class CognitiveAgent(Agent):
 
     def serve(self, address: Optional[str] = None) -> None:
         """Bind clients to the Substrate, then boot the single-threaded server (D2)."""
-        import grpc
-
+        from .channel import build_channel
         from .runtime import start_agent_server
         from .server import _parse_listen_address, _parse_substrate_addr
         from ._proto import cambrian_pb2_grpc
 
-        channel = grpc.insecure_channel(_parse_substrate_addr())
+        # ADR-0130 D4: the one channel builder — TLS root and agent credential
+        # from the environment, plaintext (warned once) on a loopback kernel.
+        channel = build_channel(_parse_substrate_addr(), agent_id=self.agent_id)
         self._bind_clients(cambrian_pb2_grpc.OrchestratorStub(channel))
         start_agent_server(self, address or _parse_listen_address())
 

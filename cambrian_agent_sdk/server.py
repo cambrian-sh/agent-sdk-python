@@ -119,12 +119,16 @@ def start_daemon(agent: "Agent") -> None:
     agent.params = params
 
     def _build_channel():
-        return grpc.insecure_channel(
+        # ADR-0130 D4: credential + transport from the environment (channel.py).
+        from .channel import build_channel
+
+        return build_channel(
             substrate_addr,
             options=[
                 ("grpc.max_send_message_length", 50 * 1024 * 1024),
                 ("grpc.max_receive_message_length", 50 * 1024 * 1024),
             ],
+            agent_id=agent.agent_id,
         )
 
     from ._proto import cambrian_pb2, cambrian_pb2_grpc

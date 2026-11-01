@@ -67,6 +67,7 @@ def start_daemon(agent, substrate_addr: Optional[str] = None) -> None:
 
     import grpc
 
+    from .channel import build_channel
     from .server import _parse_daemon_cli, agent_id_override
     from ._proto import cambrian_pb2, cambrian_pb2_grpc
 
@@ -166,12 +167,14 @@ def start_daemon(agent, substrate_addr: Optional[str] = None) -> None:
     backoff = 1.0
     while _should_continue():
         try:
-            channel = grpc.insecure_channel(
+            # ADR-0130 D4: credential + transport from the environment (channel.py).
+            channel = build_channel(
                 addr,
                 options=[
                     ("grpc.max_send_message_length", 50 * 1024 * 1024),
                     ("grpc.max_receive_message_length", 50 * 1024 * 1024),
                 ],
+                agent_id=agent.agent_id,
             )
             stub = cambrian_pb2_grpc.OrchestratorStub(channel)
             logger.info("Daemon '%s' opening SignalStream (stream_id=%s)", agent.agent_id, stream_id)

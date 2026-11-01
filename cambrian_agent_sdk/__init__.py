@@ -159,9 +159,11 @@ class SubstrateClient:
         with self._lock:
             if self._stub is not None:
                 return
-            import grpc
             from ._proto import cambrian_pb2_grpc
-            self._channel = grpc.insecure_channel(self._addr)
+            from .channel import build_channel
+
+            # ADR-0130 D4: credential + transport from the environment (channel.py).
+            self._channel = build_channel(self._addr, agent_id=self._agent_id)
             self._stub = cambrian_pb2_grpc.OrchestratorStub(self._channel)
 
     def generate(
