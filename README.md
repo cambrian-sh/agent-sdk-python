@@ -44,6 +44,26 @@ with their outcomes), **tools** (`tool_call` — kernel-owned or your own
 Declare tools with the `@tool` decorator (auto-injected into the agent's action menu) and
 capabilities with `@capability`. See `example-agents/` in the repo.
 
+## Memory and event time
+
+`MemoryClient.remember()` stores text; `recall()` retrieves it. Both understand **event
+time**, when something happened as opposed to when it was stored:
+
+```python
+from datetime import datetime, timezone
+
+mem.remember("We moved the launch to Friday.",
+             occurred_at=datetime(2024, 5, 2, 14, 5, tzinfo=timezone.utc),
+             time_precision="minute")
+hits = mem.recall("when is the launch?",
+                  reference_time=datetime(2024, 5, 10, tzinfo=timezone.utc))
+hits[0]["event_time"], hits[0]["time_source"]   # aware UTC datetime, "explicit"
+```
+
+Times must be timezone-aware; a naive `datetime` raises `ValueError`. Unstated times are
+labelled `ingest_default`, never shown as real. `parts=[(text, time), ...]` ingests a chat
+with a time per turn, and `event_after` / `event_before` ask for a time window.
+
 ## Connecting to a kernel
 
 The SDK dials the Substrate through one builder (`cambrian_agent_sdk.channel.build_channel`),

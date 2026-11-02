@@ -217,9 +217,12 @@ def test_recall_calls_querymemory_with_no_scope_params():
     req = stub.calls["QueryMemory"]
     assert req.query == "capital of france"
     assert req.top_k == 3
-    # D5: the request type has no scope fields at all — nothing to leak client-side
+    # D5: the request type has no scope fields at all — nothing to leak client-side.
+    # Contract 0099 (ADR-0134 D4) added the event-time query fields; they are not
+    # scope (a reference time and an event window), so the set is pinned to exactly
+    # these, and a new field must be added here deliberately.
     field_names = {f.name for f in req.DESCRIPTOR.fields}
-    assert field_names == {"query", "top_k"}
+    assert field_names == {"query", "top_k", "reference_time", "event_after", "event_before"}
     assert results[0]["text"] == "paris"
 
 
@@ -416,3 +419,116 @@ def test_lease_metadata_helper_pairs_both_headers():
         ("x-lease-id", "lease-1"),
         ("x-session-id", "lease-1"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# ADR-0134 event time (contract 0099): remember() states when content happened,
+# recall() takes the asker's "now" and an event window, hits carry their time.
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+_IST = timezone(timedelta(hours=3))
+
+
+def test_remember_sends_occurred_at_as_utc_and_the_precision():
+    stub = _FakeStub()
+    mem = MemoryClient(stub=stub, agent_id="analyst")
+
+    mem.remember("we shipped v2", occurred_at=datetime(2023, 5, 20, 5, 21, tzinfo=_IST),
+                 time_precision="minute")
+
+    req = stub.calls["IngestMemory"]
+    assert req.HasField("occurred_at")
+    assert req.occurred_at.ToDatetime() == datetime(2023, 5, 20, 2, 21)  # UTC instant
+    assert req.time_precision == "minute"
+    assert len(req.parts) == 0
+
+
+def test_remember_without_a_time_leaves_occurred_at_unset():
+    stub = _FakeStub()
+    MemoryClient(stub=stub, agent_id="a").remember("x")
+    req = stub.calls["IngestMemory"]
+    assert not req.HasField("occurred_at") and req.time_precision == ""
+
+
+def test_remember_refuses_a_naive_datetime_before_any_rpc():
+    stub = _FakeStub()
+    mem = MemoryClient(stub=stub, agent_id="a")
+    with pytest.raises(ValueError, match="naive datetime"):
+        mem.remember("x", occurred_at=datetime(2023, 5, 20, 2, 21))
+    with pytest.raises(ValueError, match=r"parts\[1\]\.occurred_at.*naive"):
+        mem.remember("", parts=[("a", datetime(2023, 1, 1, tzinfo=timezone.utc)),
+                                ("b", datetime(2023, 1, 2))])
+    assert "IngestMemory" not in stub.calls
+
+
+def test_remember_sends_parts_with_their_own_times():
+    stub = _FakeStub()
+    mem = MemoryClient(stub=stub, agent_id="a")
+    t0 = datetime(2023, 5, 20, 2, 21, tzinfo=timezone.utc)
+    mem.remember("", parts=[("user: hi", t0), ("assistant: hello", t0 + timedelta(minutes=1)),
+                            ("user: untimed", None)], time_precision="second")
+    req = stub.calls["IngestMemory"]
+    assert req.text == "" and [p.text for p in req.parts] == ["user: hi", "assistant: hello", "user: untimed"]
+    assert req.parts[1].occurred_at.ToDatetime() == datetime(2023, 5, 20, 2, 22)
+    assert not req.parts[2].HasField("occurred_at")
+    assert not req.HasField("occurred_at")  # the kernel takes the earliest part time
+
+
+def test_remember_rejects_text_with_parts_and_an_unknown_precision():
+    mem = MemoryClient(stub=_FakeStub(), agent_id="a")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        mem.remember("body", parts=[("p", None)])
+    with pytest.raises(ValueError, match="time_precision"):
+        mem.remember("x", time_precision="week")
+
+
+def test_recall_sends_reference_time_and_event_window():
+    stub = _FakeStub()
+    mem = MemoryClient(stub=stub, agent_id="a")
+    now = datetime(2023, 6, 6, 8, 0, tzinfo=timezone.utc)
+    mem.recall("how long ago did I start yoga", reference_time=now,
+               event_after=now - timedelta(days=30), event_before=now)
+    req = stub.calls["QueryMemory"]
+    assert req.reference_time.ToDatetime() == datetime(2023, 6, 6, 8, 0)
+    assert req.event_after.ToDatetime() == datetime(2023, 5, 7, 8, 0)
+    assert req.event_before.ToDatetime() == datetime(2023, 6, 6, 8, 0)
+
+
+def test_recall_without_times_leaves_them_unset_and_refuses_bad_ones():
+    stub = _FakeStub()
+    mem = MemoryClient(stub=stub, agent_id="a")
+    mem.recall("q")
+    req = stub.calls["QueryMemory"]
+    assert not any(req.HasField(f) for f in ("reference_time", "event_after", "event_before"))
+    with pytest.raises(ValueError, match="naive"):
+        mem.recall("q", reference_time=datetime(2023, 6, 6))
+    t = datetime(2023, 6, 6, tzinfo=timezone.utc)
+    with pytest.raises(ValueError, match="earlier than"):
+        mem.recall("q", event_after=t, event_before=t)
+
+
+def test_recall_results_carry_event_time_source_and_precision():
+    class _TimedStub(_FakeStub):
+        def QueryMemory(self, req, timeout=None, metadata=None):
+            r = pb.MemoryResult(text="started yoga", score=0.8, metadata="{}",
+                                time_source="explicit", time_precision="minute")
+            r.event_time.FromDatetime(datetime(2023, 5, 25, 8, 0))
+            r.event_time_end.FromDatetime(datetime(2023, 5, 25, 8, 40))
+            old = pb.MemoryResult(text="legacy", score=0.1)
+            return pb.MemoryResponse(results=[r, old])
+
+    hits = MemoryClient(stub=_TimedStub(), agent_id="a").recall("yoga")
+    assert hits[0]["event_time"] == datetime(2023, 5, 25, 8, 0, tzinfo=timezone.utc)
+    assert hits[0]["event_time_end"] == datetime(2023, 5, 25, 8, 40, tzinfo=timezone.utc)
+    assert hits[0]["time_source"] == "explicit" and hits[0]["time_precision"] == "minute"
+    # A hit with no time (an older kernel) reads None / "", never a made-up time.
+    assert hits[1]["event_time"] is None and hits[1]["time_source"] == ""
+
+
+def test_pre_epoch_times_round_trip():
+    stub = _FakeStub()
+    MemoryClient(stub=stub, agent_id="a").remember(
+        "moon landing", occurred_at=datetime(1969, 7, 20, 20, 17, tzinfo=timezone.utc), time_precision="minute")
+    assert stub.calls["IngestMemory"].occurred_at.ToDatetime() == datetime(1969, 7, 20, 20, 17)

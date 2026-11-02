@@ -7,6 +7,17 @@ described by their git history.
 
 ### Added
 
+- **Event time on memory** (ADR-0134, kernel contract 0099). `MemoryClient.remember()`
+  takes keyword-only `occurred_at` (when the content happened), `parts=[(text,
+  occurred_at), ...]` for multi-message content such as a chat's turns (replaces `text`),
+  and `time_precision` (`year` … `second`, see `TIME_PRECISIONS`). `recall()` takes
+  `reference_time` (the asker's "now"), `event_after` (inclusive) and `event_before`
+  (exclusive). Every time must be timezone-aware: a naive `datetime` raises `ValueError`
+  before any RPC, because the SDK will not guess a zone. Every recall result dict
+  (`recall`, `recall_actions`, `recall_precedents`, `recall_entity`) gains `event_time` /
+  `event_time_end` (aware UTC `datetime` or `None`), `time_source` (`TIME_SOURCES`) and
+  `time_precision`. A kernel without the event window wired answers `UNIMPLEMENTED` for
+  `event_after`/`event_before` rather than ignoring them.
 - **One channel builder, with a credential and a TLS path** (ADR-0130 D1/D4,
   `cambrian_agent_sdk/channel.py`). Every dial to the kernel — `Agent.serve`, the daemon
   `SignalStream`, the lazily-dialed `SubstrateClient` — now goes through `build_channel`.

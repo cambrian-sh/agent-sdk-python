@@ -79,26 +79,6 @@ class OrchestratorStub:
                 request_serializer=cambrian__pb2.PutContextNodeRequest.SerializeToString,
                 response_deserializer=cambrian__pb2.PutContextNodeResponse.FromString,
                 _registered_method=True)
-        self.RegisterWatch = channel.unary_unary(
-                '/cambrian.Orchestrator/RegisterWatch',
-                request_serializer=cambrian__pb2.RegisterWatchRequest.SerializeToString,
-                response_deserializer=cambrian__pb2.RegisterWatchResponse.FromString,
-                _registered_method=True)
-        self.ListWatches = channel.unary_unary(
-                '/cambrian.Orchestrator/ListWatches',
-                request_serializer=cambrian__pb2.ListWatchesRequest.SerializeToString,
-                response_deserializer=cambrian__pb2.ListWatchesResponse.FromString,
-                _registered_method=True)
-        self.DeleteWatch = channel.unary_unary(
-                '/cambrian.Orchestrator/DeleteWatch',
-                request_serializer=cambrian__pb2.DeleteWatchRequest.SerializeToString,
-                response_deserializer=cambrian__pb2.DeleteWatchResponse.FromString,
-                _registered_method=True)
-        self.SetWatchActive = channel.unary_unary(
-                '/cambrian.Orchestrator/SetWatchActive',
-                request_serializer=cambrian__pb2.SetWatchActiveRequest.SerializeToString,
-                response_deserializer=cambrian__pb2.SetWatchActiveResponse.FromString,
-                _registered_method=True)
         self.UploadArtifact = channel.unary_unary(
                 '/cambrian.Orchestrator/UploadArtifact',
                 request_serializer=cambrian__pb2.UploadArtifactRequest.SerializeToString,
@@ -234,37 +214,15 @@ class OrchestratorServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def RegisterWatch(self, request, context):
-        """WatchConfig CRUD — premium build only. ADR-0032.
-        Create or replace a reactive rule. Returns the persisted config ID.
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def ListWatches(self, request, context):
-        """List all registered WatchConfigs.
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def DeleteWatch(self, request, context):
-        """Delete a WatchConfig by ID.
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def SetWatchActive(self, request, context):
-        """Enable or disable a WatchConfig without deleting it.
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
     def UploadArtifact(self, request, context):
-        """Artifact storage with ADR-0034 tag-based access scoping. REQ-SDK-007c.
+        """Contract 0099: the four Orchestrator watch-CRUD RPCs (RegisterWatch,
+        ListWatches, DeleteWatch, SetWatchActive) and their messages were REMOVED.
+        They duplicated the OperatorConsole watch commands on the agent plane with no
+        authentication, audit row, reason or command-id dedup, and were retired in place
+        on 2026-10-31. Use OperatorConsole/{Register,List,Delete}Watch and
+        SetWatchActive, which are authenticated and audited.
+
+        Artifact storage with ADR-0034 tag-based access scoping. REQ-SDK-007c.
         Upload validates classification tags against the writer's scope + controlled
         vocabulary and kernel-stamps provenance before persisting.
         """
@@ -393,26 +351,6 @@ def add_OrchestratorServicer_to_server(servicer, server):
                     servicer.PutContextNode,
                     request_deserializer=cambrian__pb2.PutContextNodeRequest.FromString,
                     response_serializer=cambrian__pb2.PutContextNodeResponse.SerializeToString,
-            ),
-            'RegisterWatch': grpc.unary_unary_rpc_method_handler(
-                    servicer.RegisterWatch,
-                    request_deserializer=cambrian__pb2.RegisterWatchRequest.FromString,
-                    response_serializer=cambrian__pb2.RegisterWatchResponse.SerializeToString,
-            ),
-            'ListWatches': grpc.unary_unary_rpc_method_handler(
-                    servicer.ListWatches,
-                    request_deserializer=cambrian__pb2.ListWatchesRequest.FromString,
-                    response_serializer=cambrian__pb2.ListWatchesResponse.SerializeToString,
-            ),
-            'DeleteWatch': grpc.unary_unary_rpc_method_handler(
-                    servicer.DeleteWatch,
-                    request_deserializer=cambrian__pb2.DeleteWatchRequest.FromString,
-                    response_serializer=cambrian__pb2.DeleteWatchResponse.SerializeToString,
-            ),
-            'SetWatchActive': grpc.unary_unary_rpc_method_handler(
-                    servicer.SetWatchActive,
-                    request_deserializer=cambrian__pb2.SetWatchActiveRequest.FromString,
-                    response_serializer=cambrian__pb2.SetWatchActiveResponse.SerializeToString,
             ),
             'UploadArtifact': grpc.unary_unary_rpc_method_handler(
                     servicer.UploadArtifact,
@@ -708,114 +646,6 @@ class Orchestrator:
             '/cambrian.Orchestrator/PutContextNode',
             cambrian__pb2.PutContextNodeRequest.SerializeToString,
             cambrian__pb2.PutContextNodeResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def RegisterWatch(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/cambrian.Orchestrator/RegisterWatch',
-            cambrian__pb2.RegisterWatchRequest.SerializeToString,
-            cambrian__pb2.RegisterWatchResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def ListWatches(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/cambrian.Orchestrator/ListWatches',
-            cambrian__pb2.ListWatchesRequest.SerializeToString,
-            cambrian__pb2.ListWatchesResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def DeleteWatch(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/cambrian.Orchestrator/DeleteWatch',
-            cambrian__pb2.DeleteWatchRequest.SerializeToString,
-            cambrian__pb2.DeleteWatchResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def SetWatchActive(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/cambrian.Orchestrator/SetWatchActive',
-            cambrian__pb2.SetWatchActiveRequest.SerializeToString,
-            cambrian__pb2.SetWatchActiveResponse.FromString,
             options,
             channel_credentials,
             insecure,

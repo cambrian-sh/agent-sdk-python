@@ -20,7 +20,9 @@ change in this repo, however small:
    per `cambrian-knowledge/meta/SCHEMA.md`); operating rule → `cambrian-knowledge/decisions/`;
    tradeoff → the ADR's `tradeoffs:`. **Never write ADRs to `docs/adr/`** — it holds redirect
    stubs only.
-4. **Before reporting done:** numbers you produced → the ADR's `measurements:`; gotchas → `observations:`; re-verified ADRs →
+4. **Before reporting done:** benchmark runs → a run record each (`record_benchmark_run`; the
+   procedure is root `../AGENTS.md` §0.5); other numbers you produced → the ADR's `measurements:`;
+   gotchas → `observations:`; re-verified ADRs →
    `last_verified` + `verified_at_rev`; `CONTEXT.md` if architecture or gaps changed. Then
    `close` the ticket with a resolution (files changed, ADRs updated, tests run and result) —
    or, if unfinished, `log` where you stopped and `release`.

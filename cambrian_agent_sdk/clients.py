@@ -15,7 +15,70 @@ Error surfaces: a coined hint → :class:`InvalidTagError`; a scope-denied read 
 from __future__ import annotations
 
 import warnings
-from typing import List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Sequence, Tuple
+
+#: ADR-0134 time vocabulary (kernel ``domain/event_time.go``, contract 0099). How
+#: precise a stated time is; a date-only source is ``"day"``, never an exact instant.
+TIME_PRECISIONS = ("year", "month", "day", "hour", "minute", "second")
+#: Where a hit's ``event_time`` came from. ``ingest_default`` means nothing was stated:
+#: the time is when the kernel recorded it. ``clamped_future`` means the stated time
+#: was later than the kernel's clock (plus tolerance) and was clamped to the ingest time.
+TIME_SOURCES = ("explicit", "source_metadata", "inferred", "ingest_default", "clamped_future")
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _to_timestamp(name: str, value: datetime):
+    """An aware ``datetime`` as a protobuf ``Timestamp`` (an absolute UTC instant).
+
+    A naive datetime is refused (ADR-0134 owner decision Q3): it has no zone, so the
+    SDK cannot know which instant it means, and guessing would silently shift every
+    event by the caller's UTC offset.
+    """
+    from google.protobuf.timestamp_pb2 import Timestamp
+
+    if not isinstance(value, datetime):
+        raise TypeError(f"{name} must be a datetime, got {type(value).__name__}")
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        raise ValueError(
+            f"{name} is a naive datetime (no timezone). Pass a timezone-aware datetime, "
+            f"e.g. datetime(2024, 5, 1, 9, 30, tzinfo=timezone.utc) or "
+            f"dt.replace(tzinfo=ZoneInfo('Europe/Istanbul')); the SDK does not guess a zone."
+        )
+    delta = value.astimezone(timezone.utc) - _EPOCH
+    return Timestamp(seconds=delta.days * 86400 + delta.seconds, nanos=delta.microseconds * 1000)
+
+
+def _from_timestamp(msg, field: str) -> Optional[datetime]:
+    """A set ``Timestamp`` field as an aware UTC ``datetime``; ``None`` when unset."""
+    if not msg.HasField(field):
+        return None
+    ts = getattr(msg, field)
+    return _EPOCH + timedelta(seconds=ts.seconds, microseconds=ts.nanos // 1000)
+
+
+def _check_precision(time_precision: str) -> None:
+    if time_precision and time_precision not in TIME_PRECISIONS:
+        raise ValueError(f"time_precision must be one of {TIME_PRECISIONS}, got {time_precision!r}")
+
+
+def _result_dict(r) -> dict:
+    """One ``MemoryResult`` as the dict every recall returns.
+
+    ``event_time`` / ``event_time_end`` are aware UTC datetimes (``None`` when the
+    kernel sent none); ``time_source`` and ``time_precision`` are strings from
+    :data:`TIME_SOURCES` / :data:`TIME_PRECISIONS` (``""`` from an older kernel).
+    """
+    return {
+        "text": r.text,
+        "score": r.score,
+        "metadata": r.metadata,
+        "event_time": _from_timestamp(r, "event_time"),
+        "event_time_end": _from_timestamp(r, "event_time_end"),
+        "time_source": r.time_source,
+        "time_precision": r.time_precision,
+    }
 
 
 class InvalidTagError(Exception):
@@ -69,7 +132,10 @@ class MemoryClient:
         self._channel = channel
 
     def recall(self, query: str, top_k: int = 5, timeout_ms: int = 0,
-               session_token_id: str = "") -> List[dict]:
+               session_token_id: str = "", *,
+               reference_time: Optional[datetime] = None,
+               event_after: Optional[datetime] = None,
+               event_before: Optional[datetime] = None) -> List[dict]:
         """Retrieve from LTM. Results are already scope-filtered server-side; this
         request carries **no** scope params (D5/ADR-0034).
 
@@ -77,14 +143,36 @@ class MemoryClient:
         :func:`_lease_metadata`. The kernel resolves it to this run's task session and
         applies the same-session step-record filter (ADR-0048 D1): without it the server
         sees no session and D1 silently no-ops, so the agent's OWN step output is recalled
-        straight back into the same run — the context feedback loop D1 exists to break."""
+        straight back into the same run — the context feedback loop D1 exists to break.
+
+        Event time (ADR-0134 D4, contract 0099), all optional and timezone-aware only
+        (a naive datetime raises :class:`ValueError`):
+
+        - ``reference_time`` is the asker's "now" ("last month" is relative to it).
+          Unset means the kernel's clock. Use it to replay history as of a past date.
+        - ``event_after`` (inclusive) / ``event_before`` (exclusive) restrict hits to
+          those whose event span overlaps ``[event_after, event_before)``. A kernel that
+          has not wired the window yet answers ``UNIMPLEMENTED`` rather than ignoring it.
+
+        Each result dict carries ``text``, ``score``, ``metadata`` and the hit's
+        ``event_time`` / ``event_time_end`` (aware UTC datetimes or ``None``),
+        ``time_source`` (:data:`TIME_SOURCES`) and ``time_precision``
+        (:data:`TIME_PRECISIONS`)."""
         from ._proto import cambrian_pb2
 
         req = cambrian_pb2.MemoryRequest(query=query, top_k=top_k)
+        if reference_time is not None:
+            req.reference_time.CopyFrom(_to_timestamp("reference_time", reference_time))
+        if event_after is not None:
+            req.event_after.CopyFrom(_to_timestamp("event_after", event_after))
+        if event_before is not None:
+            req.event_before.CopyFrom(_to_timestamp("event_before", event_before))
+        if event_after is not None and event_before is not None and event_after >= event_before:
+            raise ValueError("event_after must be earlier than event_before (the window is [after, before))")
         md = self._identity_metadata()
         md = md + _lease_metadata(session_token_id)
         resp = self._stub.QueryMemory(req, timeout=_secs(timeout_ms), metadata=md)
-        return [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in resp.results]
+        return [_result_dict(r) for r in resp.results]
 
     def recall_actions(self, query: str, top_k: int = 5, timeout_ms: int = 0,
                        session_token_id: str = "") -> List[dict]:
@@ -98,7 +186,7 @@ class MemoryClient:
         md = self._identity_metadata() + [("x-lane", "actions")]
         md = md + _lease_metadata(session_token_id)
         resp = self._stub.QueryMemory(req, timeout=_secs(timeout_ms), metadata=md)
-        return [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in resp.results]
+        return [_result_dict(r) for r in resp.results]
 
     def recall_entity(self, kind_id: str, timeout_ms: int = 0,
                       session_token_id: str = "") -> List[dict]:
@@ -130,7 +218,7 @@ class MemoryClient:
         md = self._identity_metadata() + [("x-lane", "entity")]
         md = md + _lease_metadata(session_token_id)
         resp = self._stub.QueryMemory(req, timeout=_secs(timeout_ms), metadata=md)
-        return [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in resp.results]
+        return [_result_dict(r) for r in resp.results]
 
     def recall_precedents(self, query: str, top_k: int = 5, timeout_ms: int = 0,
                           session_token_id: str = "") -> List[dict]:
@@ -147,7 +235,7 @@ class MemoryClient:
         md = self._identity_metadata() + [("x-lane", "precedents")]
         md = md + _lease_metadata(session_token_id)
         resp = self._stub.QueryMemory(req, timeout=_secs(timeout_ms), metadata=md)
-        return [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in resp.results]
+        return [_result_dict(r) for r in resp.results]
 
     def remember(
         self,
@@ -156,19 +244,49 @@ class MemoryClient:
         source: str = "",
         session_id: str = "",
         importance: float = 0.0,
+        *,
+        occurred_at: Optional[datetime] = None,
+        parts: Optional[Sequence[Tuple[str, Optional[datetime]]]] = None,
+        time_precision: str = "",
     ) -> str:
         """Persist a synthesized insight. ``hint`` is a **narrow-only** classification
         hint (never authoritative tags); the kernel derives the real classification.
-        Returns the new doc ID. A coined hint raises :class:`InvalidTagError`."""
+        Returns the new doc ID. A coined hint raises :class:`InvalidTagError`.
+
+        Event time (ADR-0134 D1, contract 0099), all optional:
+
+        - ``occurred_at`` is when the content HAPPENED, as opposed to when it is
+          stored. It must be timezone-aware; a naive datetime raises
+          :class:`ValueError`. Unset means unknown: the kernel dates it by its ingest
+          clock and labels it ``ingest_default``, never as a real time. A time beyond
+          the kernel's clock (plus a tolerance, default 5 minutes) is clamped to the
+          ingest time and labelled ``clamped_future``.
+        - ``parts`` is multi-message content, e.g. a chat's turns, as
+          ``[(text, occurred_at_or_None), ...]``. It replaces ``text`` (pass
+          ``text=""``); the kernel joins the parts with a blank line. The document's
+          time is the earliest part time unless ``occurred_at`` is given.
+        - ``time_precision`` says how precise those times are, one of
+          :data:`TIME_PRECISIONS` (``"day"`` for a date-only source). Empty means
+          ``"second"``."""
         from ._proto import cambrian_pb2
 
+        _check_precision(time_precision)
+        if parts and text:
+            raise ValueError("text and parts are mutually exclusive: pass text='' with parts")
         req = cambrian_pb2.IngestMemoryRequest(
             text=text,
             tags=list(hint or []),  # narrow-only hint
             importance=importance,
             source=source,
             session_id=session_id,
+            time_precision=time_precision,
         )
+        if occurred_at is not None:
+            req.occurred_at.CopyFrom(_to_timestamp("occurred_at", occurred_at))
+        for i, (part_text, part_time) in enumerate(parts or ()):
+            part = req.parts.add(text=part_text)
+            if part_time is not None:
+                part.occurred_at.CopyFrom(_to_timestamp(f"parts[{i}].occurred_at", part_time))
         try:
             resp = self._stub.IngestMemory(req, metadata=self._identity_metadata())
         except Exception as exc:

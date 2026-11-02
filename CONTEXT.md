@@ -15,6 +15,9 @@ This file is the *current shape* of the SDK. It is not where decisions or work l
 - **What is being done, and what is broken** — tickets: `list_tickets` (`repo: "sdk"`), or the
   knowledge-board Tickets view. Every change is ticketed, claimed, and closed with a
   resolution — the protocol is root [`AGENTS.md`](../AGENTS.md) §0.
+- **What has been measured** — benchmark runs in `../cambrian-knowledge/benchmarks/`
+  (`list_benchmarks` by `tag`/`adr`, or the knowledge-board Benchmarks page). Every benchmark
+  run is recorded there, with a verdict — the procedure is root [`AGENTS.md`](../AGENTS.md) §0.5.
 - **Every gap listed in this file should have a ticket.** Put its id next to the gap
   (`— T-20261031-…`); when the ticket closes, update or remove the gap here in the same change.
 
@@ -100,7 +103,7 @@ it by lexical scoping, with no central ranking involved.
 | --- | --- |
 | `cambrian_agent_sdk/__init__.py` | Public surface, `assemble_context`, top-level `configure_logging`, the `SubstrateClient` definition |
 | `cambrian_agent_sdk/base.py` | `Agent` abstract + the three trait classes; wires `run_think` into the cognitive trait |
-| `cambrian_agent_sdk/clients.py` | `MemoryClient` (recall lanes + remember — `recall` facts, `recall_actions`, `recall_precedents` prior transitions; `recall_entity` is **deprecated**: the kernel removed the entity lane on 2026-08-14 and serves `x-lane=entity` from the fact lane), `ArtifactManager` (save/get/list_from_step), read-only `WorkingMemory` view, plus `InvalidTagError`, `ArtifactNotFound`, `SelfDelegationError` |
+| `cambrian_agent_sdk/clients.py` | `MemoryClient` (recall lanes + remember, both with ADR-0134 event time; `TIME_PRECISIONS` / `TIME_SOURCES` vocabulary — `recall` facts, `recall_actions`, `recall_precedents` prior transitions; `recall_entity` is **deprecated**: the kernel removed the entity lane on 2026-08-14 and serves `x-lane=entity` from the fact lane), `ArtifactManager` (save/get/list_from_step), read-only `WorkingMemory` view, plus `InvalidTagError`, `ArtifactNotFound`, `SelfDelegationError` |
 | `cambrian_agent_sdk/daemon.py` | `start_daemon` + `run_supervised`: the `SignalStream` runtime with crash supervision (capped exponential backoff, 30s cap). The supervised loop is started ONCE, **outside** the reconnect loop — that placement is load-bearing, see Known Gaps |
 | `cambrian_agent_sdk/errors.py` | `BudgetExceededError`, the typed signal that a task refused on budget grounds |
 | `cambrian_agent_sdk/helpers.py` | `build_prompt` (v2 cache-friendly layout), `extract_code_block`, `find_step_ref`, `DEFAULT_CONSTRAINTS`, `DEFAULT_ANTI_PATTERNS`, XML escape |
@@ -183,7 +186,7 @@ reconnects per agent, **0** conflicts and **0** loop crashes, against 133 of eac
 - **Cross-run `LessonsLearned` write-back is open.** ADR-0052 ships the per-run reflection, but it lives in working memory only. Writing reflections back to LTM (the FORGE / `LessonsLearned` lane per ADR-0049) is the natural follow-up, and is a kernel change, not an SDK one.
 - **The A2A server in `server.py` is minimal.** The current daemon runtime handles a `SignalStream` round-trip, but is not a full Agent2Agent protocol implementation. A canonical A2A stack would add an AgentCard, server-side skills index, and JSON-RPC translation. Deferred.
 - **`DeterministicAgent` is deprecated but not removed**, and three cambrian-core system agents (`agents/system/{docling,kg_extractor,reranker}_agent`) still subclass it, so they print the `DeprecationWarning` at boot once they run on an SDK containing it. Migrating them flips their trait from `"tool"` to `"cognitive"` (interview / verifier-pool eligibility), so it is an owner decision — T-20261031-core-system-agents-docling-kg-extractor.
-- **Proto is vendored, not generated.** Re-vendoring requires running `grpcio-tools` against the kernel's `.proto` and overwriting `_proto/`. There is no automatic check that the vendored stubs match the kernel's current proto; treat any drift as a build break.
+- **Proto is vendored, not generated.** Re-vendoring requires running `grpcio-tools` against the kernel's `.proto` and overwriting `_proto/`. There is no automatic check that the vendored stubs match the kernel's current proto; treat any drift as a build break. Last re-vendored 2026-11-01 at kernel contract 0099 with grpcio-tools 1.81.1 (`python -m grpc_tools.protoc -I ../cambrian-core/api/proto --python_out=_proto --grpc_python_out=_proto cambrian.proto`, then `import cambrian_pb2` → `from . import cambrian_pb2` in the grpc file): the retired watch-CRUD RPCs are gone, and `IngestMemoryRequest` / `MemoryRequest` / `MemoryResult` carry the ADR-0134 event-time fields. `MemoryClient.remember()` exposes them as keyword-only `occurred_at` / `parts=[(text, occurred_at)]` / `time_precision`, `recall()` as `reference_time` / `event_after` / `event_before` (timezone-aware datetimes only; a naive one raises `ValueError`, owner decision Q3), and every recall result dict carries `event_time` / `event_time_end` (aware UTC or None), `time_source`, `time_precision`. `CambrianAgent.ask()` still returns the old three-key dicts.
 
 ## Terminology Glossary
 

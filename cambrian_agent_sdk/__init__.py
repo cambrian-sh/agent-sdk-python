@@ -62,6 +62,8 @@ from .clients import (
     InvalidTagError,
     MemoryClient,
     SelfDelegationError,
+    TIME_PRECISIONS,
+    TIME_SOURCES,
     WorkingMemory,
 )
 from .helpers import extract_code_block, find_step_ref, build_prompt
@@ -91,6 +93,8 @@ __all__ = [
     "InvalidTagError",
     "ArtifactNotFound",
     "SelfDelegationError",
+    "TIME_PRECISIONS",
+    "TIME_SOURCES",
     # shared vocabulary + helpers
     "assemble_context",
     "build_prompt",
