@@ -7,6 +7,12 @@ described by their git history.
 
 ### Added
 
+- **Source metadata on memory** (ADR-0136 Amendment A3). `MemoryClient.remember()` takes
+  keyword-only `source_kind`, `title` and `author`, and a part may carry a speaker as a
+  third element, `parts=[(text, occurred_at, speaker), ...]`. All are descriptive: the
+  kernel never lets `author` replace the authenticated writer, and speakers never enter
+  the stored text. Vendored stubs re-generated from core's `cambrian.proto`
+  (`IngestMemoryRequest` fields 9-11, `MemoryPart.speaker` = 3; grpcio-tools 1.81.1).
 - **Event time on memory** (ADR-0134, kernel contract 0099). `MemoryClient.remember()`
   takes keyword-only `occurred_at` (when the content happened), `parts=[(text,
   occurred_at), ...]` for multi-message content such as a chat's turns (replaces `text`),

@@ -246,8 +246,11 @@ class MemoryClient:
         importance: float = 0.0,
         *,
         occurred_at: Optional[datetime] = None,
-        parts: Optional[Sequence[Tuple[str, Optional[datetime]]]] = None,
+        parts: Optional[Sequence[Tuple]] = None,
         time_precision: str = "",
+        source_kind: str = "",
+        title: str = "",
+        author: str = "",
     ) -> str:
         """Persist a synthesized insight. ``hint`` is a **narrow-only** classification
         hint (never authoritative tags); the kernel derives the real classification.
@@ -267,7 +270,23 @@ class MemoryClient:
           time is the earliest part time unless ``occurred_at`` is given.
         - ``time_precision`` says how precise those times are, one of
           :data:`TIME_PRECISIONS` (``"day"`` for a date-only source). Empty means
-          ``"second"``."""
+          ``"second"``.
+
+        Source metadata (ADR-0136 A3), all optional and DESCRIPTIVE only:
+
+        - ``source_kind`` is free text describing the source (``"conversation"``,
+          ``"email"``, ``"report"``, ...). It is shown to the kernel's fact extractor as
+          data; nothing branches on it, and it never changes how the kernel parses.
+        - ``title`` is the source's own title (unset: the body's first line).
+        - ``author`` is the source's author as the source names it. It never changes
+          who the writer is: the kernel stamps the authenticated agent as the writer.
+        - A part may carry a speaker as a third element:
+          ``[(text, occurred_at_or_None, speaker), ...]``. The speaker never changes the
+          stored text; each chunk records the speaker at its start.
+
+        The kernel trims each value, cuts it to a configured length, and rejects one
+        containing a control character (raised as :class:`InvalidTagError`, the SDK's
+        INVALID_ARGUMENT mapping)."""
         from ._proto import cambrian_pb2
 
         _check_precision(time_precision)
@@ -280,11 +299,18 @@ class MemoryClient:
             source=source,
             session_id=session_id,
             time_precision=time_precision,
+            source_kind=source_kind,
+            title=title,
+            author=author,
         )
         if occurred_at is not None:
             req.occurred_at.CopyFrom(_to_timestamp("occurred_at", occurred_at))
-        for i, (part_text, part_time) in enumerate(parts or ()):
-            part = req.parts.add(text=part_text)
+        for i, p in enumerate(parts or ()):
+            if len(p) not in (2, 3):
+                raise ValueError(f"parts[{i}] must be (text, occurred_at) or (text, occurred_at, speaker)")
+            part_text, part_time = p[0], p[1]
+            speaker = p[2] if len(p) == 3 else ""
+            part = req.parts.add(text=part_text, speaker=speaker or "")
             if part_time is not None:
                 part.occurred_at.CopyFrom(_to_timestamp(f"parts[{i}].occurred_at", part_time))
         try:

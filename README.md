@@ -64,6 +64,12 @@ Times must be timezone-aware; a naive `datetime` raises `ValueError`. Unstated t
 labelled `ingest_default`, never shown as real. `parts=[(text, time), ...]` ingests a chat
 with a time per turn, and `event_after` / `event_before` ask for a time window.
 
+`remember()` also takes descriptive source metadata (ADR-0136 A3): `source_kind`
+(free text such as `"conversation"` or `"report"`), `title` and `author`, plus a speaker
+per part, `parts=[(text, time, speaker), ...]`. They are data for the kernel's fact
+extractor only: the writer of record is always the authenticated agent, and a speaker
+never changes the stored text.
+
 ## Connecting to a kernel
 
 The SDK dials the Substrate through one builder (`cambrian_agent_sdk.channel.build_channel`),

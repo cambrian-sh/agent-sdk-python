@@ -484,6 +484,31 @@ def test_remember_rejects_text_with_parts_and_an_unknown_precision():
         mem.remember("x", time_precision="week")
 
 
+# ADR-0136 A3: descriptive source metadata and per-part speakers.
+def test_remember_sends_source_metadata_and_part_speakers():
+    stub = _FakeStub()
+    mem = MemoryClient(stub=stub, agent_id="analyst")
+    mem.remember("", parts=[("hi", None, "user"), ("hello", None, "assistant"), ("untagged", None)],
+                 source_kind="conversation", title="Trip planning", author="Alice")
+    req = stub.calls["IngestMemory"]
+    assert (req.source_kind, req.title, req.author) == ("conversation", "Trip planning", "Alice")
+    assert [p.speaker for p in req.parts] == ["user", "assistant", ""]
+    assert [p.text for p in req.parts] == ["hi", "hello", "untagged"]
+
+
+def test_remember_without_source_metadata_sends_empty_fields():
+    stub = _FakeStub()
+    MemoryClient(stub=stub, agent_id="a").remember("x")
+    req = stub.calls["IngestMemory"]
+    assert (req.source_kind, req.title, req.author) == ("", "", "")
+
+
+def test_remember_rejects_a_malformed_part_tuple():
+    mem = MemoryClient(stub=_FakeStub(), agent_id="a")
+    with pytest.raises(ValueError, match=r"parts\[0\]"):
+        mem.remember("", parts=[("only text",)])
+
+
 def test_recall_sends_reference_time_and_event_window():
     stub = _FakeStub()
     mem = MemoryClient(stub=stub, agent_id="a")
