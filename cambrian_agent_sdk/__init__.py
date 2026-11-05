@@ -66,8 +66,24 @@ from .clients import (
     TIME_SOURCES,
     WorkingMemory,
 )
-from .helpers import extract_code_block, find_step_ref, build_prompt
-from .errors import BudgetExceededError, ToolCallingUnsupported
+from .helpers import extract_code_block, find_step_ref, build_prompt, build_prompt_parts, PromptParts
+from .errors import (
+    BudgetExceededError,
+    GenerateError,
+    GenerationResourceExhausted,
+    InvalidRequest,
+    ModelUnavailable,
+    SchemaValidationFailed,
+    ToolCallingUnsupported,
+)
+from .llm import (
+    CACHE_TTL_LONG,
+    CACHE_TTL_SHORT,
+    GenerateResult,
+    GenerateUsage,
+    ResponseSchema,
+    SystemBlock,
+)
 
 __all__ = [
     # ADR-0036 v2 trait-aligned surface
@@ -100,6 +116,20 @@ __all__ = [
     "build_prompt",
     "BudgetExceededError",
     "ToolCallingUnsupported",
+    # ADR-0139 C1 managed-generation request/result and typed errors
+    "GenerateError",
+    "InvalidRequest",
+    "SchemaValidationFailed",
+    "GenerationResourceExhausted",
+    "ModelUnavailable",
+    "GenerateResult",
+    "GenerateUsage",
+    "ResponseSchema",
+    "SystemBlock",
+    "CACHE_TTL_SHORT",
+    "CACHE_TTL_LONG",
+    "build_prompt_parts",
+    "PromptParts",
     "Capability",
     "ContextNode",
     "ContextRef",
@@ -141,6 +171,149 @@ def configure_logging(level: int = logging.INFO) -> None:
     _cfg(level=level)
 
 
+# ── C1 request/response conversion (ADR-0139, wave 1d) ──────────────────────
+# Plain-data <-> vendored protobuf. Kept as functions, not methods, so tests can
+# exercise the mapping without a channel.
+
+def _generate_options(pb, max_tokens, temperature, stop, strict):
+    """GenerateOptions with field presence: ``None`` leaves max_tokens/temperature
+    unset (the model's default); an explicit ``0``/``0.0`` is sent and honoured."""
+    opts = pb.GenerateOptions()
+    if max_tokens is not None:
+        opts.max_tokens = int(max_tokens)
+    if temperature is not None:
+        opts.temperature = float(temperature)
+    if stop:
+        opts.stop_sequences.extend([stop] if isinstance(stop, str) else list(stop))
+    if strict:
+        opts.strict = True
+    return opts
+
+
+def _pb_system(pb, blocks):
+    return [pb.SystemBlock(text=b.text, cache=b.cache) for b in blocks]
+
+
+def _pb_messages(pb, messages):
+    out = []
+    for m in messages:
+        calls = [
+            pb.ModelToolCallProto(
+                id=c.get("id", ""),
+                name=c.get("name", ""),
+                # The provider's own argument string, forwarded unchanged: it
+                # matches this against its record of the call it made.
+                arguments_json=c.get("arguments", "") or "",
+            )
+            for c in (m.get("tool_calls") or [])
+        ]
+        out.append(pb.ModelMessageProto(
+            role=m.get("role", "user") or "user",
+            content=m.get("content", "") or "",
+            tool_calls=calls,
+            tool_call_id=m.get("tool_call_id", "") or "",
+        ))
+    return out
+
+
+def _pb_schema(pb, schema):
+    return pb.ResponseSchema(name=schema.name, schema_json=schema.schema_json, strict=schema.strict)
+
+
+def _pb_cache_ttl(pb, ttl: str):
+    from .llm import CACHE_TTL_LONG, CACHE_TTL_SHORT
+    if ttl == CACHE_TTL_SHORT:
+        return pb.CACHE_TTL_SHORT
+    if ttl == CACHE_TTL_LONG:
+        return pb.CACHE_TTL_LONG
+    return pb.CACHE_TTL_UNSPECIFIED
+
+
+_legacy_kernel_logged = False
+
+
+def _fill_result_from(out, msg, *, structured: bool, tools: bool) -> None:
+    """Copy usage/ignored/stop_reason/model from a final GenerateChunk or a
+    GenerateWithToolsResponse into ``out`` (a GenerateResult).
+
+    A C1 kernel always sets ``usage`` on a normally completed call. Its absence
+    after a structured request means the kernel predates C1: on the stream the
+    flattened prompt was read instead (nothing lost); on GenerateWithTools the
+    system blocks were dropped, which is reported as ``ignored: ["system"]`` so a
+    caller can re-send the system text inside the conversation."""
+    from .llm import GenerateUsage
+    global _legacy_kernel_logged
+    out.usage_tokens = int(getattr(msg, "usage_tokens", 0) or 0)
+    if msg.HasField("usage"):
+        u = msg.usage
+        out.usage = GenerateUsage(
+            input_tokens=u.input_tokens, output_tokens=u.output_tokens,
+            cache_read_tokens=u.cache_read_tokens, cache_write_tokens=u.cache_write_tokens,
+            cache_write_known=u.cache_write_known, estimated=u.estimated)
+    out.ignored = list(msg.ignored)
+    if msg.stop_reason:
+        out.stop_reason = msg.stop_reason
+    out.model = msg.model
+    if structured and not msg.HasField("usage"):
+        out.legacy_kernel = True
+        if tools and "system" not in out.ignored:
+            out.ignored.append("system")
+        if not _legacy_kernel_logged:
+            _legacy_kernel_logged = True
+            logger.warning("llm_legacy_kernel", extra={
+                "rpc": "GenerateWithTools" if tools else "GenerateViaModelStream",
+                "effect": ("system blocks dropped; reported as ignored" if tools
+                           else "served from the flattened prompt; no cache breakpoint")})
+    if out.ignored:
+        logger.info("llm_fields_ignored", extra={"ignored": list(out.ignored), "model": out.model})
+
+
+def _map_generate_error(exc, *, tools: bool):
+    """A gRPC error from a managed generation call -> the typed SDK exception.
+
+    FAILED_PRECONDITION (and UNIMPLEMENTED, a kernel predating the RPC) on
+    GenerateWithTools is ``ToolCallingUnsupported``: the documented signal to fall
+    back to the prompt-encoded action protocol, deliberately distinct from every
+    real failure so an outage never silently downgrades a run."""
+    import grpc
+    from .errors import (GenerateError, GenerationResourceExhausted, InvalidRequest,
+                         ModelUnavailable, SchemaValidationFailed)
+    try:
+        code = exc.code()
+        details = exc.details() or ""
+    except Exception:  # noqa: BLE001 — a bare RpcError without status
+        code, details = grpc.StatusCode.UNKNOWN, str(exc)
+    if tools and code in (grpc.StatusCode.UNIMPLEMENTED, grpc.StatusCode.FAILED_PRECONDITION):
+        return ToolCallingUnsupported(str(details or code))
+    name = getattr(code, "name", str(code))
+    cls = {
+        grpc.StatusCode.INVALID_ARGUMENT: InvalidRequest,
+        grpc.StatusCode.ABORTED: SchemaValidationFailed,
+        grpc.StatusCode.RESOURCE_EXHAUSTED: GenerationResourceExhausted,
+        grpc.StatusCode.UNAVAILABLE: ModelUnavailable,
+    }.get(code, GenerateError)
+    return cls(details, code=name)
+
+
+def _log_request(rpc: str, blocks, messages, schema, ttl: str) -> None:
+    """Debug-level request metadata: block count, cache marks, the sha256 of the
+    system text (byte-identical across turns of a run when the caller follows the
+    stable-tier rule), message count, schema name and cache lifetime."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    import hashlib
+    sys_text = "\n\n".join(b.text for b in blocks)
+    logger.debug("llm_request", extra={
+        "rpc": rpc,
+        "system_blocks": len(blocks),
+        "system_cache_marks": sum(1 for b in blocks if b.cache),
+        "system_sha256": hashlib.sha256(sys_text.encode("utf-8")).hexdigest() if blocks else "",
+        "messages": len(messages),
+        "response_schema": schema.name if schema is not None else "",
+        "cache_ttl": ttl,
+    })
+
+
 class SubstrateClient:
     """Backchannel to the Substrate for delegation calls and LTM queries.
 
@@ -170,13 +343,30 @@ class SubstrateClient:
             self._channel = build_channel(self._addr, agent_id=self._agent_id)
             self._stub = cambrian_pb2_grpc.OrchestratorStub(self._channel)
 
+    # ── Managed generation (ADR-0018 proxy; ADR-0139 C1 request shape) ──────────
+    #
+    # Four entry points, one wire path per RPC:
+    #   generate(...)            -> str              (legacy signature, kept)
+    #   generate_stream(...)     -> Iterator[str]    (legacy signature, kept)
+    #   generate_request(...)    -> GenerateResult   (text + usage, ignored, model)
+    #   generate_with_tools(...) -> GenerateResult   (unpacks as the old 3-tuple)
+    # All accept the C1 fields as keywords: system, messages, response_schema,
+    # cache_ttl, stop, strict. See cambrian_agent_sdk/llm.py for the shapes.
+
     def generate(
         self,
         session_token_id: str,
-        prompt: str,
-        max_tokens: int = 1024,
-        temperature: float = 0.7,
+        prompt: str = "",
+        max_tokens: Optional[int] = 1024,
+        temperature: Optional[float] = 0.7,
         timeout_ms: int = 0,
+        *,
+        system=None,
+        messages=None,
+        response_schema=None,
+        cache_ttl=None,
+        stop=None,
+        strict: bool = False,
     ) -> str:
         """Call the Substrate's managed LLM proxy and return the full text.
 
@@ -185,24 +375,32 @@ class SubstrateClient:
         block the thread after the Go side has already moved on with
         DEADLINE_EXCEEDED, leaking a ThreadPoolExecutor slot per hung call.
 
-        Internally delegates to :meth:`generate_stream` — see that method for
-        the streaming variant (useful for > 4k-token outputs).
+        ``prompt`` alone is the original call shape and is sent as one user turn.
+        The C1 keywords (``system``, ``messages``, ...) are described on
+        :meth:`generate_request`, which also returns usage and ``ignored``.
         """
-        return "".join(self.generate_stream(
-            session_token_id=session_token_id,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
+        return self.generate_request(
+            session_token_id, prompt=prompt, system=system, messages=messages,
+            response_schema=response_schema, cache_ttl=cache_ttl,
+            max_tokens=max_tokens, temperature=temperature, stop=stop, strict=strict,
             timeout_ms=timeout_ms,
-        ))
+        ).text
 
     def generate_stream(
         self,
         session_token_id: str,
-        prompt: str,
-        max_tokens: int = 1024,
-        temperature: float = 0.7,
+        prompt: str = "",
+        max_tokens: Optional[int] = 1024,
+        temperature: Optional[float] = 0.7,
         timeout_ms: int = 0,
+        *,
+        system=None,
+        messages=None,
+        response_schema=None,
+        cache_ttl=None,
+        stop=None,
+        strict: bool = False,
+        result=None,
     ):
         """Stream text chunks from the Substrate's managed LLM proxy.
 
@@ -210,38 +408,134 @@ class SubstrateClient:
         Use this for large outputs to avoid buffering the entire response before
         returning — prevents ThreadPoolExecutor saturation on 8k-token replies.
 
+        Pass ``result=GenerateResult()`` to receive the final chunk's usage,
+        ``ignored``, ``stop_reason`` and ``model`` once the stream is exhausted.
+
         Example::
 
             for chunk in agent.substrate.generate_stream(token, prompt, timeout_ms=5000):
                 partial_output += chunk
         """
         self._ensure()
+        import grpc
         from ._proto import cambrian_pb2
-        req = cambrian_pb2.GenerateStreamRequest(
+        from .llm import GenerateResult as _Result
+
+        req, structured = self._build_stream_request(
+            cambrian_pb2, session_token_id, prompt=prompt, system=system, messages=messages,
+            response_schema=response_schema, cache_ttl=cache_ttl, max_tokens=max_tokens,
+            temperature=temperature, stop=stop, strict=strict)
+        out = result if result is not None else _Result()
+        timeout_secs = (timeout_ms / 1000.0) if timeout_ms > 0 else None
+        md = [("x-agent-id", self._agent_id)] if self._agent_id else []
+        texts: List[str] = []
+        try:
+            for chunk in self._stub.GenerateViaModelStream(req, timeout=timeout_secs, metadata=md):
+                if chunk.text:
+                    texts.append(chunk.text)
+                    yield chunk.text
+                if chunk.is_final:
+                    _fill_result_from(out, chunk, structured=structured, tools=False)
+        except grpc.RpcError as exc:
+            raise _map_generate_error(exc, tools=False) from exc
+        out.text = "".join(texts)
+
+    def generate_request(
+        self,
+        session_token_id: str,
+        *,
+        system=None,
+        messages=None,
+        prompt: str = "",
+        response_schema=None,
+        cache_ttl=None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        stop=None,
+        strict: bool = False,
+        timeout_ms: int = 0,
+    ):
+        """One managed generation in the ADR-0139 C1 shape; returns a ``GenerateResult``.
+
+        - ``system``: ``[{"text": ..., "cache": True}, ...]`` (or ``SystemBlock``s, or a
+          plain string). Stable text first; mark the last stable block ``cache=True``.
+          Volatile text (budget notices, step state) belongs in ``messages``.
+        - ``messages``: ``[{"role": "user"|"assistant"|"tool", "content": ...}]``. A
+          ``"system"`` role raises ``InvalidRequest``. ``prompt`` alone is sent as one
+          user turn.
+        - ``response_schema``: ``{"name", "schema": dict|str, "strict": bool}``.
+        - ``cache_ttl``: ``"short"`` (5 min, agent runs) | ``"long"`` (1 h) | ``None``.
+        - ``max_tokens`` / ``temperature``: ``None`` = the model's default; ``0.0`` is
+          sent as a real temperature (field presence).
+        - ``stop``: stop sequences. ``strict=True`` turns an option the model cannot
+          honour into ``InvalidRequest`` instead of an entry in ``result.ignored``.
+
+        Raises ``InvalidRequest`` (INVALID_ARGUMENT), ``SchemaValidationFailed``
+        (ABORTED), ``GenerationResourceExhausted`` (RESOURCE_EXHAUSTED),
+        ``ModelUnavailable`` (UNAVAILABLE), or ``GenerateError`` for anything else.
+        """
+        from .llm import GenerateResult as _Result
+        out = _Result()
+        out.text = "".join(self.generate_stream(
+            session_token_id, prompt=prompt, max_tokens=max_tokens,
+            temperature=temperature, timeout_ms=timeout_ms, system=system,
+            messages=messages, response_schema=response_schema, cache_ttl=cache_ttl,
+            stop=stop, strict=strict, result=out))
+        return out
+
+    def _build_stream_request(self, pb, session_token_id, *, prompt, system, messages,
+                              response_schema, cache_ttl, max_tokens, temperature, stop, strict):
+        """The GenerateStreamRequest, plus whether it used the structured C1 fields.
+
+        Compatibility with a kernel that predates C1: such a kernel drops the unknown
+        ``system``/``messages`` fields and reads ``prompt``. So whenever the request
+        is structured, the flattened prompt rides along in the deprecated ``prompt``
+        field. A C1 kernel ignores ``prompt`` when ``messages`` is non-empty, so it
+        is never read twice; an older kernel still gets the whole text (without the
+        cache breakpoint).
+        """
+        from .llm import (coerce_cache_ttl, coerce_messages, coerce_response_schema,
+                          coerce_system, flatten_prompt)
+        blocks = coerce_system(system)
+        msgs = coerce_messages(messages)
+        schema = coerce_response_schema(response_schema)
+        ttl = coerce_cache_ttl(cache_ttl)
+        structured = bool(blocks or msgs or schema)
+        if structured and not msgs and prompt:
+            msgs = [{"role": "user", "content": prompt}]
+        legacy_prompt = flatten_prompt(blocks, msgs) if structured else prompt
+        req = pb.GenerateStreamRequest(
             # Phase 1: lease_id is the honest name; session_token_id is sent too so a
             # kernel predating the field still authenticates the call. Same value.
             lease_id=session_token_id,
             session_token_id=session_token_id,
-            prompt=prompt,
-            options=cambrian_pb2.GenerateOptions(
-                max_tokens=max_tokens,
-                temperature=temperature,
-            ),
+            prompt=legacy_prompt,
+            options=_generate_options(pb, max_tokens, temperature, stop, strict),
         )
-        timeout_secs = (timeout_ms / 1000.0) if timeout_ms > 0 else None
-        md = [("x-agent-id", self._agent_id)] if self._agent_id else []
-        for chunk in self._stub.GenerateViaModelStream(req, timeout=timeout_secs, metadata=md):
-            if chunk.text:
-                yield chunk.text
+        if structured:
+            req.system.extend(_pb_system(pb, blocks))
+            req.messages.extend(_pb_messages(pb, msgs))
+            if schema is not None:
+                req.response_schema.CopyFrom(_pb_schema(pb, schema))
+        if ttl:
+            req.cache_ttl = _pb_cache_ttl(pb, ttl)
+        _log_request("GenerateViaModelStream", blocks, msgs, schema, ttl)
+        return req, structured
 
     def generate_with_tools(
         self,
         session_token_id: str,
         messages: list,
         tools: list,
-        max_tokens: int = 1024,
-        temperature: float = 0.7,
+        max_tokens: Optional[int] = 1024,
+        temperature: Optional[float] = 0.7,
         timeout_ms: int = 0,
+        *,
+        system=None,
+        response_schema=None,
+        cache_ttl=None,
+        stop=None,
+        strict: bool = False,
     ):
         """One generation turn with NATIVE tool-calling (ADR-0097 Phase B).
 
@@ -252,9 +546,15 @@ class SubstrateClient:
         see that its own call happened. Sending a single user turn per round — the first
         cut of this method — makes every round a fresh conversation.
 
-        Returns ``(text, tool_calls, stop_reason)`` where ``tool_calls`` is a list of
-        ``{"id", "name", "arguments"}`` dicts and ``stop_reason`` is the kernel's
-        normalized value — only ``"end_turn"`` means finished.
+        ``system`` / ``response_schema`` / ``cache_ttl`` / ``stop`` / ``strict`` are the
+        C1 fields, as on :meth:`generate_request`. System text goes only in ``system``;
+        a ``"system"`` message raises ``InvalidRequest``.
+
+        Returns a ``GenerateResult``. It unpacks as the old ``(text, tool_calls,
+        stop_reason)`` tuple, where ``tool_calls`` is a list of ``{"id", "name",
+        "arguments"}`` dicts and ``stop_reason`` is the kernel's normalized value —
+        only ``"end_turn"`` means finished — and also carries ``usage``, ``ignored``
+        and ``model``.
 
         ``tools`` is a list of ``{"name", "description", "parameters"}`` dicts, where
         ``parameters`` is a JSON Schema object (dict or pre-encoded string).
@@ -263,10 +563,18 @@ class SubstrateClient:
         to the step cannot do native tool-calling. That is a CAPABILITY answer, not a
         failure: the caller is expected to fall back to the prompt-encoded action
         protocol, which is why it is a distinct exception rather than a generic error.
+        Other failures raise the typed errors listed on :meth:`generate_request`.
         """
         self._ensure()
         import grpc
         from ._proto import cambrian_pb2
+        from .llm import (GenerateResult as _Result, coerce_cache_ttl, coerce_messages,
+                          coerce_response_schema, coerce_system)
+
+        blocks = coerce_system(system)
+        msgs = coerce_messages(messages)
+        schema = coerce_response_schema(response_schema)
+        ttl = coerce_cache_ttl(cache_ttl)
 
         pb_tools = []
         for t in tools or []:
@@ -279,53 +587,31 @@ class SubstrateClient:
                 parameters_json=params,
             ))
 
-        pb_messages = []
-        for m in messages or []:
-            pb_calls = [
-                cambrian_pb2.ModelToolCallProto(
-                    id=c.get("id", ""),
-                    name=c.get("name", ""),
-                    # The provider's own argument string, forwarded unchanged: it
-                    # matches this against its record of the call it made.
-                    arguments_json=c.get("arguments", "") or "",
-                )
-                for c in (m.get("tool_calls") or [])
-            ]
-            pb_messages.append(cambrian_pb2.ModelMessageProto(
-                role=m.get("role", "user"),
-                content=m.get("content", "") or "",
-                tool_calls=pb_calls,
-                tool_call_id=m.get("tool_call_id", "") or "",
-            ))
-
         req = cambrian_pb2.GenerateWithToolsRequest(
             lease_id=session_token_id,
-            options=cambrian_pb2.GenerateOptions(
-                max_tokens=max_tokens,
-                temperature=temperature,
-            ),
+            options=_generate_options(cambrian_pb2, max_tokens, temperature, stop, strict),
             tools=pb_tools,
-            messages=pb_messages,
+            messages=_pb_messages(cambrian_pb2, msgs),
+            system=_pb_system(cambrian_pb2, blocks),
         )
+        if schema is not None:
+            req.response_schema.CopyFrom(_pb_schema(cambrian_pb2, schema))
+        if ttl:
+            req.cache_ttl = _pb_cache_ttl(cambrian_pb2, ttl)
+        _log_request("GenerateWithTools", blocks, msgs, schema, ttl)
         timeout_secs = (timeout_ms / 1000.0) if timeout_ms > 0 else None
         md = [("x-agent-id", self._agent_id)] if self._agent_id else []
         try:
             resp = self._stub.GenerateWithTools(req, timeout=timeout_secs, metadata=md)
         except grpc.RpcError as exc:
-            code = exc.code()
-            # UNIMPLEMENTED: kernel predates this RPC. FAILED_PRECONDITION: the RPC
-            # exists but this step's model cannot do it. Both mean "use the fallback",
-            # and both must stay distinct from a real generation error so the loop
-            # does not silently degrade on an outage.
-            if code in (grpc.StatusCode.UNIMPLEMENTED, grpc.StatusCode.FAILED_PRECONDITION):
-                raise ToolCallingUnsupported(str(exc.details() or code)) from exc
-            raise
+            raise _map_generate_error(exc, tools=True) from exc
 
-        calls = [
+        out = _Result(text=resp.text, stop_reason=resp.stop_reason, tool_calls=[
             {"id": tc.id, "name": tc.name, "arguments": tc.arguments_json}
             for tc in resp.tool_calls
-        ]
-        return resp.text, calls, resp.stop_reason
+        ])
+        _fill_result_from(out, resp, structured=bool(blocks or schema), tools=True)
+        return out
 
     def get_context_node(self, cid: str, session_token_id: str = "") -> Optional["ContextNode"]:
         """Resolve a CID from the ContentStore. Drill-down for offloaded content.
@@ -437,6 +723,7 @@ class SubstrateClient:
     def list_tools(
         self, query: str = "", k: int = 0,
         names: Optional[List[str]] = None, full: bool = False,
+        session_token_id: str = "",
     ) -> List[Dict]:
         """Return the system tools this agent may invoke (ADR-0039), for the ReAct
         prompt menu. The kernel resolves the agent's grants from the x-agent-id
@@ -454,6 +741,10 @@ class SubstrateClient:
         ``describe_tool`` path) to fetch Tier-2 (full description + full arg
         schema) for the named granted tools only — ungranted names are absent.
         These ride x-tool-names / x-tool-full metadata.
+
+        ``session_token_id`` (the run's lease) lets the kernel also describe tools a
+        system skill conferred for THIS run (ADR-0046 D6); without it only standing
+        grants are described.
         """
         self._ensure()
         from ._proto import cambrian_pb2
@@ -467,6 +758,8 @@ class SubstrateClient:
             md.append(("x-tool-names", ",".join(names)))
         if full:
             md.append(("x-tool-full", "true"))
+        if session_token_id:
+            md.append(("x-lease-id", session_token_id))
         try:
             resp = self._stub.ListTools(cambrian_pb2.ListToolsRequest(), metadata=md)
         except Exception:  # noqa: BLE001 — degrade to an empty menu, never crash

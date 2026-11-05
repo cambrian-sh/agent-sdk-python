@@ -39,7 +39,7 @@ class Spinner:
 
     def generate_with_tools(self, session_token_id=None, messages=None, tools=None, **kw):
         blob = json.dumps(messages or [])
-        if "TOOL BUDGET EXHAUSTED" in blob:
+        if "tool budget exhausted" in blob.lower():
             self.saw_notice = True
             if self.obey:
                 return (json.dumps({"action": "final_answer",

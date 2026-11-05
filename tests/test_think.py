@@ -453,93 +453,36 @@ def test_think_memory_query_branch_then_final():
 
 
 class _FakePrecedentMemory(_FakeMemory):
-    """A memory client that also serves the world-model PULL lane (ADR-0049 D11):
-    each hit is a prior TRANSITION whose metadata carries the outcome."""
+    """A memory client that still exposes recall_precedents (an old SDK, or a
+    hand-rolled client). The loop must never call it: precedents were removed
+    2026-11-05 (decisions/scenes-cancelled.md)."""
 
-    def __init__(self, results, precedents):
+    def __init__(self, results):
         super().__init__(results)
-        self.precedents = precedents
         self.precedent_queries = []
 
     def recall_precedents(self, query, **kw):
         self.precedent_queries.append(query)
-        return self.precedents
+        return [{"text": "should never be read"}]
 
 
-def test_think_recall_precedents_branch_pulls_the_lane_and_renders_it():
-    """ADR-0049 D11/Issue 014: a recall_precedents action reaches
-    MemoryClient.recall_precedents (NOT recall), and the returned transitions —
-    with their outcomes — are rendered into the next prompt."""
+def test_recall_precedents_action_is_no_longer_dispatched():
+    """recall_precedents is no longer a loop action: an emitted one never reaches
+    MemoryClient.recall_precedents, and nothing precedent-shaped is rendered."""
     bot = Bot(agent_id="b")
-    bot.memory = _FakePrecedentMemory(
-        [{"text": "a fact"}],
-        [{"text": "restarted payments at peak -> 4m outage",
-          "metadata": {"outcome": "failure"}}],
-    )
-    bot.substrate = _FakeLLM([
-        json.dumps({"action": "recall_precedents",
-                    "query": "about to restart payments at peak"}),
-        json.dumps({"action": "final_answer", "answer": "drain first"}),
-    ])
-
-    res = bot.think(AgentTask(text="restart payments"))
-    assert res.text == "drain first"
-    # Exactly one pull, on the precedent lane, with the query the model asked for.
-    assert bot.memory.precedent_queries == ["about to restart payments at peak"]
-    assert bot.memory.calls == 1  # the seed fact recall only — NOT a second recall()
-    nxt = bot.substrate.prompts[1]
-    assert 'type="recall_precedents"' in nxt
-    assert 'query="about to restart payments at peak"' in nxt
-    assert "<precedent " in nxt and "outcome='failure'" in nxt
-    assert "restarted payments at peak -&gt; 4m outage" in nxt
-
-
-def test_think_recall_precedents_empty_says_no_precedent():
-    """The lane is similarity-gated: empty means "no comparable prior situation",
-    which the trajectory must SAY, so the model does not read a blank block as a
-    licence to invent an analogy."""
-    bot = Bot(agent_id="b")
-    bot.memory = _FakePrecedentMemory([{"text": "a fact"}], [])
-    bot.substrate = _FakeLLM([
-        json.dumps({"action": "recall_precedents", "query": "never seen before"}),
-        json.dumps({"action": "final_answer", "answer": "proceeding"}),
-    ])
-
-    bot.think(AgentTask(text="do a novel thing"))
-    nxt = bot.substrate.prompts[1]
-    assert 'status="empty"' in nxt
-    assert "no precedent found" in nxt
-
-
-def test_recall_precedents_shares_the_memory_budget():
-    """A precedent round is still a retrieval round: it spends the SAME budget as
-    memory_query, so an LLM that only ever retrieves cannot evade the cap by
-    alternating lanes."""
-    bot = Bot(agent_id="b")
-    bot.memory = _FakePrecedentMemory([{"text": "f"}], [{"text": "p"}])
-    bot.substrate = _FakeLLM(
-        [json.dumps({"action": "recall_precedents", "query": "x"})] * 20)
-
-    res = bot.think(AgentTask(text="q"), max_memory_queries=3)
-    assert isinstance(res, AgentResult)  # graceful, no crash
-    # 1 seed recall + 2 precedent pulls = the 3-round budget.
-    assert bot.memory.calls == 1
-    assert len(bot.memory.precedent_queries) == 2
-
-
-def test_recall_precedents_degrades_when_client_predates_the_lane():
-    """An older MemoryClient has no recall_precedents. That is answered the same way
-    the kernel answers a gated miss — no precedent — never an AttributeError crash."""
-    bot = Bot(agent_id="b")
-    bot.memory = _FakeMemory([{"text": "a fact"}])  # no recall_precedents method
+    bot.memory = _FakePrecedentMemory([{"text": "a fact"}])
     bot.substrate = _FakeLLM([
         json.dumps({"action": "recall_precedents", "query": "x"}),
         json.dumps({"action": "final_answer", "answer": "ok"}),
     ])
 
-    res = bot.think(AgentTask(text="q"))
-    assert res.text == "ok"
-    assert "no precedent found" in bot.substrate.prompts[1]
+    bot.think(AgentTask(text="q"))
+    assert bot.memory.precedent_queries == []
+    # Not advertised either (the menu is in the first prompt). The second prompt
+    # carries the unknown-action note naming the stale verb, which is the intended
+    # feedback (T-20261105-react-text-loop-ends-the-run-with-an-empty).
+    assert "precedent" not in bot.substrate.prompts[0]
+    assert "is not an action you can take" in bot.substrate.prompts[1]
 
 
 def test_seed_recall_always_fires_even_without_llm_memory_query():
@@ -600,7 +543,9 @@ def test_default_generation_params():
     bot = Bot(agent_id="b")  # no overrides → CognitiveAgent defaults
     bot.substrate = _FakeLLM([json.dumps({"action": "final_answer", "answer": "ok"})])
     bot.think(AgentTask(text="hi"))
-    assert bot.substrate.last_kwargs["max_tokens"] == 1024
+    # ADR-0139 Phase 0: CognitiveAgent.max_tokens=None defers to run_think's 4096
+    # default; the old class literal 1024 shadowed it for every agent.
+    assert bot.substrate.last_kwargs["max_tokens"] == 4096
     assert bot.substrate.last_kwargs["temperature"] == 0.7
 
 
@@ -677,3 +622,27 @@ def test_prompt_uses_four_section_builder_with_tools_in_output_schema():
     assert "<OutputSchema>" in prompt
     # the @tool registry is injected into the output schema (closed menu)
     assert "add" in prompt
+
+
+
+def test_unknown_action_is_reprompted_not_returned_as_empty_success():
+    """T-20261105-react-text-loop-ends-the-run-with-an-empty: a stale or invented
+    verb must be fed back with a note, never returned as an empty final answer."""
+    bot = Bot(agent_id="b")
+    bot.substrate = llm = _FakeLLM([
+        json.dumps({"action": "recall_precedents", "query": "x"}),
+        json.dumps({"action": "final_answer", "answer": "ok"}),
+    ])
+    res = bot.think(AgentTask(text="do the thing"))
+    assert res.text == "ok"
+    assert len(llm.prompts) == 2
+    sent = llm.prompts[1] + repr(llm.last_kwargs)
+    assert "is not an action you can take" in sent
+
+
+def test_persistent_unknown_action_fails_loudly():
+    bot = Bot(agent_id="b")
+    bot.substrate = llm = _FakeLLM([json.dumps({"action": "teleport"})] * 5)
+    with pytest.raises(ReActLoopError):
+        bot.think(AgentTask(text="do the thing"))
+    assert len(llm.prompts) == 3  # first try plus two re-prompts

@@ -20,11 +20,31 @@ from __future__ import annotations
 
 from typing import List
 
+from . import prompt_library
 from .working_memory import _condense_args, action_text
+
+# The library prompt this module renders (cambrian_agent_sdk/prompts/reflection/
+# v<N>.md, ADR-0139 C4). The wording lives there; this module fills the slots.
+REFLECTION_PROMPT_ID = "reflection"
 
 # Keep a reflection terse: it is pinned into every later prompt, so it must be a
 # lesson, not an essay. The orchestrator caps generation tokens to match.
 DEFAULT_MAX_REFLECTION_TOKENS = 200
+
+
+def _role_sentence(role: str) -> str:
+    """Render the role as one "You are ..." sentence, idempotently (ADR-0139 Phase 0).
+
+    Roles are authored both ways: as a noun phrase ("a careful test assistant") and
+    as a full sentence ("You are a precise summarisation engine."). Prefixing the
+    second with "You are" produced "You are You are a precise summarisation
+    engine.." in every reflection prompt."""
+    text = (role or "").strip()
+    if not text:
+        return "You are an agent."
+    if text.lower().startswith(("you are ", "you're ")):
+        return text if text.endswith((".", "!", "?")) else text + "."
+    return f"You are {text.rstrip('.')}."
 
 
 def build_reflection_prompt(
@@ -46,17 +66,10 @@ def build_reflection_prompt(
     """
     sig = action_text(tool, _condense_args(args if isinstance(args, dict) else {"value": args}))
     prior = "\n".join(f"- {r}" for r in prior_reflections) if prior_reflections else "(none yet)"
-    return (
-        f"You are {role}.\n"
-        f"Task: {task_text}\n\n"
-        "An action you keep issuing has FAILED repeatedly and was vetoed to stop a "
-        "retry loop:\n"
-        f"  action: {sig}\n"
-        f"  most recent failure: {failure_summary or '(no detail)'}\n\n"
-        f"Reflections you already recorded this run:\n{prior}\n\n"
-        "In ONE or TWO plain sentences, reflect: WHY did this action fail, and WHAT "
-        "will you do differently next — a different tool, different arguments, or a "
-        "different approach. Be concrete and specific to THIS failure.\n"
-        "Output only the reflection sentence(s). Do NOT output JSON, and do NOT "
-        "emit an action."
-    )
+    return prompt_library.get(REFLECTION_PROMPT_ID).render({
+        "role_sentence": _role_sentence(role),
+        "task": task_text,
+        "action": sig,
+        "failure": failure_summary or "(no detail)",
+        "prior_reflections": prior,
+    }).text

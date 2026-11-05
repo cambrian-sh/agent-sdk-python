@@ -4,15 +4,16 @@ A reason/retrieve/act loop with three branches:
 
 - **memory-query** — capped re-queries with *graceful degradation*: once the budget
   is spent the loop stops retrieving and asks the LLM to answer best-effort; it never
-  crashes at the cap. ``recall_precedents`` (the world-model PULL lane, ADR-0049 D11)
-  is a second retrieval action on the SAME budget;
+  crashes at the cap;
 - **tool-call** — capped rounds; exceeding the cap raises :class:`ReActLoopError`,
   a *typed* error the default ``run()`` catches and turns into ``type="error"``;
 - **final-answer** — parsed and returned as an :class:`AgentResult`.
 
-The prompt is assembled with the canonical PROMPTREQ 4-section builder
-(:func:`build_prompt`), with the agent's ``@tool`` registry injected into the
-``<OutputSchema>`` so the LLM only ever sees the closed tool menu.
+The prompt is assembled by :func:`helpers.build_prompt_parts` as a cached, stable
+system tier (role, constraints, anti-patterns, the action protocol with the closed
+tool and skill menu, the per-turn contract) plus a volatile user turn (task,
+trajectory, per-turn notes), and sent on the ADR-0139 C1 fields. The texts are the
+SDK prompt-library files ``prompts/react-*/v1.md``.
 
 v2 additions (see docs/research/agent-prompting/SUMMARY.md):
 - ActionProtocol is grouped (Memory / Tools / Skills / Answer / Delegation) with
@@ -23,7 +24,7 @@ v2 additions (see docs/research/agent-prompting/SUMMARY.md):
 - The 4 Rules also live in ``<Constraints>`` at the top of <System> (via
   ``helpers.DEFAULT_CONSTRAINTS``) for recency-priority visibility.
 - Trajectory entries are emitted via :func:`working_memory.add_step` for typed
-  steps (memory_query, recall_precedents, tool_call) — the v2 rich XML renderer produces
+  steps (memory_query, tool_call) — the v2 rich XML renderer produces
   self-describing ``<step n="N" type="..." status="...">`` blocks with named
   ``<call>`` children and ``<result offloaded_cid="...">`` summaries.
 """
@@ -36,7 +37,11 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from .helpers import _esc, build_prompt
+# build_prompt stays importable from here for callers that used react.build_prompt;
+# the loop itself sends build_prompt_parts (system + messages, ADR-0139 D2).
+from .helpers import (_esc, build_prompt, build_prompt_parts, default_anti_patterns,  # noqa: F401
+                      default_constraints, prompt_versions)
+from .prompt_library import fragment
 from .host import host_block
 from .recurrence import count_failed_duplicates, count_successful_duplicates
 from .reflection import DEFAULT_MAX_REFLECTION_TOKENS, build_reflection_prompt
@@ -50,7 +55,6 @@ from .working_memory import (
     memory_provenance_attrs,
     render_entry_xml,
     _render_memory_results,
-    _render_precedent_results,
 )
 
 logger = logging.getLogger("cambrian.react")
@@ -77,6 +81,16 @@ _DEFAULT_MAX_TOOL_ROUNDS = 12
 _DEFAULT_MAX_DESCRIBE_CALLS = 5
 # ADR-0046: cap use_skill loads per run.
 _DEFAULT_MAX_SKILL_LOADS = 5
+# ADR-0139 D3: the total budget for loaded skill bodies in one run, in characters
+# (~4 chars/token, so ~8k tokens). A loaded skill is pinned in full for the rest of
+# the run, so the budget is what bounds the instructions region; a load that would
+# overflow it is REFUSED with a note, never truncated: a cut procedure is a wrong
+# procedure. Characters rather than tokens because the SDK has no tokenizer; the
+# Phase 2 context engine replaces this with a token budget.
+_DEFAULT_MAX_SKILL_CHARS = 32000
+# The sectioned-write tool the truncation guidance may recommend, when (and only
+# when) it is actually in the agent's menu.
+_LARGE_WRITE_TOOL = "fast_large_write_file"
 # ADR-0044: default size of the task-relevant tool menu the kernel serves (the
 # push). The kernel ranks the granted tools against the task and returns this many;
 # the find_tools pull fetches more on demand, so this can stay small.
@@ -92,6 +106,11 @@ _MAX_TRUNCATION_RETRIES = 3
 # How many times a non-action response is re-prompted before it is accepted as the
 # answer. 1 = nudge once. See INFERRED_FINAL_ANSWER_NOTE for why this exists at all.
 _MAX_INFERRED_ANSWER_RETRIES = 1
+# An action kind no branch handles (a hallucinated verb, or one removed from the
+# menu, e.g. recall_precedents on 2026-11-05) used to fall through to the
+# final_answer tail and return an EMPTY answer as success. It is re-prompted this
+# many times, then the run fails loudly (T-20261105-react-text-loop-ends-the-run-with-an-empty).
+_MAX_UNKNOWN_ACTION_RETRIES = 2
 # ADR-0052: how many verbal reflections the loop will extract per run. Each costs one
 # small LLM call on a hard-veto; bounded so a thrashing run cannot reflect endlessly.
 _DEFAULT_MAX_REFLECTIONS = 3
@@ -102,38 +121,28 @@ _DEFAULT_MAX_REFLECTIONS = 3
 _DEFAULT_MAX_INLINE_RESOLVES = 3
 
 
-# The Tool-actions half of the menu, in its two encodings.
+# The ReAct prompt texts live in the SDK prompt library (ADR-0139 C4):
+# prompts/react-action-protocol/v1.md, react-turn/v1.md, react-nudges/v1.md. This
+# module chooses and joins sections; it holds no model-facing prose of its own.
+_AP = "react-action-protocol"
+
+
+def _ap(section: str, **values) -> str:
+    return fragment(_AP, section).render(values)
+
+
+# The Tool-actions half of the menu, in its two encodings (kept as module names for
+# callers that import them).
 #
 # Under native tool-calling the JSON tool_call action must NOT be advertised. Telling a
 # model to emit `{"action":"tool_call",...}` while ALSO attaching real tool schemas
 # gives it two ways to do one thing, and it takes the one that does nothing. Measured
 # 2026-07-28: with both present the suite scored 3/6 against 5/6 on the pure text path,
 # and every failure was a model describing the work instead of performing it.
-_JSON_TOOL_SECTION = (
-    "## Tool actions\n"
-    '- `{"action": "tool_call", "tool": "<name>", "args": {<json>}}` — invoke a granted tool.\n'
-    '  Example: `{"action": "tool_call", "tool": "web_search", "args": {"query": "Paris population 2024"}}`\n'
-    "- **cid handoff (ADR-0048 #1)**: for an arg value you already have a cid for\n"
-    "  (a recalled fact shows `[full content cid:…]`, OR a workspace block / tool\n"
-    '  result shows `offloaded_cid="…"` in the trajectory), pass `{"$cid": "<cid>"}`\n'
-    "  instead of pasting the whole content — the kernel resolves it. The tool\n"
-    "  sees the full body; you don't have to re-emit it. This is how you write\n"
-    "  large offloaded workspace content to a file in a single tool_call.\n"
-    '- `{"action": "find_tools", "need": "<capability>"}` — discover more tools (verb-first).\n'
-    '  Example: `{"action": "find_tools", "need": "search the web for a person"}`\n'
-    '- `{"action": "describe_tool", "tool": "<name>"}` — fetch the FULL arg schema.\n'
-    '  Example: `{"action": "describe_tool", "tool": "mcp:pdf-reader/read_pdf"}`\n'
-    "\n"
-)
-
-_NATIVE_TOOL_SECTION = """## Tools
-- Your tools are attached to this request directly. CALL them — do not describe
-  calling them, and do not emit a JSON tool_call action; there is no such action.
-- Use an action from the menu below ONLY when you are not calling a tool.
-- Describing what you are about to do is not doing it. If the task needs a tool,
-  call it now; if the task is finished, say so as a final answer.
-
-"""
+# ADR-0139 Phase 0: the native section does not even NAME the JSON action it forbids;
+# the native prompt speaks one protocol, and naming the other is how it leaked back in.
+_JSON_TOOL_SECTION = _ap("tools-text") + "\n\n"
+_NATIVE_TOOL_SECTION = _ap("tools-native") + "\n\n"
 
 
 def build_output_schema(
@@ -159,33 +168,43 @@ def build_output_schema(
       mechanism; the literature shows this is the single biggest lift).
     - The 4 Rules are kept here (prompt-mid position) as well as in
       ``<Constraints>`` at the top (recency-priority).
+
+    The text is the ``react-action-protocol`` fragment set; blocks are joined by one
+    blank line.
     """
     tool_lines = []
     for spec in agent.tools.specs():
-        tool_lines.append(f'  - {spec.name}: args schema = {json.dumps(spec.schema["properties"])}')
+        tool_lines.append(_ap("tool-line-local", name=spec.name,
+                              schema=json.dumps(spec.schema["properties"])))
     for t in system_tools or []:
         desc = (t.get("description") or "").strip()
         props = _schema_properties(t.get("schema_json"))
-        suffix = f" args schema = {json.dumps(props)}" if props else ""
-        tool_lines.append(f'  - {t.get("name")} (system tool): {desc}{suffix}')
-    tools_block = "\n".join(tool_lines) if tool_lines else "  (no tools registered)"
+        suffix = _ap("tool-line-schema", schema=json.dumps(props)) if props else ""
+        tool_lines.append(_ap("tool-line-system", name=t.get("name"), description=desc,
+                              suffix=suffix))
+    tools_block = "\n".join(tool_lines) if tool_lines else _ap("tools-empty")
     # ADR-0046: the [skills] menu section — authored procedures the agent may load.
-    skill_lines = [f'  - {sk.get("name")}: {(sk.get("description") or "").strip()}'
+    skill_lines = [_ap("skill-line", name=sk.get("name"),
+                       description=(sk.get("description") or "").strip())
                    for sk in system_skills or []]
-    skills_block = "\n".join(skill_lines) if skill_lines else "  (no skills available)"
+    skills_block = "\n".join(skill_lines) if skill_lines else _ap("skills-empty")
+    # ADR-0139 Phase 0: one protocol per prompt. Under native tool-calling there is no
+    # JSON tool_call action, so neither the opener nor the rules may name one; tools
+    # are CALLED. Non-tool actions (memory_query, final_answer, ...) stay JSON actions
+    # until Phase 2 makes every control verb a native tool.
+    variant = "native" if native_tools else "text"
+    # Skills are native tools when tools are native and there is a skill menu to load
+    # from (build_tool_definitions(include_skills=...) follows the same condition).
+    native_skills = bool(native_tools and system_skills)
     # yield_subgoal is only meaningful inside a coordinated plan; an opted-out agent
     # (e.g. the chat front desk) delegates whole work via a tool instead, so we omit
     # the action from its menu entirely rather than advertising a dead option.
-    yield_line = (
-        '- `{"action": "yield_subgoal", "intent": "<task>", "capability_hint": "<opt>"}` — delegate.\n'
-        '  Example: `{"action": "yield_subgoal", "intent": "summarise the risk factors section", "capability_hint": "summarisation"}`\n'
-        if allow_yield_subgoal else ""
-    )
-    return (
-        'You emit ONE JSON action per turn — {"action": "<name>", ...} — and are '
-        "called again with each result. Prefer gathering evidence over guessing.\n"
-        "\n"
-        # Advertised only when the agent may actually use it.
+    answer = _ap("answer")
+    if allow_yield_subgoal:
+        answer += "\n" + _ap("answer-yield")
+    blocks = [
+        _ap(f"opener-{variant}"),
+        # Memory is advertised only when the agent may actually use it.
         #
         # Listing it unconditionally while `max_memory_queries` is 0 is the
         # same inconsistent middle that broke the tool path: the menu says "Do
@@ -195,54 +214,18 @@ def build_output_schema(
         # exhausted</note>" as though it were the agent's considered reply.
         #
         # Advertise a capability and allow it, or advertise neither.
-        + ("## Memory actions\n"
-           '- `{"action": "memory_query", "query": "<text>"}` — retrieve from org long-term memory (knowledge base). Do this FIRST; ground claims in retrieved facts before answering from your own training.\n'
-           '  Example: `{"action": "memory_query", "query": "Q4 2024 revenue"}`\n'
-           '- `{"action": "recall_precedents", "query": "<the situation you are about to act in>"}` — before committing to an approach in a situation that may have occurred before, pull prior TRANSITIONS (what was done, what followed), failures first; an empty result means no precedent — proceed on your own judgment.\n'
-           '  Example: `{"action": "recall_precedents", "query": "about to restart the payments service during peak traffic"}`\n'
-           "\n" if allow_memory else
-           "## Memory\n"
-           "- You have NO memory access in this session. There is no `memory_query` action; do not attempt one.\n"
-           "\n")
-        + (_NATIVE_TOOL_SECTION if native_tools else _JSON_TOOL_SECTION) +
-        "## Skill actions\n"
-        '- `{"action": "use_skill", "skill": "<name>"}` — load a skill\'s steps + tools.\n'
-        '  Example: `{"action": "use_skill", "skill": "codebase-investigation"}`\n'
-        '- `{"action": "find_skills", "need": "<capability>"}` — discover authored procedures.\n'
-        '  Example: `{"action": "find_skills", "need": "investigate a Python codebase"}`\n'
-        "\n"
-        "## Answer / delegation\n"
-        '- `{"action": "final_answer", "answer": "<text>", "type": "text"}` — emit the answer.\n'
-        '  Example: `{"action": "final_answer", "answer": "Q4 2024 revenue was $4.2B (verified via PDF p.5).", "type": "text"}`\n'
-        f"{yield_line}"
-        "\n"
-        "## Resolution actions (ADR-0048 residual)\n"
-        "- `{\"action\": \"resolve_cid\", \"cid\": \"<cid>\", \"as\": \"offload\"|\"inline\"}` — fetch a previously-offloaded body for the next step.\n"
-        "  - `as: \"offload\"` (default): body is re-offloaded and a NEW cid is returned; the body is NOT in your context, but the next tool_call can use the new cid. Use this for chained operations: resolve_cid → tool_call.\n"
-        "  - `as: \"inline\"`: body is inlined so you can read it. Use ONLY when you need to reason about the body (quote, summarize, answer a question). Per-run cap: 3 inline resolves.\n"
-        "  Default: prefer passing the cid as `{\"$cid\": \"<cid>\"}` to a tool_call (the kernel resolves it). resolve_cid is the escape hatch.\n"
-        '  Example: `{"action": "resolve_cid", "cid": "2e0093...", "as": "offload"}`\n'
-        "\n"
-        "## Rules\n"
-        "- Ground first: issue at least one memory_query before answering, unless the "
-        "task is trivial.\n"
-        "- Do trivial math / multi-step reasoning yourself in final_answer; don't "
-        "tool_call each step.\n"
-        "- Stale-failure rule: a recalled PAST tool failure ('unavailable', timed out, "
-        "'not found') is history under conditions that may no longer hold — NOT proof it "
-        "fails now. Attempt it; judge by the CURRENT result.\n"
-        "- Capability-gap rule: **Tools** is a task-relevant SUBSET, not everything you "
-        "can use. Missing a capability means find_tools (and find_skills for a "
-        "procedure) — never conclude a task is impossible or a tool 'missing' before "
-        "trying find_tools.\n"
-        "\n"
-        + ("## Tools\n  (attached directly to this request - call them)\n"
-           if native_tools else
-           "## Tools (tool_call may name only these)\n" + tools_block + "\n")
-        + "\n"
-        + "## Skills (use_skill may name only these)\n"
-        + skills_block
-    )
+        _ap("memory") if allow_memory else _ap("memory-none"),
+        _ap(f"tools-{variant}"),
+        _ap("skills-native") if native_skills else _ap("skills-text"),
+        answer,
+        # ADR-0048 residual.
+        _ap(f"resolution-{variant}"),
+        _ap(f"rules-{variant}"),
+        _ap("toollist-native") if native_tools else _ap("toollist-text", tools=tools_block),
+        (_ap("skillmenu-native", skills=skills_block) if native_skills
+         else _ap("skillmenu-text", skills=skills_block)),
+    ]
+    return "\n\n".join(blocks)
 
 
 def _looks_like_truncated_action(text: str) -> bool:
@@ -263,12 +246,13 @@ def _looks_like_truncated_action(text: str) -> bool:
 
 # Sent back when the model produces something that is not an action. Names both
 # legitimate continuations so the model does not read it as "you must call a tool".
-INFERRED_FINAL_ANSWER_NOTE = (
-    "<note>That response was not a valid action, so nothing was executed. If the task "
-    "still needs work, emit the next action. If the task is genuinely complete, emit "
-    '{"action": "final_answer", "answer": "..."} explicitly. Do not describe what you '
-    "are about to do — either do it, or declare the answer.</note>"
-)
+def _nudge(section: str, **values) -> str:
+    """A mid-run loop note (prompts/react-nudges/v1.md). Notes are volatile: they go
+    into the message stream, never into the system blocks (ADR-0139 D2)."""
+    return fragment("react-nudges", section).render(values)
+
+
+INFERRED_FINAL_ANSWER_NOTE = _nudge("inferred-answer")
 
 
 # OpenAI (and every gateway that mirrors it) constrains a function name to
@@ -386,8 +370,18 @@ class _ConversationMirror:
 
         return wrapped
 
+    def add_skill(self, name: str, body: str, note: str = "") -> None:
+        """A skill loaded by a TEXT envelope while native tools are active (no tool turn
+        to answer): the conversation is the model's only history, so the full body
+        must land there as a turn, besides being pinned in working memory (ADR-0139)."""
+        self._wm.add_skill(name, body, note)
+        content = f"<skill name={name!r}>\n{body}\n</skill>"
+        if note:
+            content += f"\n<note>{note}</note>"
+        self._emit({"role": "user", "content": content})
+
     def add_step(self, kind: str, pinned: bool = False, **fields):
-        """Memory-query and precedent steps carry retrieved content the model must see;
+        """Memory-query steps carry retrieved content the model must see;
         tool_call steps are already represented by their tool turn."""
         result = self._wm.add_step(kind, pinned=pinned, **fields)
         if kind == "memory_query":
@@ -396,13 +390,6 @@ class _ConversationMirror:
                 "role": "user",
                 "content": ("<memory_query query=" + repr(fields.get("query")) + ">"
                             + chr(10) + rendered + chr(10) + "</memory_query>"),
-            })
-        elif kind == "recall_precedents":
-            rendered = _render_precedent_results(fields.get("results") or [])
-            self._emit({
-                "role": "user",
-                "content": ("<recall_precedents query=" + repr(fields.get("query")) + ">"
-                            + chr(10) + rendered + chr(10) + "</recall_precedents>"),
             })
         return result
 
@@ -446,6 +433,41 @@ _DISCOVERY_TOOL_DEFS = [
 # Names the loop handles itself rather than dispatching to the tool plane.
 _DISCOVERY_TOOL_NAMES = {d["name"] for d in _DISCOVERY_TOOL_DEFS}
 
+# ADR-0139 D3/D8: skill verbs as NATIVE tool definitions. The loop already
+# RECOGNISED a native use_skill call (_CONTROL_ACTION_NAMES) but never OFFERED one,
+# and the call's tool turn was then answered "call was not executed": the model
+# loaded a skill and was told nothing happened. Offered only when the agent has a
+# skill menu: a load tool with nothing to load is the same shape as offering
+# find_tools to an opted-out agent (see build_tool_definitions). The use_skill turn
+# is answered with the skill's FULL body (run_think, kind == "use_skill").
+_SKILL_TOOL_DEFS = [
+    {
+        "name": "use_skill",
+        "description": (
+            "Load a skill (an authored, step-by-step procedure) by name. Its full "
+            "instructions come back as the result and stay in force for the rest of "
+            "the run. Name only a skill from the skill menu in the prompt."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"skill": {"type": "string", "description": "skill name from the menu"}},
+            "required": ["skill"],
+        },
+    },
+    {
+        "name": "find_skills",
+        "description": (
+            "Find more skills (authored procedures) for a need the skill menu does not "
+            "cover. Describe the procedure you want, e.g. 'investigate a Python codebase'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"need": {"type": "string", "description": "procedure needed"}},
+            "required": ["need"],
+        },
+    },
+]
+
 # The loop's OWN vocabulary, as the model may emit it under native tool-calling.
 #
 # <ActionProtocol> advertises these as actions. A model given native tools
@@ -465,7 +487,6 @@ _DISCOVERY_TOOL_NAMES = {d["name"] for d in _DISCOVERY_TOOL_DEFS}
 _CONTROL_ACTION_NAMES = _DISCOVERY_TOOL_NAMES | {
     "final_answer",
     "memory_query",
-    "recall_precedents",
     "describe_tool",
     "use_skill",
     "find_skills",
@@ -474,7 +495,8 @@ _CONTROL_ACTION_NAMES = _DISCOVERY_TOOL_NAMES | {
 }
 
 
-def build_tool_definitions(agent, system_tools, include_discovery: bool = True) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+def build_tool_definitions(agent, system_tools, include_discovery: bool = True,
+                           include_skills: bool = False) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """Render the agent's tool menu as native tool definitions (ADR-0097 Phase B).
 
     Returns ``(definitions, name_map)`` where ``name_map`` is sanitized→original. The
@@ -496,16 +518,20 @@ def build_tool_definitions(agent, system_tools, include_discovery: bool = True) 
     than merely untidy: the model calls it, the loop will not execute it, and the next
     request carries an assistant turn with ``tool_calls`` and no tool turn answering
     them — which every OpenAI-compatible provider rejects with a 400.
+
+    ``include_skills=True`` adds ``use_skill`` / ``find_skills`` (ADR-0139 D8); the
+    loop passes it when the agent has a non-empty skill menu.
     """
     defs: List[Dict[str, Any]] = []
     name_map: Dict[str, str] = {}
 
     # Added FIRST so they keep their plain names; a real tool that happens to share one
     # is disambiguated by sanitize_tool_name instead.
-    if include_discovery:
-        for d in _DISCOVERY_TOOL_DEFS:
-            name_map[d["name"]] = d["name"]
-            defs.append(dict(d))
+    control_defs = (list(_DISCOVERY_TOOL_DEFS) if include_discovery else []) + (
+        list(_SKILL_TOOL_DEFS) if include_skills else [])
+    for d in control_defs:
+        name_map[d["name"]] = d["name"]
+        defs.append(dict(d))
 
     def _add(name: str, description: str, params: Any) -> None:
         if not name:
@@ -687,6 +713,7 @@ def run_think(
     reflect_enabled: bool = True,
     max_reflections: int = _DEFAULT_MAX_REFLECTIONS,
     max_inline_resolves: int = _DEFAULT_MAX_INLINE_RESOLVES,
+    cache_ttl: Optional[str] = None,
 ) -> AgentResult:
     """Drive the reason/retrieve/act loop for one task and return the final result.
 
@@ -697,6 +724,11 @@ def run_think(
 
     ``result_type`` forces the final ``AgentResult.type`` (e.g. ``code`` → executor),
     overriding whatever ``type`` the LLM puts on its ``final_answer``.
+
+    ``cache_ttl`` is the lifetime of the system prompt's cache breakpoint
+    (``"short"`` | ``"long"``). ``None`` resolves to the agent's ``cache_ttl``
+    attribute, then ``CAMBRIAN_AGENT_CACHE_TTL``, then ``"short"``: an agent run is
+    machine-paced (ADR-0139 D1).
     """
     from . import assemble_context
 
@@ -723,12 +755,18 @@ def run_think(
     find_skills_calls = 0  # ADR-0046: cap the find_skills discovery pull
     skill_loads = 0  # ADR-0046: cap use_skill loads
     loaded_skills = set()  # ADR-0046: skills already loaded this run (idempotent)
+    # ADR-0046 D6: tools a loaded skill conferred this run. Kept apart from
+    # system_tools because a native->text latch RE-LISTS system_tools from the kernel,
+    # whose ListTools serves standing grants only; without this they would silently
+    # drop out of the menu again after the latch.
+    skill_tools: List[Dict] = []
     mem_exhausted = False
     tool_exhausted = False
     veto_counts: Dict[str, int] = {}  # ADR-0041 D4: per-action hard-veto tally
     success_dedup_counts: Dict[str, int] = {}  # ADR-0041 D4: per-action already-succeeded tally
     truncation_retries = 0  # #2: consecutive token-limit truncations re-prompted
     inferred_answer_retries = 0  # non-action responses re-prompted (see note above)
+    unknown_action_retries = 0  # unrecognised action kinds re-prompted (_MAX_UNKNOWN_ACTION_RETRIES)
     reflections: List[str] = []  # ADR-0052: verbal reflections extracted on hard-veto
     inline_resolves: int = 0   # ADR-0048 residual: budget for resolve_cid as="inline"
 
@@ -831,8 +869,11 @@ def run_think(
     # call tells us anyway.
     native_tools = True
     # find_tools follows the same opt-out as the system menu it exists to reach.
+    # ADR-0139 D8: skill verbs are native tools whenever there is a skill menu.
     tool_defs, tool_name_map = build_tool_definitions(
-        agent, system_tools, include_discovery=find_tools_enabled)
+        agent, system_tools, include_discovery=find_tools_enabled,
+        include_skills=bool(system_skills))
+    skill_chars = 0  # ADR-0139 D3: total chars of skill bodies pinned this run
     # ADR-0097 D8: under native tool-calling the model's history is THIS list, not a
     # re-rendered prompt. It is seeded once with the composed prompt and thereafter
     # grows by real turns — assistant turns carrying tool_calls, tool turns carrying
@@ -855,6 +896,35 @@ def run_think(
     # satisfies the invariant and tells the model why its other call did not run.
     pending_extra_call_ids: List[str] = []
 
+    def _answer_native_turn(content: str) -> bool:
+        """Answer the pending native tool call with ``content`` (ADR-0139 D8).
+
+        A control verb that arrived as a NATIVE call (use_skill, find_skills) must get
+        its result in the tool turn the provider correlates with the call. Otherwise
+        the next round closes it with "call was not executed", which tells the model
+        its skill load did nothing. Returns False on the text path (nothing pending).
+        """
+        nonlocal pending_tool_call_id, pending_extra_call_ids
+        if not (conversation and pending_tool_call_id):
+            return False
+        conversation.append({"role": "tool", "tool_call_id": pending_tool_call_id,
+                             "content": content})
+        pending_tool_call_id = ""
+        pending_extra_call_ids = _answer_unexecuted(conversation, pending_extra_call_ids)
+        if isinstance(wm, _ConversationMirror):
+            wm.release()
+        return True
+
+    def _control_reply(text: str) -> None:
+        """Report a control verb's outcome: as the native tool result when the verb
+        arrived as a native call, else as a working-memory note. On the native path
+        the note goes to the UNDERLYING memory only, so the mirror does not repeat the
+        tool result to the model as a second, prose user turn."""
+        if _answer_native_turn(text):
+            (wm._wm if isinstance(wm, _ConversationMirror) else wm).add_text(text)
+        else:
+            wm.add_text(text)
+
     # The menu follows the BUDGET, so it never advertises what the loop refuses.
     allow_memory = max_memory_queries > 0
     action_protocol = _compose_action_protocol(agent, output_schema, system_tools, system_skills,
@@ -874,14 +944,35 @@ def run_think(
     # determined, which stays silent rather than asserting a guessed path.
     host_constraint = host_block()
 
+    # ADR-0139 D1/D2: the prompt is sent as a cached system tier plus messages. The
+    # cache lifetime follows caller pacing: an agent run is machine-paced, so SHORT
+    # by default; an agent serving a human-paced session may set `cache_ttl = "long"`
+    # (class attribute), or a deployment CAMBRIAN_AGENT_CACHE_TTL.
+    run_cache_ttl = _resolve_cache_ttl(agent, cache_ttl)
+    # Latched per run, like native_tools:
+    #   structured_text - the text path may use the structured call. Off after the
+    #     kernel refused it (InvalidRequest) or reported "system" as ignored: the
+    #     rest of the run sends the legacy single prompt.
+    #   fold_system - the native path folds the system text into the first user turn
+    #     because the kernel (or model) dropped the `system` field.
+    structured_text = True
+    fold_system = False
+    native_system_kw = None  # None = unknown; resolved on the first native call
+    native_system: List[Dict[str, Any]] = []
+    _log_prompt_versions(agent)
+
     round_no = 0
     while True:
         extra = list(constraints or [])
         if host_constraint:
             extra.append(host_constraint)
-        if mem_exhausted:
-            extra.append("Memory budget is exhausted — answer best-effort from what you have.")
-        prompt = build_prompt(
+        # Volatile notices go into the message stream, never the system tier: the
+        # system text must be byte-identical across the turns of a run (D2).
+        notes = [_nudge("memory-exhausted")] if mem_exhausted else []
+        # ADR-0139 Phase 0: the prompt speaks ONE protocol (the same condition that
+        # composed action_protocol) and states the budgets this loop enforces.
+        native_prompt = bool(native_tools and tool_defs)
+        parts = build_prompt_parts(
             role=role,
             task=task.text,
             # #3 trajectory reframe: number the bounded buffer as an ordered loop
@@ -890,11 +981,20 @@ def run_think(
             context_str=wm.assemble(intent_vec, numbered=True),
             step_no=round_no + 1,
             # ADR-0048 D8: the action menu + behavioral rules go in <ActionProtocol>;
-            # <OutputSchema> keeps only the per-turn action contract, so the recency-
-            # anchored last line steers toward "emit one action", not a final-answer body.
+            # <OutputSchema> keeps only the per-turn action contract.
             action_protocol=action_protocol,  # #4: composed once above (loop-invariant)
-            output_schema=_PER_TURN_OUTPUT_CONTRACT,
+            output_schema=(_PER_TURN_OUTPUT_CONTRACT_NATIVE if native_prompt
+                           else _PER_TURN_OUTPUT_CONTRACT),
             constraints=extra or None,
+            base_constraints=default_constraints(
+                native_tools=native_prompt, max_memory_queries=max_memory_queries,
+                max_tool_rounds=max_tool_rounds),
+            base_anti_patterns=default_anti_patterns(
+                native_tools=native_prompt,
+                large_write_tool=(_LARGE_WRITE_TOOL
+                                  if _menu_has_tool(agent, system_tools, _LARGE_WRITE_TOOL)
+                                  else None)),
+            notes=notes,
         )
         # No client-side timeout on the agent's LLM call: passing the inbound RPC's
         # remaining budget here makes the managed-generate gRPC deadline strangle a
@@ -942,28 +1042,61 @@ def run_think(
             pending_extra_call_ids = []
             if seed_system_tools:
                 system_tools = _list_system_tools(agent, query=_seed_tool_query, full=False)
+            system_tools = _merge_tools(system_tools, skill_tools)
             action_protocol = _compose_action_protocol(
                 agent, output_schema, system_tools, system_skills,
                 allow_yield_subgoal=allow_yield_subgoal, native_tools=False,
                 allow_memory=allow_memory)
             continue
         if native_fn is not None and tool_defs:
+            if native_system_kw is None:
+                # A custom substrate written before C1 cannot take `system=`; it gets
+                # the system text inside the first user turn, as before (ADR-0139).
+                native_system_kw = _accepts_kwarg(native_fn, "system")
+                if not native_system_kw:
+                    fold_system = True
             if not conversation:
-                # Seed once. The prompt carries role, task and the action menu; from
-                # here the conversation carries what happened, so the prompt is never
-                # rebuilt — re-narrating the model's own actions back at it as prose is
-                # what made it summarise its history instead of continuing it.
-                conversation.append({"role": "user", "content": prompt})
+                # Seed once. The system blocks carry role, rules and the action menu;
+                # the first user turn carries the task and the seeded trajectory. From
+                # here the conversation carries what happened, so neither is rebuilt —
+                # re-narrating the model's own actions back at it as prose is what made
+                # it summarise its history instead of continuing it.
+                native_system = list(parts.system)
+                first = parts.messages[0]["content"]
+                conversation.append({"role": "user", "content": (
+                    parts.legacy_prompt() if fold_system else first)})
                 wm = _ConversationMirror(wm, conversation)
+            kw: Dict[str, Any] = {}
+            if native_system_kw and not fold_system:
+                kw = {"system": native_system, "cache_ttl": run_cache_ttl}
+            _log_llm_call("native", round_no + 1, native_system if not fold_system else [],
+                          len(conversation))
             try:
-                n_text, n_calls, n_stop = native_fn(
+                n_res = native_fn(
                     task.session_token_id,
                     conversation,
                     tool_defs,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     timeout_ms=0,
+                    **kw,
                 )
+                n_text, n_calls, n_stop = n_res
+                n_ignored = list(getattr(n_res, "ignored", None) or [])
+                if "system" in n_ignored and not fold_system:
+                    # The kernel (an older build) or the allocated model dropped the
+                    # system blocks: the model saw no role, rules or menu. Discard the
+                    # turn and resend with the system text folded into the first user
+                    # turn, for the rest of the run.
+                    fold_system = True
+                    logger.warning("react_system_ignored_folding", extra={
+                        "path": "native", "legacy_kernel": bool(getattr(n_res, "legacy_kernel", False))})
+                    if conversation and conversation[0].get("role") == "user":
+                        conversation[0] = {"role": "user", "content": "\n\n".join(
+                            p for p in ("\n\n".join(b["text"] for b in native_system),
+                                        conversation[0].get("content") or "") if p)}
+                    continue
+                _log_llm_result("native", n_res)
                 # Echo the assistant turn back VERBATIM, tool_calls included. This is
                 # what lets the model see that the call was its own.
                 assistant_turn: Dict[str, Any] = {"role": "assistant", "content": n_text or ""}
@@ -999,6 +1132,7 @@ def run_think(
                 # every prompt with detail the menu never renders.
                 if seed_system_tools:
                     system_tools = _list_system_tools(agent, query=_seed_tool_query, full=False)
+                system_tools = _merge_tools(system_tools, skill_tools)
                 # The action menu is composed ONCE before the loop and currently says
                 # "your tools are attached to this request". That is now false, so
                 # recompose and retake the turn — one extra call, only in the rare
@@ -1011,13 +1145,9 @@ def run_think(
                 continue
 
         if action is None:
-            raw = agent.substrate.generate(
-                task.session_token_id,
-                prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                timeout_ms=0,
-            )
+            raw, structured_text = _generate_text_turn(
+                agent, task, parts, structured=structured_text, cache_ttl=run_cache_ttl,
+                max_tokens=max_tokens, temperature=temperature, round_no=round_no + 1)
             action = parse_action(raw)
         kind = action.get("action")
 
@@ -1049,13 +1179,14 @@ def run_think(
                     type="error",
                 )
             logger.info("react_truncated_action", extra={"round": round_no, "retry": truncation_retries})
-            wm.add_text(
-                "<note>Your last action was TRUNCATED at the output-token limit before it "
-                "finished — it was NOT executed. Do NOT emit a large payload in one action. "
-                "To write a large file, call fast_large_write_file in SECTIONS: the first "
-                "call with append=false (create/overwrite), then append=true for each "
-                "subsequent section. Otherwise emit a smaller action.</note>"
-            )
+            # ADR-0139 Phase 0: name the sectioned-write tool only when it is in this
+            # agent's menu. Recommending a tool the model cannot call sends it hunting
+            # for one it will never find, on the turn it most needs a usable plan.
+            if _menu_has_tool(agent, system_tools, _LARGE_WRITE_TOOL):
+                how = _nudge("truncated-how-tool", tool=_LARGE_WRITE_TOOL)
+            else:
+                how = _nudge("truncated-how-none")
+            wm.add_text(_nudge("truncated", how=how))
             continue
 
         if kind == "memory_query":
@@ -1068,7 +1199,7 @@ def run_think(
                     logger.warning("react_memory_budget_exceeded", extra={"round": round_no})
                     return AgentResult.from_text(_best_effort(wm), type=result_type or "text")
                 mem_exhausted = True
-                wm.add_text("<note>memory query budget exhausted; answer best-effort</note>")
+                wm.add_text(_nudge("memory-budget"))
                 continue
             mem_queries += 1
             results = _safe_recall(agent, query, task.session_token_id)
@@ -1079,38 +1210,6 @@ def run_think(
             # v2: emit as a typed Step so the query is visible in the trajectory.
             wm.add_step(
                 kind="memory_query",
-                query=query,
-                status="ok" if results else "empty",
-                results=results,
-            )
-            continue
-
-        if kind == "recall_precedents":
-            # ADR-0049 D11/Issue 014: the world-model PULL lane. A different QUESTION
-            # from memory_query ("what happened last time in a situation like this?"
-            # vs "what do I know?"), but the same RETRIEVAL budget — a precedent round
-            # is still a round spent retrieving instead of acting, and giving it its
-            # own budget would let an LLM that only ever retrieves evade the cap by
-            # alternating between the two lanes.
-            query = action.get("query", "")
-            if mem_queries >= max_memory_queries:
-                if mem_exhausted:
-                    logger.warning("react_memory_budget_exceeded", extra={"round": round_no})
-                    return AgentResult.from_text(_best_effort(wm), type=result_type or "text")
-                mem_exhausted = True
-                wm.add_text("<note>memory query budget exhausted; answer best-effort</note>")
-                continue
-            mem_queries += 1
-            results = _safe_recall_precedents(agent, query, task.session_token_id)
-            logger.info(
-                "react_recall_precedents",
-                extra={"round": round_no, "query": query, "results_count": len(results)},
-            )
-            # Empty is a REAL answer here ("no precedent"), not a failed retrieval — the
-            # renderer says so explicitly rather than leaving a blank the model reads as
-            # a licence to invent an analogy.
-            wm.add_step(
-                kind="recall_precedents",
                 query=query,
                 status="ok" if results else "empty",
                 results=results,
@@ -1159,17 +1258,11 @@ def run_think(
                             wm.add_reflection(lesson)
                             logger.info("react_reflection",
                                         extra={"round": round_no, "tool": name, "lesson": lesson[:200]})
-                    wm.add_text(
-                        f"<note>VETOED: {name!r} already failed {failed_dups} times with similar "
-                        f"arguments. Do NOT retry it — change your approach or give a final answer.</note>"
-                    )
+                    wm.add_text(_nudge("vetoed", tool=repr(name), count=failed_dups))
                     continue
                 if failed_dups == 1:
                     # Soft nudge (→ ReBind): warn, but allow this one retry (transient failures recover).
-                    wm.add_text(
-                        f"<note>{name!r} already failed once. Retrying once more — if it fails "
-                        f"again, change your approach.</note>"
-                    )
+                    wm.add_text(_nudge("retry-once", tool=repr(name)))
                 elif count_successful_duplicates(name, args, avec, wm.cards, recurrence_threshold) >= 1:
                     # ADR-0041 D4 (symmetric guard): this exact action ALREADY
                     # SUCCEEDED this run. Re-running it is an idempotent no-op spin
@@ -1189,11 +1282,7 @@ def run_think(
                                     extra={"round": round_no, "tool": name})
                         return AgentResult.from_text(_best_effort(wm), type=result_type or "text")
                     logger.info("react_success_dedup", extra={"round": round_no, "tool": name})
-                    wm.add_text(
-                        f"<note>ALREADY DONE: {name!r} already completed successfully this run "
-                        f"with these arguments — its result is above. Do NOT repeat it; continue "
-                        f"to the next step, or if the task is now complete, emit final_answer.</note>"
-                    )
+                    wm.add_text(_nudge("already-done", tool=repr(name)))
                     continue
 
             tool_rounds += 1
@@ -1219,12 +1308,7 @@ def run_think(
                 tool_exhausted = True
                 logger.info("react_tool_budget_exhausted",
                             extra={"round": round_no, "budget": max_tool_rounds})
-                wm.add_text(
-                    f"<note>TOOL BUDGET EXHAUSTED after {max_tool_rounds} calls. No further "
-                    "tool call will run. Answer NOW, in your required output format, using "
-                    "what you have already gathered. If what you have is not enough to "
-                    "conclude, say so in that format rather than searching again.</note>"
-                )
+                wm.add_text(_nudge("tool-budget", max_tool_rounds=max_tool_rounds))
                 continue
             # Local @tool → run in-process. Otherwise it is a kernel-owned system
             # tool (ADR-0039): the agent marshalled the args here; the kernel
@@ -1302,26 +1386,28 @@ def run_think(
             continue
 
         if kind == "find_tools":
+            # Replies go through _control_reply so a NATIVE find_tools call is
+            # answered in its own tool turn, not "call was not executed" (ADR-0139 D8).
             # An agent that opted out of DISCOVERY must not be able to pull tools
             # back in through it. Keyed on find_tools_enabled rather than on the
             # seeded menu: an agent may legitimately want no preloaded menu and
             # still want to ask for a capability by name.
             if not find_tools_enabled:
-                wm.add_text("<note>Tools are not available to you. Either answer from what you "
-                            "have, or use delegate_to_planner to hand the task to the planner.</note>")
+                _control_reply("<note>Tools are not available to you. Either answer from what you "
+                               "have, or use delegate_to_planner to hand the task to the planner.</note>")
                 continue
             # ADR-0044 pull: the agent describes a capability need; the kernel
             # returns the matching tools, which we merge into the menu so the next
             # turn can tool_call one. The analogue of memory_query, for tools.
             need = (action.get("need") or action.get("query") or "").strip()
             if not need:
-                wm.add_text("<note>find_tools needs a non-empty capability 'need' "
-                            "(verb-first, e.g. 'search the web for a person').</note>")
+                _control_reply("<note>find_tools needs a non-empty capability 'need' "
+                               "(verb-first, e.g. 'search the web for a person').</note>")
                 continue
             find_tools_calls += 1
             if find_tools_calls > 3:
-                wm.add_text("<note>tool-discovery budget exhausted; use a tool already "
-                            "in your menu, or answer/yield.</note>")
+                _control_reply("<note>tool-discovery budget exhausted; use a tool already "
+                               "in your menu, or answer/yield.</note>")
                 continue
             found = _list_system_tools(agent, query=need, full=native_tools)
             seen = {t.get("name") for t in system_tools}
@@ -1333,31 +1419,36 @@ def run_think(
             # sanitized→original map together; they must stay in step or a discovered
             # tool dispatches to a name the registry has never heard of.
             if native_tools:
-                tool_defs, tool_name_map = build_tool_definitions(agent, system_tools)
+                tool_defs, tool_name_map = build_tool_definitions(
+                    agent, system_tools, include_skills=bool(system_skills))
             logger.info("react_find_tools", extra={"round": round_no, "need": need,
                                                    "added": [t.get("name") for t in added],
                                                    "offered": len(tool_defs)})
             if added:
-                wm.add_text("<note>Found tools for {!r}: {}. Call one with tool_call.</note>".format(
-                    need, ", ".join(t.get("name") for t in added)))
+                # One protocol per prompt (ADR-0139): natively the tool is just called.
+                _control_reply("<note>Found tools for {!r}: {}. {}</note>".format(
+                    need, ", ".join(t.get("name") for t in added),
+                    "Call one." if native_tools else "Call one with tool_call."))
             else:
-                wm.add_text(f"<note>No tool matched {need!r}. Proceed without it — "
-                            "answer from what you have, or yield_subgoal.</note>")
+                _control_reply(f"<note>No tool matched {need!r}. Proceed without it — "
+                               "answer from what you have, or yield_subgoal.</note>")
             continue
 
         if kind == "find_skills":
             # ADR-0046 pull: discover authored procedures (skills) for a need not in
             # the menu. The analogue of find_tools, for skills. Returns Tier-1 short
             # forms, merged into the menu; then the agent loads one with use_skill.
+            # Replies go through _control_reply so a NATIVE find_skills call is
+            # answered in its own tool turn (ADR-0139 D8).
             need = (action.get("need") or action.get("query") or "").strip()
             if not need:
-                wm.add_text("<note>find_skills needs a non-empty 'need' describing the "
-                            "procedure/capability you want.</note>")
+                _control_reply("<note>find_skills needs a non-empty 'need' describing the "
+                               "procedure/capability you want.</note>")
                 continue
             find_skills_calls += 1
             if find_skills_calls > 3:
-                wm.add_text("<note>skill-discovery budget exhausted; use a listed skill, "
-                            "or proceed/answer.</note>")
+                _control_reply("<note>skill-discovery budget exhausted; use a listed skill, "
+                               "or proceed/answer.</note>")
                 continue
             found = _list_system_skills(agent, query=need)
             seen = {sk.get("name") for sk in system_skills}
@@ -1366,10 +1457,11 @@ def run_think(
             logger.info("react_find_skills", extra={"round": round_no, "need": need,
                                                     "added": [sk.get("name") for sk in added]})
             if added:
-                wm.add_text("<note>Found skills for {!r}: {}. Load one with use_skill.</note>".format(
-                    need, ", ".join(sk.get("name") for sk in added)))
+                _control_reply("<note>Found skills for {!r}: {}. Load one with use_skill.</note>".format(
+                    need, "; ".join("{} ({})".format(sk.get("name"), (sk.get("description") or "").strip())
+                                    for sk in added)))
             else:
-                wm.add_text(f"<note>No skill matched {need!r}. Proceed without it.</note>")
+                _control_reply(f"<note>No skill matched {need!r}. Proceed without it.</note>")
             continue
 
         if kind == "use_skill":
@@ -1378,31 +1470,82 @@ def run_think(
             # An agent-local skill loads purely locally (its grants are already within
             # the agent's envelope); a system skill is fetched Tier-2 and the kernel
             # confers + activates its grants run-scoped during the fetch.
+            #
+            # ADR-0139 D3 (Phase 0): the body is PINNED in full via wm.add_skill, not
+            # put through add_text, whose R7 offloader cut any body over 1000 chars to
+            # a 240-char head and whose entries the 10-entry cap later evicted. The
+            # bound is the run's skill budget instead: the load cap (5) plus a total
+            # body budget; an overflow is refused with a note, never truncated.
+            # Every reply goes through _control_reply, so a NATIVE use_skill call is
+            # answered in its own tool turn with the full body (ADR-0139 D8).
             name = (action.get("skill") or action.get("name") or "").strip()
             if not name:
-                wm.add_text("<note>use_skill needs a 'skill' name from the [skills] list.</note>")
+                _control_reply("<note>use_skill needs a 'skill' name from the skill menu.</note>")
                 continue
             if name in loaded_skills:
-                wm.add_text(f"<note>Skill {name!r} is already loaded — follow its instructions.</note>")
+                _control_reply(f"<note>Skill {name!r} is already loaded — follow its instructions.</note>")
                 continue
             skill_loads += 1
             if skill_loads > _DEFAULT_MAX_SKILL_LOADS:
-                wm.add_text("<note>skill-load budget exhausted; act on a loaded skill or answer.</note>")
+                _control_reply(f"<note>skill-load budget exhausted ({_DEFAULT_MAX_SKILL_LOADS} loads "
+                               "per run); act on a loaded skill or answer.</note>")
                 continue
             sk = _load_skill(agent, name, task.session_token_id)
             logger.info("react_use_skill", extra={"round": round_no, "skill": name,
                                                   "loaded": sk is not None})
-            if sk:
-                loaded_skills.add(name)
-                grants = sk.get("tool_grants") or []
-                grant_note = (" Its tools ({}) are available for this task.".format(", ".join(grants))
-                              if grants else "")
-                wm.add_text(
-                    "<skill name={!r}>\n{}\n</skill>\n".format(name, (sk.get("instructions") or "").strip())
-                    + f"<note>Loaded skill {name!r}; follow its instructions.{grant_note}</note>")
+            if not sk:
+                _control_reply(f"<note>Skill {name!r} is not available to you. "
+                               "Use a listed skill, or proceed.</note>")
+                continue
+            body = (sk.get("instructions") or "").strip()
+            if skill_chars + len(body) > _DEFAULT_MAX_SKILL_CHARS:
+                # Refuse whole, never truncate: a partial procedure is a different one.
+                logger.info("react_use_skill_over_budget",
+                            extra={"round": round_no, "skill": name, "chars": len(body),
+                                   "used": skill_chars, "budget": _DEFAULT_MAX_SKILL_CHARS})
+                _control_reply(
+                    f"<note>Skill {name!r} was NOT loaded: its instructions ({len(body)} chars) "
+                    f"do not fit the remaining skill budget ({_DEFAULT_MAX_SKILL_CHARS - skill_chars} "
+                    f"of {_DEFAULT_MAX_SKILL_CHARS} chars left). Continue with the skills already "
+                    "loaded, or proceed without it.</note>")
+                continue
+            skill_chars += len(body)
+            loaded_skills.add(name)
+            grants = sk.get("tool_grants") or []
+            # ADR-0046 D6: the load conferred these grants (kernel-side, run-scoped), so
+            # they must also become CALLABLE: added to the native tool definitions and
+            # to the prose menu, or the note below promises tools the model cannot name.
+            # Append-only, so the cached prefix of tool_defs is unchanged.
+            new_tools = _skill_granted_tools(
+                agent, name, grants, system_tools, full=native_tools,
+                kernel_confirmed=not sk.get("_local"),
+                session_token_id=task.session_token_id)
+            if new_tools:
+                skill_tools = skill_tools + new_tools
+                system_tools = _merge_tools(system_tools, new_tools)
+                if native_tools:
+                    tool_defs, tool_name_map = build_tool_definitions(
+                        agent, system_tools, include_discovery=find_tools_enabled,
+                        include_skills=bool(system_skills))
+                else:
+                    action_protocol = _compose_action_protocol(
+                        agent, output_schema, system_tools, system_skills,
+                        allow_yield_subgoal=allow_yield_subgoal,
+                        native_tools=False, allow_memory=allow_memory)
+                logger.info("react_skill_tools_added",
+                            extra={"round": round_no, "skill": name,
+                                   "added": [t.get("name") for t in new_tools]})
+            grant_note = (" Its tools ({}) are available for this task.".format(", ".join(grants))
+                          if grants else "")
+            note = f"Loaded skill {name!r}; follow its instructions for the rest of this task.{grant_note}"
+            if _answer_native_turn(
+                    "<skill name={!r}>\n{}\n</skill>\n<note>{}</note>".format(name, body, note)):
+                # Native: the tool turn carries the body and the conversation keeps it
+                # for the run. Pin it in the underlying memory too, so a later latch to
+                # the text path still renders it.
+                (wm._wm if isinstance(wm, _ConversationMirror) else wm).add_skill(name, body, note)
             else:
-                wm.add_text(f"<note>Skill {name!r} is not available to you. "
-                            "Use a listed skill, or proceed.</note>")
+                wm.add_skill(name, body, note)
             continue
 
         if kind == "describe_tool":
@@ -1573,6 +1716,20 @@ def run_think(
         # RetryWithErrorOutputParser) rather than accepting it as an answer. This is
         # that contract, bounded: re-prompt once, then accept so the loop still always
         # terminates. The real fix is native tool-calling, which removes the guess.
+        # Every handled action kind `continue`d above; only final_answer (declared or
+        # inferred) may reach the answer tail. Anything else is an unknown verb.
+        if kind != "final_answer" and not action.get("_inferred"):
+            if unknown_action_retries < _MAX_UNKNOWN_ACTION_RETRIES:
+                unknown_action_retries += 1
+                logger.info("react_unknown_action_reprompt",
+                            extra={"round": round_no, "action_kind": str(kind)[:80],
+                                   "retry": unknown_action_retries})
+                wm.add_text(_nudge("unknown-action", action=repr(kind)))
+                continue
+            raise ReActLoopError(
+                f"model kept emitting an unknown action {kind!r} "
+                f"({_MAX_UNKNOWN_ACTION_RETRIES} re-prompts)")
+
         if action.get("_inferred") and inferred_answer_retries < _MAX_INFERRED_ANSWER_RETRIES:
             inferred_answer_retries += 1
             logger.info(
@@ -1606,15 +1763,39 @@ def run_think(
 # final_answer body format lives in <ActionProtocol> (the final_answer action's
 # description), present but no longer the closing instruction that biased premature
 # termination.
-_PER_TURN_OUTPUT_CONTRACT = (
-    "Output EXACTLY ONE JSON object this turn — a single action chosen from "
-    "<ActionProtocol>:\n"
-    '  {"action": "<name>", ...}\n'
-    "Pick the action that makes progress. Do NOT emit final_answer until you have "
-    "gathered the evidence it requires (query memory, discover/call tools); when you "
-    "do, its \"answer\" field must follow the format given for the final_answer "
-    "action in <ActionProtocol>."
-)
+_PER_TURN_OUTPUT_CONTRACT = fragment("react-turn", "contract-text").render()
+# The last sentence above: T-20261104-agent-final-answers-leak-loop-narration-perfect
+# (E2E E5: a final answer opened with "Perfect! I now have all the information...",
+# breaking a first-line format rule). ADR-0139 D3's native final_answer tool removes
+# the failure by construction; this is the interim prompt fix.
+
+# ADR-0139 Phase 0: the native-tool-calling variant. The text contract above says
+# "Output EXACTLY ONE JSON object", which under native tool-calling contradicts the
+# attached tool schemas and _NATIVE_TOOL_SECTION ("there is no such action"): two
+# ways to act, and the model takes the one that does nothing (react.py, the
+# _JSON_TOOL_SECTION comment: 3/6 against 5/6). One protocol per prompt.
+_PER_TURN_OUTPUT_CONTRACT_NATIVE = fragment("react-turn", "contract-native").render()
+# The last sentence above: T-20261104-agent-final-answers-leak-loop-narration-perfect
+# (E2E E5: a final answer opened with "Perfect! I now have all the information...",
+# breaking a first-line format rule). ADR-0139 D3's native final_answer tool removes
+# the failure by construction; this is the interim prompt fix.
+
+
+def _menu_has_tool(agent, system_tools: Optional[List[Dict]], name: str) -> bool:
+    """True when ``name`` is a tool this agent can call right now: one of its local
+    ``@tool`` functions, or a granted system tool in the current menu (matched on the
+    full name or its last path segment, since system tools are namespaced, e.g.
+    ``mcp:filesystem/fast_large_write_file``)."""
+    try:
+        if name in agent.tools:
+            return True
+    except Exception:  # noqa: BLE001 — a test double without a registry
+        pass
+    for t in system_tools or []:
+        full = t.get("name") or ""
+        if full == name or full.rsplit("/", 1)[-1] == name:
+            return True
+    return False
 
 
 def _compose_action_protocol(agent, domain_schema: str, system_tools: Optional[List[Dict]] = None,
@@ -1630,11 +1811,138 @@ def _compose_action_protocol(agent, domain_schema: str, system_tools: Optional[L
                                native_tools=native_tools,
                                allow_memory=allow_memory)
     if domain_schema and domain_schema.strip():
-        base += (
-            "\n\nWhen you emit final_answer, the \"answer\" field MUST follow this format:\n"
-            + domain_schema.strip()
-        )
+        base += "\n\n" + _ap("final-format", format=domain_schema.strip())
     return base
+
+
+# ── ADR-0139 C1 call plumbing for the ReAct loop (wave 1d) ───────────────────
+
+_CACHE_TTL_ENV = "CAMBRIAN_AGENT_CACHE_TTL"
+_DEFAULT_RUN_CACHE_TTL = "short"
+
+
+def _resolve_cache_ttl(agent, explicit: Optional[str]) -> str:
+    """run_think argument > agent ``cache_ttl`` attribute > env > ``"short"``.
+    An unrecognised value is logged and replaced by the default, never sent."""
+    from .llm import coerce_cache_ttl
+    from .errors import InvalidRequest
+    for value in (explicit, getattr(agent, "cache_ttl", None), os.getenv(_CACHE_TTL_ENV)):
+        if value is None or value == "":
+            continue
+        try:
+            return coerce_cache_ttl(value)
+        except InvalidRequest:
+            logger.warning("react_bad_cache_ttl", extra={"value": str(value)})
+    return _DEFAULT_RUN_CACHE_TTL
+
+
+_KWARG_CACHE: Dict[Any, bool] = {}
+
+
+def _accepts_kwarg(fn, name: str) -> bool:
+    """True when ``fn`` takes ``name`` as a keyword (explicitly or via ``**kw``).
+    Lets the loop keep serving a substrate written before the C1 keywords existed."""
+    import inspect
+    key = (getattr(fn, "__func__", fn), name)
+    if key in _KWARG_CACHE:
+        return _KWARG_CACHE[key]
+    try:
+        params = inspect.signature(fn).parameters.values()
+        ok = any(p.kind is p.VAR_KEYWORD or (p.name == name and p.kind in (
+            p.KEYWORD_ONLY, p.POSITIONAL_OR_KEYWORD)) for p in params)
+    except (TypeError, ValueError):
+        ok = False
+    _KWARG_CACHE[key] = ok
+    return ok
+
+
+def _log_prompt_versions(agent) -> None:
+    """Debug: which prompt-library versions this run's ReAct prompt is built from."""
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("react_prompt_versions", extra={
+            "agent_id": getattr(agent, "agent_id", ""), "prompts": prompt_versions()})
+
+
+def _log_llm_call(path: str, round_no: int, system: List[Dict[str, Any]], n_messages: int) -> None:
+    """Per-call request metadata, at INFO: it is the prompt-provenance record.
+    ``system_sha256`` is the hash of the system text sent; it must be the same on
+    every turn of a run (the cache depends on it). ``prompts`` names each
+    prompt-library id, version and static hash."""
+    if not logger.isEnabledFor(logging.INFO):
+        return
+    import hashlib
+    text = "\n\n".join(b.get("text", "") for b in system)
+    logger.info("react_llm_request", extra={
+        "path": path,
+        "round": round_no,
+        "system_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest() if system else "",
+        "system_chars": len(text),
+        "messages": n_messages,
+        "prompts": prompt_versions(),
+    })
+
+
+def _log_llm_result(path: str, res) -> None:
+    usage = getattr(res, "usage", None)
+    ignored = list(getattr(res, "ignored", None) or [])
+    if usage is None and not ignored:
+        return
+    logger.info("react_llm_usage", extra={
+        "path": path,
+        "model": getattr(res, "model", ""),
+        "ignored": ignored,
+        "input_tokens": getattr(usage, "input_tokens", 0),
+        "output_tokens": getattr(usage, "output_tokens", 0),
+        "cache_read_tokens": getattr(usage, "cache_read_tokens", 0),
+        "cache_write_tokens": getattr(usage, "cache_write_tokens", 0),
+        "cache_write_known": getattr(usage, "cache_write_known", False),
+        "estimated": getattr(usage, "estimated", False),
+    })
+
+
+def _generate_text_turn(agent, task, parts, *, structured: bool, cache_ttl: str,
+                        max_tokens, temperature, round_no: int) -> Tuple[str, bool]:
+    """One text-protocol turn. Returns ``(raw_text, structured_still_ok)``.
+
+    Preferred: the structured call (``substrate.generate_request``) with the cached
+    system tier and the volatile user turn. Degrades, latched for the run, to the
+    legacy single prompt when:
+      - the substrate has no ``generate_request`` (an older SDK object, a custom
+        transport, a test double): it gets ``generate(token, prompt)`` as before;
+      - the kernel refuses the structured shape (``InvalidRequest``);
+      - the kernel reports ``"system"`` as ignored (the model saw no system text).
+    A kernel that predates C1 needs no retry: the client also sends the flattened
+    prompt in the deprecated field, which such a kernel reads.
+    """
+    from .errors import InvalidRequest
+    sub = agent.substrate
+    req_fn = getattr(sub, "generate_request", None) if structured else None
+    if req_fn is not None:
+        _log_llm_call("text", round_no, parts.system, len(parts.messages))
+        try:
+            res = req_fn(task.session_token_id, system=parts.system, messages=parts.messages,
+                         cache_ttl=cache_ttl, max_tokens=max_tokens, temperature=temperature,
+                         timeout_ms=0)
+        except InvalidRequest as exc:
+            logger.warning("react_structured_refused_legacy_prompt", extra={"reason": str(exc)})
+            structured = False
+        else:
+            if "system" in (res.ignored or []):
+                logger.warning("react_system_ignored_legacy_prompt",
+                               extra={"path": "text", "model": res.model})
+                structured = False
+            else:
+                _log_llm_result("text", res)
+                return res.text, True
+    _log_llm_call("text-legacy", round_no, [], 1)
+    raw = sub.generate(
+        task.session_token_id,
+        parts.legacy_prompt(),
+        max_tokens=max_tokens,
+        temperature=temperature,
+        timeout_ms=0,
+    )
+    return raw, structured and req_fn is not None
 
 
 def _best_effort(wm: WorkingMemory) -> str:
@@ -1766,6 +2074,81 @@ def _describe_tool(agent, name: str) -> Optional[Dict]:
     return specs[0] if specs else None
 
 
+def _merge_tools(base: List[Dict], extra: List[Dict]) -> List[Dict]:
+    """``base`` followed by the entries of ``extra`` whose names it lacks. Order is
+    kept (append-only), so a native tool-definition list rebuilt from the result
+    keeps its existing prefix byte-identical."""
+    seen = {t.get("name") for t in base}
+    out = list(base)
+    for t in extra:
+        if t.get("name") not in seen:
+            seen.add(t.get("name"))
+            out.append(t)
+    return out
+
+
+# The schema a skill-granted tool is offered with when the kernel confirmed the grant
+# but could not describe the tool (see _skill_granted_tools). Top-level "type" is what
+# a provider requires; no properties means "any arguments".
+_GRANTED_TOOL_FALLBACK_SCHEMA = '{"type": "object", "properties": {}}'
+
+
+def _skill_granted_tools(agent, skill: str, grants: List[str], menu: List[Dict],
+                         full: bool, kernel_confirmed: bool,
+                         session_token_id: str = "") -> List[Dict]:
+    """The menu entries for the tools a just-loaded skill grants (ADR-0046 D6) that
+    the agent's menu does not already carry.
+
+    The kernel conferred the grants run-scoped while serving the skill (ListSkills
+    -> ToolExecutor.ConferSkillGrants), and ``ExecuteTool`` honours them through the
+    run overlay — but nothing put the tools in front of the model, so it was told
+    they were available and could not call them. Schemas come from the existing
+    disclosure path (``list_tools(names=..., full=...)``, as describe_tool uses).
+
+    The run's lease (``session_token_id``) rides the call so the kernel also
+    describes tools the skill conferred under THIS run's overlay
+    (``AvailableToolsNamedFor``); an older kernel ignores it and serves standing
+    grants only, so an overlay-only tool can still come back absent. For a system
+    skill the returned ``tool_grants`` is exactly the post-clip set of registry-known
+    tools the kernel just conferred, so such a tool is still offered, with a
+    permissive schema and a description pointing at the skill. For an agent-local
+    skill (``kernel_confirmed=False``) nothing vouches for an undescribed name, so it
+    is not invented. Local ``@tool`` names are already in the menu and are skipped.
+    Never raises."""
+    have = {t.get("name") for t in menu or []}
+    tools = getattr(agent, "tools", None)
+    missing = [g for g in grants or []
+               if g and g not in have and not (tools is not None and g in tools)]
+    if not missing:
+        return []
+    described: Dict[str, Dict] = {}
+    substrate = getattr(agent, "substrate", None)
+    if substrate is not None and hasattr(substrate, "list_tools"):
+        try:
+            try:
+                listed = substrate.list_tools(names=missing, full=full,
+                                              session_token_id=session_token_id)
+            except TypeError:  # a substrate (or fake) without the lease kwarg
+                listed = substrate.list_tools(names=missing, full=full)
+            for t in listed or []:
+                if t.get("name") in missing:
+                    described[t["name"]] = t
+        except Exception:  # noqa: BLE001 — TypeError (old fake) or RPC failure: degrade
+            pass
+    out: List[Dict] = []
+    for g in missing:
+        if g in described:
+            out.append(described[g])
+        elif kernel_confirmed:
+            out.append({
+                "name": g,
+                "description": f"Granted by skill {skill!r} for this task; its instructions "
+                               "say how to call it.",
+                "schema_json": _GRANTED_TOOL_FALLBACK_SCHEMA,
+            })
+    return out
+
+
 def _list_system_skills(agent, query: str = "") -> List[Dict]:
     """Fetch the agent's scope-permitted kernel system skills (ADR-0046). Degrades
     to an empty list when the substrate has no skill plane. Never raises."""
@@ -1783,6 +2166,47 @@ def _list_system_skills(agent, query: str = "") -> List[Dict]:
         return []
 
 
+# The Tier-1 one-liner cap — the SAME constant as the kernel's toolSummaryMaxChars
+# (cambrian-core domain/tool_retriever.go, ADR-0045 D3).
+SUMMARY_MAX_CHARS = 120
+
+
+def derive_summary(name: str, description: str) -> str:
+    """Port of the kernel's ``deriveSummary`` (domain/tool_retriever.go, ADR-0045 D3,
+    reused for skills by ADR-0046): strip leading markdown, take the first sentence or
+    line, collapse whitespace, cap at a word boundary with an ellipsis, and fall back
+    to the humanized name when nothing is left. Pure, no LLM.
+
+    It exists so an agent-local skill's menu line is derived exactly as a system
+    skill's is (the kernel applies it in ``SkillDisclosure`` before serving). Held to
+    the Go implementation by ``tests/test_skill_summary_parity.py`` against the fixture
+    the Go test writes (internal/skill/discovery/testdata/summary_cases.json)."""
+    # stripLeadingMarkup -> firstSentenceOrLine -> collapseSpaces, in the Go order.
+    seg = (description or "").lstrip("#*`> \t\r\n").strip()
+    if seg:
+        ends = [i for i in (seg.find("\n"), seg.find("\r")) if i >= 0]
+        if ends:
+            seg = seg[:min(ends)].strip()
+        i = seg.find(". ")
+        if i >= 0:
+            seg = seg[:i + 1]  # include the period
+        seg = seg.strip()
+    seg = " ".join(seg.split())
+    if len(seg) > SUMMARY_MAX_CHARS:
+        cut_s = seg[:SUMMARY_MAX_CHARS]
+        j = cut_s.rfind(" ")
+        if j > 0:
+            cut_s = cut_s[:j]
+        seg = cut_s.rstrip(" ") + "…"
+    if not seg:
+        n = name or ""
+        k = max(n.rfind("/"), n.rfind(":"))
+        if k >= 0 and k + 1 < len(n):
+            n = n[k + 1:]
+        return " ".join(n.replace("_", " ").replace("-", " ").split())
+    return seg
+
+
 def _agent_local_skills(agent) -> List[Dict]:
     """The agent's own SDK-local skills (ADR-0046 D2/D5) — shipped with the agent,
     never in the kernel index. The agent exposes them via a ``local_skills``
@@ -1797,7 +2221,10 @@ def _agent_local_skills(agent) -> List[Dict]:
             continue
         out.append({
             "name": name,
-            "description": get("description") or "",
+            # One deriver for both loci: a local skill's menu line is capped and cut
+            # exactly as the kernel cuts a system skill's (SkillDisclosure), instead of
+            # rendering an author's whole multi-paragraph description into the menu.
+            "description": derive_summary(name, get("description") or ""),
             "instructions": get("instructions") or "",
             "tool_grants": list(get("tool_grants") or []),
         })
@@ -1823,7 +2250,8 @@ def _load_skill(agent, name: str, session_token_id: str = "") -> Optional[Dict]:
     when unavailable. Never raises."""
     for s in _agent_local_skills(agent):
         if s["name"] == name:
-            return s
+            # Marked so the caller knows no kernel confirmed (or conferred) its grants.
+            return dict(s, _local=True)
     substrate = getattr(agent, "substrate", None)
     if substrate is None or not hasattr(substrate, "list_skills"):
         return None
@@ -1895,27 +2323,6 @@ def _safe_recall(agent, query: str, session_token_id: str = ""):
         return []
 
 
-def _safe_recall_precedents(agent, query: str, session_token_id: str = ""):
-    """Call the agent's memory.recall_precedents if present; degrade to empty on any
-    failure — including a memory client that predates the lane (``AttributeError``),
-    which is answered the same way the kernel answers a similarity-gated miss: no
-    precedent. An empty list is a legitimate result here, so degradation is silent by
-    design and never becomes a fabricated analogy."""
-    memory = getattr(agent, "memory", None)
-    if memory is None:
-        return []
-    fn = getattr(memory, "recall_precedents", None)
-    if fn is None:
-        return []
-    try:
-        return fn(query, session_token_id=session_token_id)
-    except TypeError:
-        # A client that predates the session_token_id param — degrade rather than break.
-        return fn(query)
-    except Exception:
-        return []
-
-
 def _content_cid(r) -> str:
     """The full-body CID a recalled fact carries (ADR-0048 #1), parsed from its
     metadata. Recall returns the fact's one-line SUMMARY as the text and the full
@@ -1975,19 +2382,6 @@ def _render_memory_children(results) -> str:
         text = r.get("text", r) if isinstance(r, dict) else getattr(r, "text", r)
         items.append(f"  <memory {memory_provenance_attrs(r)}>{_esc(text)}</memory>")
     return "\n".join(items)
-
-
-# v2 typed-Step renderer for recall_precedents (ADR-0049 D11/Issue 014) — the same
-# shape as the memory_query renderer, because a precedent round is read the same way:
-# the query is surfaced as an attribute so the next round sees WHAT SITUATION was
-# asked about. Used by the loop via WorkingMemory.add_step(kind="recall_precedents").
-def _render_precedent_step(query: str, status: str, results) -> str:
-    """Build a typed Step for a recall_precedents round (v2 trajectory)."""
-    return (
-        f'<step type="recall_precedents" query="{_esc(query)}" status="{_esc(status)}">\n'
-        + _render_precedent_results(results)
-        + "\n</step>"
-    )
 
 
 # ADR-0048 #1: the recall block carried into the prompt. When the kernel's

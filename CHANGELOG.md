@@ -7,6 +7,39 @@ described by their git history.
 
 ### Added
 
+- **Structured managed generation** (ADR-0139 C1, wave 1d). `SubstrateClient.generate_request(
+  lease, *, system, messages, response_schema, cache_ttl, max_tokens, temperature, stop,
+  strict)` returns a `GenerateResult` with `text`, `tool_calls`, `stop_reason`, `usage`
+  (`GenerateUsage`: input/output, cache read/write, `cache_write_known`, `estimated`),
+  `ignored` (request fields the model did not honour) and `model`. `generate`,
+  `generate_stream` and `generate_with_tools` keep their signatures and accept the same
+  keywords; `generate_with_tools` now returns a `GenerateResult` that still unpacks as
+  `(text, tool_calls, stop_reason)`. `max_tokens`/`temperature` use field presence
+  (`None` = model default, `0.0` is sent). System text goes only in `system`: a
+  `"system"`-role message raises `InvalidRequest` before any RPC. Status codes map to
+  typed errors, all also `grpc.RpcError`: `InvalidRequest` (INVALID_ARGUMENT),
+  `SchemaValidationFailed` (ABORTED), `GenerationResourceExhausted` (RESOURCE_EXHAUSTED),
+  `ModelUnavailable` (UNAVAILABLE), `GenerateError` (other); FAILED_PRECONDITION /
+  UNIMPLEMENTED on `generate_with_tools` stay `ToolCallingUnsupported`. Against a kernel
+  that predates C1 the stream also carries the flattened prompt, and a reply without
+  `usage` sets `result.legacy_kernel`.
+- **The ReAct loop sends a cached system tier plus messages** (ADR-0139 D2). Role,
+  constraints, anti-patterns, the action protocol (tool policy, skill index) and the
+  per-turn contract are one `system` block with `cache=True`, byte-identical across a
+  run's turns; the task, the trajectory and per-turn notices (for example "Memory budget
+  is exhausted", formerly a constraint) are the user turn. `cache_ttl` defaults to
+  `"short"`; set `CognitiveAgent.cache_ttl = "long"` or `CAMBRIAN_AGENT_CACHE_TTL`. The
+  loop degrades to the legacy single prompt when the kernel reports `system` as ignored,
+  refuses the structured call, or the substrate predates it. `helpers.build_prompt_parts`
+  / `PromptParts` expose the split; `build_prompt` is unchanged.
+- **ReAct prompt texts in the prompt library** (ADR-0139 C4): `prompts/react-constraints`,
+  `react-anti-patterns`, `react-action-protocol`, `react-turn`, `react-nudges` (v1,
+  fragment sets read with `prompt_library.fragment(id, section)`). Renders are identical
+  to the previous inline text except two lint fixes: "Output EXACTLY ONE JSON object" ->
+  "Output exactly ONE JSON object", "TOOL BUDGET EXHAUSTED" -> "Tool budget exhausted".
+  Each call logs (debug) the prompt ids, versions and static hashes and the system text's
+  sha256.
+
 - **Source metadata on memory** (ADR-0136 Amendment A3). `MemoryClient.remember()` takes
   keyword-only `source_kind`, `title` and `author`, and a part may carry a speaker as a
   third element, `parts=[(text, occurred_at, speaker), ...]`. All are descriptive: the
@@ -20,7 +53,7 @@ described by their git history.
   `reference_time` (the asker's "now"), `event_after` (inclusive) and `event_before`
   (exclusive). Every time must be timezone-aware: a naive `datetime` raises `ValueError`
   before any RPC, because the SDK will not guess a zone. Every recall result dict
-  (`recall`, `recall_actions`, `recall_precedents`, `recall_entity`) gains `event_time` /
+  (`recall`, `recall_actions`, `recall_precedents` (removed 2026-11-05; now returns `[]`), `recall_entity`) gains `event_time` /
   `event_time_end` (aware UTC `datetime` or `None`), `time_source` (`TIME_SOURCES`) and
   `time_precision`. A kernel without the event window wired answers `UNIMPLEMENTED` for
   `event_after`/`event_before` rather than ignoring them.
@@ -54,3 +87,19 @@ described by their git history.
 
   Nothing else changes: `trait` stays `"tool"`, `propose()` still returns the static bid,
   and the class will be removed only after the kernel drops `TraitTool`.
+
+- **`MemoryClient.recall_precedents`** (owner decision 2026-11-05,
+  `cambrian-knowledge/decisions/scenes-cancelled.md`). Precedents and scenes were
+  removed from the kernel, including the `x-lane=precedents` lane. The method stays as a
+  shim: it emits a `DeprecationWarning` and returns `[]` **without calling the kernel**,
+  because a current kernel would answer the lane from the fact lane and hand back facts
+  labelled as prior transitions. Use `recall()` for facts.
+
+### Removed
+
+- **The `recall_precedents` ReAct action** (same decision). The action protocol
+  (`prompts/react-action-protocol/v1.md`, text and native variants) no longer advertises
+  it, the loop no longer handles it, it is no longer a native control verb, and the
+  `recall_precedents` trajectory step and its `<precedent>` rendering are gone from
+  `working_memory`. `tests/golden/react_prompts_v1.json` was updated deliberately: the
+  only change in every action-protocol render is the removed `recall_precedents` bullet.

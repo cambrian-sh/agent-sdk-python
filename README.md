@@ -26,8 +26,7 @@ if __name__ == "__main__":
 ```
 
 The kernel spawns your agent, hands it tasks over the agent plane, and your `run()`/`think()`
-loop can call **memory** (`memory_query` for facts, `recall_precedents` for prior transitions
-with their outcomes), **tools** (`tool_call` — kernel-owned or your own
+loop can call **memory** (`memory_query` for facts), **tools** (`tool_call` — kernel-owned or your own
 `@tool` methods), and **delegate** (`yield_subgoal`) to the planner.
 
 ## Agent shapes
@@ -42,7 +41,28 @@ with their outcomes), **tools** (`tool_call` — kernel-owned or your own
 - **`DaemonAgent`** — a persistent background producer on the `SignalStream` contract.
 
 Declare tools with the `@tool` decorator (auto-injected into the agent's action menu) and
-capabilities with `@capability`. See `example-agents/` in the repo.
+capabilities with `@capability`. See `examples/tool_tutorial_agent.py` (the `@tool`
+tutorial) and `example-agents/` (a daemon and an ingress agent) in the repo.
+
+## Declarative profiles
+
+A specialist does not need its own agent class. `cambrian_agent_sdk.profiles` parses and
+validates **profiles**: a YAML file naming an agent's id, routing description,
+capabilities, skills, tool allowlist (`mcp:<server>/<tool glob>`), optional model
+preference, trust tier, limits and role. The Cambrian kernel ships one runtime that runs
+any profile (`cambrian-core/agents/worker_agent.py --profile <name>`); the format is
+specified in `cambrian-core/agents/profiles/README.md`.
+
+```python
+from cambrian_agent_sdk.profiles import load_profile
+
+p = load_profile("data-analyst", profiles_dir="agents/profiles", skills_dir="skills")
+p.allowlist.allows("mcp:code-sandbox/execute_code")   # True
+```
+
+`ProfileScopedSubstrate` narrows an agent's tool and skill menu to its profile and refuses
+out-of-profile tool calls on the client. That check is advisory: the kernel's tool grants
+are the enforcing control.
 
 ## Memory and event time
 
@@ -69,6 +89,41 @@ with a time per turn, and `event_after` / `event_before` ask for a time window.
 per part, `parts=[(text, time, speaker), ...]`. They are data for the kernel's fact
 extractor only: the writer of record is always the authenticated agent, and a speaker
 never changes the stored text.
+
+## Calling the model
+
+Every LLM call goes through the kernel's managed proxy (`self.substrate`), under the
+task's lease. The structured form sends a system prompt, a conversation and options:
+
+```python
+from cambrian_agent_sdk import InvalidRequest, ModelUnavailable
+
+res = self.substrate.generate_request(
+    task.session_token_id,
+    system=[{"text": STABLE_INSTRUCTIONS, "cache": True}],   # identical on every call
+    messages=[{"role": "user", "content": f"<documents>{docs}</documents>\n\n{question}"}],
+    response_schema={"name": "answer", "schema": {"type": "object", "required": ["answer"]}},
+    cache_ttl="short",          # "short" (5 min, machine-paced) | "long" (1 h) | None
+    max_tokens=512, temperature=0.0,   # None = the model's default; 0.0 is sent
+)
+res.text, res.stop_reason, res.model
+res.usage.cache_read_tokens, res.usage.cache_write_tokens, res.usage.estimated
+res.ignored        # e.g. ["temperature"]: fields this model did not honour
+```
+
+- System text goes only in `system`; a `"system"`-role message raises `InvalidRequest`.
+  Keep volatile text (step state, budget notices) in `messages`, so the system blocks
+  stay byte-identical and the provider can cache them.
+- `generate(token, prompt)` and `generate_stream(token, prompt)` still work and accept the
+  same keywords. `generate_with_tools(token, messages, tools, system=...)` returns a
+  `GenerateResult` that still unpacks as `text, tool_calls, stop_reason`.
+- Errors are typed (and are `grpc.RpcError`s): `InvalidRequest`, `SchemaValidationFailed`
+  (the reply failed its schema after one repair), `GenerationResourceExhausted`,
+  `ModelUnavailable`, `GenerateError`. `ToolCallingUnsupported` means "no native tools,
+  use the text protocol".
+- `CognitiveAgent.think()` already does all of this: it sends a cached system tier and
+  a volatile user turn. Set `cache_ttl = "long"` on an agent that serves a human-paced
+  session.
 
 ## Connecting to a kernel
 

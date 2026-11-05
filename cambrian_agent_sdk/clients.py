@@ -195,7 +195,7 @@ class MemoryClient:
         default FACT lane. This call therefore no longer resolves an entity's
         reconstructed state: it is a semantic fact search whose query happens to be a
         ``kind:id`` string, which almost never retrieves anything useful. Use
-        :meth:`recall` for facts or :meth:`recall_precedents` for prior transitions.
+        :meth:`recall` for facts.
 
         Kept (it is published API surface) with unchanged wire behaviour — it still
         sends ``x-lane=entity``, because an OLDER kernel that still serves the lane must
@@ -203,14 +203,13 @@ class MemoryClient:
 
         Historically (ADR-0049 Issue 012): an EXACT lookup by canonical ``kind:id`` —
         e.g. ``file:c:/repo/a.md`` — returning the materialized field-LWW view (a
-        deleted file read ``exists=false``) plus the link to its most-recent engaging
-        scene."""
+        deleted file read ``exists=false``)."""
         from ._proto import cambrian_pb2
 
         warnings.warn(
             "MemoryClient.recall_entity is deprecated: the kernel removed the entity "
             "lane on 2026-08-14 and now serves x-lane=entity from the default fact "
-            "lane. Use recall() for facts or recall_precedents() for prior transitions.",
+            "lane. Use recall() for facts.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -222,20 +221,24 @@ class MemoryClient:
 
     def recall_precedents(self, query: str, top_k: int = 5, timeout_ms: int = 0,
                           session_token_id: str = "") -> List[dict]:
-        """Retrieve from the PRECEDENT lane (ADR-0049 D11/Issue 014) — prior TRANSITIONS
-        for the current sub-situation ("situations like this → what followed"), so the
-        agent can anticipate the consequence of its next action. Failure-weighted
-        (negative precedents first) and similarity-gated (empty == "no precedent", never
-        a fabricated analogy). A DISTINCT lane from facts/actions, routed by
-        ``x-lane=precedents``; fed by the live pull path (``PrimeForStep`` is not
-        revived). The agent's LLM reasons over the returned transitions."""
-        from ._proto import cambrian_pb2
+        """**Deprecated; always returns an empty list.** Precedents were removed on
+        2026-11-05 (owner decision ``decisions/scenes-cancelled.md``): the kernel no
+        longer has a precedent lane. Unlike :meth:`recall_entity`, this shim does NOT
+        call the kernel — a current kernel would serve the request from the fact lane,
+        handing the caller facts mislabelled as prior transitions. Use :meth:`recall`
+        for facts.
 
-        req = cambrian_pb2.MemoryRequest(query=query, top_k=top_k)
-        md = self._identity_metadata() + [("x-lane", "precedents")]
-        md = md + _lease_metadata(session_token_id)
-        resp = self._stub.QueryMemory(req, timeout=_secs(timeout_ms), metadata=md)
-        return [_result_dict(r) for r in resp.results]
+        Kept (it is published API surface) so existing callers keep working, and
+        emits a :class:`DeprecationWarning` on call. The arguments are accepted and
+        ignored."""
+        warnings.warn(
+            "MemoryClient.recall_precedents is deprecated: precedents were removed "
+            "2026-11-05; see decisions/scenes-cancelled.md. It returns [] without "
+            "calling the kernel. Use recall() for facts.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return []
 
     def remember(
         self,

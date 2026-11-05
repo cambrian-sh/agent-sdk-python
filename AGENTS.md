@@ -72,8 +72,9 @@ kernel.
 | | `tools.py` (in-process `@tool` registration and `ToolRegistry`) |
 | | `recurrence.py` (Local Recurrent Workspace gate, ADR-0041 D4) |
 | | `reflection.py` (verbal reflection on the gate, ADR-0052) |
-| `examples/` | One minimal agent: `benchmark_agent.py` |
-| `example-agents/` | Production-style references (9 agents): `analyst_agent.py`, `calculator_agent.py`, `code_executor_agent.py`, `code_generator_agent.py`, `example_daemon_agent.py`, `pulse_agent.py`, `research_agent.py`, `summariser_agent.py`, `terminal_agent.py` |
+| | `profiles.py` (declarative agent profiles: loader, strict validator, tool allowlist, `ProfileScopedSubstrate`; format in `cambrian-core/agents/profiles/README.md`) |
+| `examples/` | The `@tool` tutorial: `tool_tutorial_agent.py` (a tutorial, not a shipped agent) |
+| `example-agents/` | Reference agents: `pulse_agent.py` (daemon), `example_ingress_agent.py` (ingress) |
 | `tests/` | pytest suite |
 
 ## Build & verify

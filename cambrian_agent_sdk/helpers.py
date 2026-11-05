@@ -5,9 +5,13 @@ All functions are pure and stateless — no gRPC, no external dependencies.
 
 from __future__ import annotations
 
+import hashlib
 import html
 import re
-from typing import List, Optional, TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+from .prompt_library import fragment
 
 if TYPE_CHECKING:
     from .types import ContextRef
@@ -58,25 +62,70 @@ def find_step_ref(working_memory: "List[ContextRef]", step_index: int) -> "Optio
 # (memory budget exhausted, truncation retry, veto note) on top of these.
 # They mirror the 4 Rules in <ActionProtocol> for the prompt-mid attention
 # boost — the copy at the top is the recency-priority one.
-DEFAULT_CONSTRAINTS: List[str] = [
-    "Issue at most ONE JSON action per turn. Do NOT emit multiple actions in one response.",
-    "memory_query is read-only and uncapped; tool_call has a per-run cap (5 by default). When the tool budget is exhausted, answer from what you have.",
-    "After 2 failed attempts of the same action (cosine > 0.85), the kernel's recurrence gate VETOES further attempts. Change your approach or answer.",
-    "When emitting final_answer, ground it: at least one memory_query or tool_call must have preceded it in the trajectory.",
-]
+#
+# GENERATED, not literal (ADR-0139 Phase 0, prompt/code drift). The literal list
+# told the model "memory_query is ... uncapped; tool_call has a per-run cap (5 by
+# default)" while the loop enforced 3 memory queries and 12 tool rounds, so the
+# model planned against budgets that did not exist. The text is now rendered from
+# the EFFECTIVE limits the loop enforces, in one of two protocol variants: under
+# native tool-calling there is no JSON tool_call action, and a prompt that says
+# "emit one JSON object" beside attached tool schemas gives the model two ways to
+# act, of which it picks the one that does nothing (measured 2026-07-28, react.py).
+def default_constraints(*, native_tools: bool = False,
+                        max_memory_queries: Optional[int] = None,
+                        max_tool_rounds: Optional[int] = None) -> List[str]:
+    """The <Constraints> defaults for one run, from the limits the loop enforces.
+
+    ``None`` budgets resolve to the loop's own defaults in ``react.py`` (one
+    default, one place), imported lazily because ``react`` imports this module.
+    """
+    if max_memory_queries is None or max_tool_rounds is None:
+        from .react import _DEFAULT_MAX_MEMORY_QUERIES, _DEFAULT_MAX_TOOL_ROUNDS
+        if max_memory_queries is None:
+            max_memory_queries = _DEFAULT_MAX_MEMORY_QUERIES
+        if max_tool_rounds is None:
+            max_tool_rounds = _DEFAULT_MAX_TOOL_ROUNDS
+    # The text lives in the prompt library (prompts/react-constraints/v1.md, ADR-0139
+    # C4); this function only picks the protocol variant and fills the budgets.
+    variant = "native" if native_tools else "text"
+    if max_memory_queries > 0:
+        mem = fragment("react-constraints", f"memory-{variant}").render(
+            {"max_memory_queries": max_memory_queries})
+    else:
+        mem = fragment("react-constraints", "memory-none").render()
+    body = fragment("react-constraints", variant).render(
+        {"memory_clause": mem, "max_tool_rounds": max_tool_rounds})
+    return body.splitlines()
+
 
 # AntiPatterns — the "do not" list, lifted from observed failure modes
 # (recurrence gate vetoes, truncation retries, premature final_answer).
 # These are NOT loop-injected; they live in the prompt for the entire run.
-DEFAULT_ANTI_PATTERNS: List[str] = [
-    "[NO] Don't re-run a successful tool_call — the kernel's success-dedup will block; see the trajectory.",
-    "[NO] Don't claim a tool is 'missing' without first trying find_tools (and find_skills for a procedure).",
-    "[NO] Don't emit final_answer after a single empty memory_query — the result may not have been relevant; try a different query or find_tools.",
-    "[NO] Don't truncate a large tool_call payload at the token limit — chunk with append (e.g. fast_large_write_file in sections).",
-    "[NO] Don't ignore a <reflection> block in the trajectory — it was extracted from a previous failure for a reason.",
-    "[NO] Don't memory_query for content that already has a cid (an offloaded block in the trajectory, a recalled fact with `[full content cid:…]`, or a workspace seed). Use the cid as {\"$cid\": \"<cid>\"} in the next tool_call — the kernel resolves it.",
-    "[NO] Don't resolve_cid when you can pass the cid directly to the next tool_call. resolve_cid is for the rare case where you need the body in YOUR context (to quote, summarize, or reason about it). Offload mode is free; inline mode costs N tokens and is capped at 3 per run.",
-]
+# Mode-specific for the same reason as default_constraints (ADR-0139 Phase 0).
+def default_anti_patterns(*, native_tools: bool = False,
+                          large_write_tool: Optional[str] = None) -> List[str]:
+    """The <AntiPatterns> defaults. ``large_write_tool`` names a sectioned-write tool
+    only when it is actually in this agent's menu: naming a tool the model cannot
+    call sends it looking for one it will never find."""
+    # Text: prompts/react-anti-patterns/v1.md (ADR-0139 C4).
+    if large_write_tool:
+        chunk = fragment("react-anti-patterns", "chunk-tool").render(
+            {"large_write_tool": large_write_tool})
+    else:
+        chunk = fragment("react-anti-patterns", "chunk-none").render()
+    return fragment("react-anti-patterns", "native" if native_tools else "text").render(
+        {"chunk": chunk}).splitlines()
+
+
+def __getattr__(name: str):
+    # Backward compatibility: DEFAULT_CONSTRAINTS / DEFAULT_ANTI_PATTERNS were module
+    # constants. They are now the TEXT-protocol defaults rendered from the real loop
+    # budgets, computed on access so they cannot drift from react.py again.
+    if name == "DEFAULT_CONSTRAINTS":
+        return default_constraints()
+    if name == "DEFAULT_ANTI_PATTERNS":
+        return default_anti_patterns()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _esc(s: str) -> str:
@@ -99,6 +148,8 @@ def build_prompt(
     task_type: "Optional[str]" = None,
     session_context: "Optional[str]" = None,
     extra_anti_patterns: "Optional[List[str]]" = None,
+    base_constraints: "Optional[List[str]]" = None,
+    base_anti_patterns: "Optional[List[str]]" = None,
 ) -> str:
     """Assemble a canonical LLM prompt (v2 — max-cache layout).
 
@@ -133,43 +184,23 @@ def build_prompt(
         task_type: Optional classification ("research" | "code" | "data" | "chat") for <TaskType>.
         session_context: Optional "you are agent X in plan Y, budget Z" string for <SessionContext>.
         extra_anti_patterns: Optional runtime-injected anti-patterns; appended to DEFAULT_ANTI_PATTERNS.
+        base_constraints: Replaces the text-protocol DEFAULT_CONSTRAINTS. The ReAct loop
+            passes the variant for its protocol and effective budgets (ADR-0139).
+        base_anti_patterns: Replaces DEFAULT_ANTI_PATTERNS likewise.
     """
-    # 1. <System> — frame-setting, constraints, context, anti-patterns.
-    system_parts = [f"<Role>\n{role.strip()}\n</Role>"]
-    all_constraints = list(DEFAULT_CONSTRAINTS) + list(constraints or [])
-    if all_constraints:
-        system_parts.append(
-            "<Constraints>\n"
-            + "\n".join(f"- {c}" for c in all_constraints)
-            + "\n</Constraints>"
-        )
-    if task_type:
-        system_parts.append(
-            f"<TaskType>\nThis is a {task_type} task. Step {step_no}.\n</TaskType>"
-        )
-    if session_context:
-        system_parts.append(
-            f"<SessionContext>\n{session_context.strip()}\n</SessionContext>"
-        )
-    all_anti = list(DEFAULT_ANTI_PATTERNS) + list(extra_anti_patterns or [])
-    if all_anti:
-        system_parts.append(
-            "<AntiPatterns>\n"
-            + "\n".join(f"- {p}" for p in all_anti)
-            + "\n</AntiPatterns>"
-        )
-    parts = ["<System>\n" + "\n".join(system_parts) + "\n</System>"]
+    system_block = _system_section(
+        role, constraints=constraints, task_type=task_type,
+        task_type_step=step_no, session_context=session_context,
+        extra_anti_patterns=extra_anti_patterns, base_constraints=base_constraints,
+        base_anti_patterns=base_anti_patterns)
+    parts = [system_block]
 
     # 2. <Task> — loop-invariant within a run; high attention at front.
     parts.append(f"<Task>\n{task.strip()}\n</Task>")
 
     # 3. <ActionProtocol> — composed once per task (loop-invariant).
-    if action_protocol and action_protocol.strip():
-        parts.append(f"<ActionProtocol>\n{action_protocol.strip()}\n</ActionProtocol>")
-
     # 4. <OutputSchema> — recency-adjacent (right before Trajectory).
-    if output_schema and output_schema.strip():
-        parts.append(f"<OutputSchema>\n{output_schema.strip()}\n</OutputSchema>")
+    parts.extend(_protocol_sections(action_protocol, output_schema))
 
     # 5. <Trajectory> — VARIABLE; must be the last section for prefix caching.
     # The step number goes in the BODY (not the tag) so it does NOT invalidate
@@ -177,12 +208,185 @@ def build_prompt(
     # therefore byte-identical for every turn of the same run, and the
     # provider's prefix cache covers it.
     if context_str and context_str.strip():
-        step_note = f" (round {step_no})" if step_no > 0 else ""
-        header = (
-            f"Your ReAct loop so far{step_note}. Each <step> is one round (oldest first). "
-            "Use the trajectory to avoid repeating work; then choose your next single action. "
-            "If a <reflection> block is present, it was extracted from a previous failure — read it before retrying."
-        )
-        parts.append(f"<Trajectory>\n{header}\n\n{context_str.strip()}\n</Trajectory>")
+        parts.append(f"<Trajectory>\n{_trajectory_header(step_no)}\n\n{context_str.strip()}\n</Trajectory>")
 
     return "\n\n".join(parts)
+
+
+def _trajectory_header(step_no: int) -> str:
+    if step_no > 0:
+        return fragment("react-turn", "trajectory-header").render({"round": step_no})
+    return fragment("react-turn", "trajectory-header-unnumbered").render()
+
+
+def _system_section(
+    role: str,
+    *,
+    constraints: "Optional[List[str]]" = None,
+    task_type: "Optional[str]" = None,
+    task_type_step: "Optional[int]" = None,
+    session_context: "Optional[str]" = None,
+    extra_anti_patterns: "Optional[List[str]]" = None,
+    base_constraints: "Optional[List[str]]" = None,
+    base_anti_patterns: "Optional[List[str]]" = None,
+) -> str:
+    """The ``<System>`` block: Role, Constraints, TaskType, SessionContext, AntiPatterns.
+
+    ``task_type_step`` keeps the legacy "Step N." in <TaskType> for ``build_prompt``;
+    the split layout passes ``None`` because a step number is volatile and must not
+    reach the system tier."""
+    system_parts = [f"<Role>\n{role.strip()}\n</Role>"]
+    base_c = default_constraints() if base_constraints is None else base_constraints
+    all_constraints = list(base_c) + list(constraints or [])
+    if all_constraints:
+        system_parts.append(
+            "<Constraints>\n"
+            + "\n".join(f"- {c}" for c in all_constraints)
+            + "\n</Constraints>"
+        )
+    if task_type:
+        step = f" Step {task_type_step}." if task_type_step is not None else ""
+        system_parts.append(
+            f"<TaskType>\nThis is a {task_type} task.{step}\n</TaskType>"
+        )
+    if session_context:
+        system_parts.append(
+            f"<SessionContext>\n{session_context.strip()}\n</SessionContext>"
+        )
+    base_a = default_anti_patterns() if base_anti_patterns is None else base_anti_patterns
+    all_anti = list(base_a) + list(extra_anti_patterns or [])
+    if all_anti:
+        system_parts.append(
+            "<AntiPatterns>\n"
+            + "\n".join(f"- {p}" for p in all_anti)
+            + "\n</AntiPatterns>"
+        )
+    return "<System>\n" + "\n".join(system_parts) + "\n</System>"
+
+
+def _protocol_sections(action_protocol: str, output_schema: str) -> List[str]:
+    out = []
+    if action_protocol and action_protocol.strip():
+        out.append(f"<ActionProtocol>\n{action_protocol.strip()}\n</ActionProtocol>")
+    if output_schema and output_schema.strip():
+        out.append(f"<OutputSchema>\n{output_schema.strip()}\n</OutputSchema>")
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────
+# The split layout (ADR-0139 D2, wave 1d): a cached system tier + messages
+# ──────────────────────────────────────────────────────────────────────
+
+# The SDK prompt-library ids the ReAct prompt is built from. Logged with their
+# version and static hash on every call (debug level), so an end-to-end test can
+# assert which prompt version a run actually sent.
+REACT_PROMPT_IDS = ("react-constraints", "react-anti-patterns", "react-action-protocol",
+                    "react-turn", "react-nudges")
+
+
+@dataclass
+class PromptParts:
+    """An assembled prompt in the C1 shape: ``system`` blocks plus ``messages``.
+
+    - ``system`` is the STABLE tier: role, constraints, anti-patterns, the action
+      protocol (tool policy, skill index) and the per-turn output contract. One
+      block, marked ``cache=True``. Nothing volatile is allowed in it, so it is
+      byte-identical across the turns of a run and a provider can cache it (an
+      unchanged system prompt over the provider's minimum caches; one that changes
+      every turn never does).
+    - ``messages`` is the volatile tier: one user turn holding the task, the
+      trajectory (memory and tool results, marked as data) and the per-turn notes
+      (budget notices and the like).
+
+    ``legacy_prompt()`` flattens both into the single string an older kernel, or a
+    substrate without the structured call, expects.
+    """
+
+    system: List[Dict[str, Any]] = field(default_factory=list)
+    messages: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def system_text(self) -> str:
+        return "\n\n".join(b["text"] for b in self.system if b.get("text"))
+
+    @property
+    def system_sha256(self) -> str:
+        return hashlib.sha256(self.system_text.encode("utf-8")).hexdigest()
+
+    @property
+    def user_text(self) -> str:
+        return "\n\n".join(m.get("content") or "" for m in self.messages)
+
+    def legacy_prompt(self) -> str:
+        return "\n\n".join(p for p in (self.system_text, self.user_text) if p)
+
+
+def build_prompt_parts(
+    role: str,
+    task: str,
+    context_str: str = "",
+    output_schema: str = "",
+    constraints: "list[str] | None" = None,
+    action_protocol: str = "",
+    step_no: int = 0,
+    task_type: "Optional[str]" = None,
+    session_context: "Optional[str]" = None,
+    extra_anti_patterns: "Optional[List[str]]" = None,
+    base_constraints: "Optional[List[str]]" = None,
+    base_anti_patterns: "Optional[List[str]]" = None,
+    notes: "Optional[List[str]]" = None,
+    cache: bool = True,
+) -> PromptParts:
+    """Assemble the ReAct prompt as ``system`` + ``messages`` (ADR-0139 D2).
+
+    Same inputs as :func:`build_prompt` plus ``notes``, the per-turn notices
+    (memory budget exhausted, and the like) that the old layout appended to
+    <Constraints>. They go at the end of the user turn instead: a notice in the
+    system tier changes the system text mid-run and voids the provider's cache.
+
+    System block (stable, cached)::
+
+        <System> Role, Constraints, TaskType, SessionContext, AntiPatterns </System>
+        <ActionProtocol> ... </ActionProtocol>
+        <OutputSchema> ... </OutputSchema>
+
+    User turn (volatile)::
+
+        <Task> ... </Task>
+        <Trajectory> header + data note + history </Trajectory>
+        <note>...</note>   (per-turn notes)
+
+    ``constraints`` must be stable for the run (caller rules, host facts); a
+    step-dependent value belongs in ``notes``.
+    """
+    system_text = "\n\n".join([
+        _system_section(role, constraints=constraints, task_type=task_type,
+                        task_type_step=None, session_context=session_context,
+                        extra_anti_patterns=extra_anti_patterns,
+                        base_constraints=base_constraints,
+                        base_anti_patterns=base_anti_patterns),
+        *_protocol_sections(action_protocol, output_schema),
+    ])
+    user = [f"<Task>\n{task.strip()}\n</Task>"]
+    if context_str and context_str.strip():
+        user.append(
+            f"<Trajectory>\n{_trajectory_header(step_no)}\n"
+            f"{fragment('react-turn', 'data-note').render()}\n\n"
+            f"{context_str.strip()}\n</Trajectory>")
+    for n in notes or []:
+        if n and n.strip():
+            user.append(n.strip())
+    return PromptParts(
+        system=[{"text": system_text, "cache": bool(cache)}],
+        messages=[{"role": "user", "content": "\n\n".join(user)}],
+    )
+
+
+def prompt_versions() -> List[Dict[str, Any]]:
+    """``[{"id", "version", "static_hash"}]`` for the ReAct prompt-library files."""
+    from . import prompt_library
+    out = []
+    for pid in REACT_PROMPT_IDS:
+        p = prompt_library.get(pid)
+        out.append({"id": p.id, "version": p.version, "static_hash": p.static_hash})
+    return out

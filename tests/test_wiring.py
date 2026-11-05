@@ -46,35 +46,35 @@ def test_bind_clients_wires_memory_artifacts_substrate():
     assert bot.memory.recall("q")[0]["text"] == "bound"
 
 
-# The migrated example agents ship inside this repo (sdk/example-agents). The old
-# "../../agents" path assumed the pre-split monorepo layout and pointed outside
-# the checkout (T-20261031-sdk-test-wiring-reads-agents-analyst-agent-py).
-_AGENTS_DIR = os.path.join(os.path.dirname(__file__), "..", "example-agents")
-_MIGRATED = [
-    "analyst_agent.py",
-    "code_generator_agent.py",
-    "summariser_agent.py",
-    "example_daemon_agent.py",
+# The example agents ship inside this repo: example-agents/ (the reference daemon and
+# ingress agents) and examples/ (the @tool tutorial). The thin prompt-only agents that
+# used to live here were deleted with agent stack v2
+# (decisions/agent-stack-v2-mcp-tools-and-profiles.md): specialists are now declarative
+# profiles over cambrian-core/agents/worker_agent.py.
+_SDK_DIR = os.path.join(os.path.dirname(__file__), "..")
+_EXAMPLES = [
+    os.path.join("example-agents", "pulse_agent.py"),
+    os.path.join("example-agents", "example_ingress_agent.py"),
+    os.path.join("examples", "tool_tutorial_agent.py"),
 ]
 
 
-def test_migrated_agents_import_no_proto_types():
-    """D3: a migrated agent never imports Handoff / Payload / proto."""
-    for fname in _MIGRATED:
-        src = open(os.path.join(_AGENTS_DIR, fname), encoding="utf-8").read()
-        assert "Handoff" not in src, fname
-        assert "Payload" not in src, fname
-        assert "_proto" not in src and "cambrian_pb2" not in src, fname
-        assert "LegacyAgent" not in src, fname  # fully migrated off the legacy class
+def test_example_agents_import_no_proto_types():
+    """D3: an example agent never imports Handoff / Payload / proto."""
+    for rel in _EXAMPLES:
+        src = open(os.path.join(_SDK_DIR, rel), encoding="utf-8").read()
+        assert "Handoff" not in src, rel
+        assert "Payload" not in src, rel
+        assert "_proto" not in src and "cambrian_pb2" not in src, rel
+        assert "LegacyAgent" not in src, rel  # fully migrated off the legacy class
 
 
-def test_cognitive_agents_are_cognitive_and_daemon_is_daemon():
+def test_tutorial_is_cognitive_and_daemon_is_daemon():
     import sys
 
-    sys.path.insert(0, os.path.abspath(_AGENTS_DIR))
-    import analyst_agent, code_generator_agent, summariser_agent, example_daemon_agent
+    sys.path.insert(0, os.path.abspath(os.path.join(_SDK_DIR, "examples")))
+    import pulse_agent, tool_tutorial_agent
 
-    assert isinstance(analyst_agent.agent, CognitiveAgent)
-    assert isinstance(code_generator_agent.agent, CognitiveAgent)
-    assert isinstance(summariser_agent.agent, CognitiveAgent)
-    assert isinstance(example_daemon_agent.agent, DaemonAgent)
+    assert isinstance(tool_tutorial_agent.agent, CognitiveAgent)
+    assert sorted(tool_tutorial_agent.agent.tools.names()) == ["add", "divide", "multiply", "subtract"]
+    assert isinstance(pulse_agent.agent, DaemonAgent)

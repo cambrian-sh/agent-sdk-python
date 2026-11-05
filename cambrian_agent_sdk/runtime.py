@@ -135,16 +135,13 @@ def dispatch_run(agent: "Agent", task: AgentTask) -> AgentResult:
         return AgentResult(data=f"BUDGET_EXCEEDED:{e.reason}".encode(), type="budget_signal", confidence=0.0)
 
 
-def proposal_bid(agent, request):
-    """Resolve an agent's auction bid. Uses ``agent.propose()`` when present (the
-    deprecated DeterministicAgent static bid); otherwise a generic best-effort bid.
-    The kernel's default capability-typed dispatch (ADR-0100) solicits no bids."""
-    from .types import ProposalResponse
-
-    propose = getattr(agent, "propose", None)
-    if callable(propose):
-        return propose(request)
-    return ProposalResponse(confidence=0.5, rationale="general-purpose agent", estimated_latency_ms=1000)
+#: The answer to the deprecated RequestProposal RPC (agent stack v2). The kernel's
+#: capability-typed dispatch (ADR-0100) solicits no bids, and the LLM interview that
+#: was the RPC's last caller is gone; the RPC stays in the proto (deprecated, never
+#: removed in v0.x). A neutral, well-formed proposal rather than UNIMPLEMENTED, so a
+#: stale caller gets an answer that attracts nothing instead of an error status, and
+#: the servicer never runs author code (``propose()``) that could raise.
+DEPRECATED_PROPOSAL_RATIONALE = "deprecated: capability-typed dispatch solicits no bids (ADR-0100)"
 
 
 class TraitServicer:
@@ -154,16 +151,14 @@ class TraitServicer:
         self._agent = agent
 
     def RequestProposal(self, request, context):
-        """Serve the agent's bid. A DeterministicAgent returns its static 1.0/5ms bid."""
+        """Deprecated RPC: always a neutral proposal (confidence 0), never the agent's
+        ``propose()``. See :data:`DEPRECATED_PROPOSAL_RATIONALE`."""
         from ._proto import cambrian_pb2
 
-        bid = proposal_bid(self._agent, request)
         return cambrian_pb2.ProposalResponse(
-            confidence=bid.confidence,
-            rationale=bid.rationale,
-            estimated_latency_ms=bid.estimated_latency_ms,
-            requirements=bid.requirements,
-            metadata=bid.metadata,
+            confidence=0.0,
+            rationale=DEPRECATED_PROPOSAL_RATIONALE,
+            estimated_latency_ms=0,
         )
 
     def Execute(self, request, context):

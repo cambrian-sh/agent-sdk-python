@@ -243,8 +243,6 @@ class Step:
 
     Kinds:
         memory_query   — ``query``, ``results`` (list of LTM hit dicts)
-        recall_precedents — ``query``, ``results`` (list of prior-TRANSITION hits;
-                         each result's ``metadata`` may carry an ``outcome``)
         tool_call      — ``tool``, ``args``, ``body``/``summary``,
                          optional ``cid``+``chars`` (offload),
                          ``status`` ('ok'|'error'|'denied')
@@ -286,6 +284,11 @@ class Step:
     # resolve_cid fields
     resolved_from: str = ""  # the cid the model asked to resolve (original)
     mode: str = ""          # for resolve_cid: 'offload' (default) | 'inline'
+    # ADR-0139 D3 / ADR-0046 D3: a pinned Step is an INSTRUCTION, not evidence. It is
+    # kept by every assemble() for the rest of the run, never offloaded and never
+    # evicted, and it does not consume the trajectory's entry cap. Used for a loaded
+    # skill's body and its grant note (WorkingMemory.add_skill).
+    pinned: bool = False
 
 
 def render_step_xml(s) -> str:
@@ -312,17 +315,6 @@ def render_step_xml(s) -> str:
             f' status="{_esc(s.status)}"'
         )
         body = _render_memory_results(s.results or [])
-        return f"<step n={n!r}{attrs}>\n{body}\n</step>"
-
-    if kind == "recall_precedents":
-        # ADR-0049 D11/Issue 014: prior transitions, not facts — same attribute shape
-        # as memory_query (the query is what was ASKED), different children.
-        attrs = (
-            f' type="recall_precedents"'
-            f' query="{_esc(s.query)}"'
-            f' status="{_esc(s.status)}"'
-        )
-        body = _render_precedent_results(s.results or [])
         return f"<step n={n!r}{attrs}>\n{body}\n</step>"
 
     if kind == "tool_call":
@@ -407,9 +399,12 @@ def render_step_xml(s) -> str:
         )
 
     if kind == "use_skill":
+        # A loaded skill (WorkingMemory.add_skill). The FULL body, always: a skill is
+        # a procedure the model must follow step by step, and a head cut of it is a
+        # different, wrong procedure (ADR-0139 Phase 0).
         return (
             f"<step n={n!r} type='use_skill' skill={_esc(s.skill)!r}>\n"
-            f"  <skill_instructions>{_esc(s.body)}</skill_instructions>\n"
+            f"  <skill_instructions>\n{_esc(s.body)}\n  </skill_instructions>\n"
             f"</step>"
         )
 
@@ -595,31 +590,6 @@ def _render_memory_results(results) -> str:
     return "\n".join(items)
 
 
-def _render_precedent_results(results) -> str:
-    """Render a recall_precedents round's results as ``<precedent>`` children.
-
-    Same provenance/freshness attributes as a recalled fact (ADR-0048 A1), led by the
-    ``outcome`` the kernel stamps on each transition — the one field that decides how
-    the agent should read the precedent (the lane is failure-weighted, so the negative
-    ones arrive first and must be legible as such).
-
-    An empty result is a REAL answer on this lane — "no comparable prior situation" —
-    and is rendered as such (ADR-0049 Issue 014: similarity-gated, never a fabricated
-    analogy), so the model does not read a blank block as licence to invent one."""
-    if not results:
-        return ("  <note>no precedent found — no comparable prior situation is on "
-                "record; proceed on your own judgment</note>")
-    items = []
-    for r in results:
-        text = r.get("text", r) if isinstance(r, dict) else getattr(r, "text", r)
-        outcome = str(_memory_meta(r).get("outcome", "") or "")
-        attrs = memory_provenance_attrs(r)
-        if outcome:
-            attrs = f"outcome={_esc(outcome)!r} " + attrs
-        items.append(f"  <precedent {attrs}>{_esc(text)}</precedent>")
-    return "\n".join(items)
-
-
 def action_text(tool: str, args: Any) -> str:
     """Canonical string form of an action (tool + sorted args) — the unit the
     recurrence gate (D4) hashes and embeds to detect re-issued failing calls."""
@@ -736,6 +706,32 @@ class WorkingMemory:
                 return
         self._entries.append(TextEntry(content, vec=vec))
 
+    def add_skill(self, name: str, body: str, note: str = "") -> None:
+        """Append a loaded skill as a PINNED instruction entry (ADR-0139 D3, ADR-0046 D3).
+
+        Deliberately NOT :meth:`add_text`. A skill body over ``text_inline_cap`` went
+        through the R7 offloader there and reached the model as a 240-char head plus
+        a cid: a procedure cut off after its first step, with the grant note at the
+        end cut off too, so the model was never told it held the skill's tools. The
+        entry was also an ordinary rankable one, so ~4 tool calls later the cosine
+        ranking evicted it: "loaded for the rest of the run" held for four rounds.
+
+        A skill is an instruction, not evidence. It is stored verbatim, never
+        offloaded, never evicted and never deduplicated, and it does not count
+        against the trajectory's entry cap. The caller (``run_think``) owns the
+        total skill budget and refuses an overflowing load rather than truncating.
+
+        ``note`` (the "loaded; its tools ... are available" line) is its own pinned
+        entry, so the grant can never be lost with, or because of, the body.
+        """
+        self._entries.append(Step(kind="use_skill", n=self._next_n, skill=name,
+                                  body=(body or "").strip(), pinned=True))
+        self._next_n += 1
+        if note and note.strip():
+            self._entries.append(Step(kind="note", n=self._next_n, body=note.strip(),
+                                      pinned=True))
+            self._next_n += 1
+
     def add_reflection(self, text: str) -> None:
         """Append a verbal reflection (ADR-0052) as a PINNED working-memory entry.
 
@@ -819,7 +815,12 @@ class WorkingMemory:
         backward compat with code that still uses the old API).
         """
         n = len(self._entries)
-        if n <= self._cap:
+        # ADR-0139 D3: pinned Steps (loaded skills + their grant notes) are the
+        # INSTRUCTIONS region. They are always kept and do not consume the cap, which
+        # bounds evidence/history entries only; otherwise five loaded skills plus
+        # their notes would fill the whole window and starve the trajectory.
+        instr = {i for i, e in enumerate(self._entries) if isinstance(e, Step) and e.pinned}
+        if n - len(instr) <= self._cap:
             idxs = self._dedup(list(range(n)))
             return self._render(idxs, self._collapse_superseded(idxs), numbered)
 
@@ -830,18 +831,19 @@ class WorkingMemory:
             elif isinstance(e, TextEntry) and e.pinned:
                 pinned.add(i)  # ADR-0052: verbal reflections — never bounded out
 
-        rankable = [i for i in range(n) if i not in pinned]
+        rankable = [i for i in range(n) if i not in pinned and i not in instr]
         if intent_vec:
             rankable.sort(key=lambda i: _cosine(getattr(self._entries[i], "vec", None), intent_vec),
                           reverse=True)
         else:
             rankable.sort(reverse=True)  # recency fallback: most recent first
 
-        keep = set(pinned)
+        keep = set(pinned - instr)
         for i in rankable:
             if len(keep) >= self._cap:
                 break
             keep.add(i)
+        keep |= instr  # instructions region: outside the cap, never bounded out
         idxs = self._dedup(sorted(keep))
         return self._render(idxs, self._collapse_superseded(idxs), numbered)
 

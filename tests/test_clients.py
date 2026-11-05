@@ -184,18 +184,21 @@ def test_recall_entity_is_deprecated():
         mem.recall_entity("file:c:/repo/a.md")
 
 
-def test_recall_precedents_routes_precedent_lane():
-    """ADR-0049 Issue 014: recall_precedents is the world-model pull lane — it sends
-    x-lane=precedents so the kernel returns transitions, not facts."""
+def test_recall_precedents_is_a_deprecated_no_op():
+    """Precedents were removed 2026-11-05 (decisions/scenes-cancelled.md). The method
+    stays (published API surface), warns, and returns [] WITHOUT an RPC — a current
+    kernel would answer x-lane=precedents from the fact lane, i.e. facts mislabelled
+    as prior transitions."""
     stub = _FakeStub()
     mem = MemoryClient(stub=stub, agent_id="analyst")
 
-    mem.recall_precedents("about to deploy the service", session_token_id="sess-1")
+    with pytest.warns(DeprecationWarning, match="precedents were removed 2026-11-05"):
+        out = mem.recall_precedents("about to deploy the service", top_k=3,
+                                    timeout_ms=10, session_token_id="sess-1")
 
-    md = dict(stub.calls["QueryMemory_metadata"] or [])
-    assert md.get("x-lane") == "precedents"
-    assert md.get("x-agent-id") == "analyst"
-    assert md.get("x-session-id") == "sess-1"
+    assert out == []
+    assert "QueryMemory" not in stub.calls
+    assert "QueryMemory_metadata" not in stub.calls
 
 
 def test_recall_omits_session_id_when_absent():

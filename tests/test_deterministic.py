@@ -94,14 +94,20 @@ def test_no_reasoning_memory_or_tool_surface():
     assert not hasattr(e, "think")
 
 
-def test_static_bid_served_over_request_proposal_rpc():
+def test_deprecated_request_proposal_rpc_is_neutral():
+    """The RPC is deprecated (no kernel caller): it answers a neutral proposal and never
+    runs the agent's propose(), so it cannot attract work or crash the server."""
     from cambrian_agent_sdk._proto import cambrian_pb2
-    from cambrian_agent_sdk.runtime import TraitServicer
+    from cambrian_agent_sdk.runtime import DEPRECATED_PROPOSAL_RATIONALE, TraitServicer
 
-    servicer = TraitServicer(Echo(agent_id="echo"))
-    resp = servicer.RequestProposal(
-        cambrian_pb2.ProposalRequest(task_id="t", description="anything", confidence_hint=0.2),
-        None,
-    )
-    assert resp.confidence == 1.0
-    assert resp.estimated_latency_ms == 5
+    class Boom(Echo):
+        def propose(self, task=None):
+            raise RuntimeError("must not be called")
+
+    for agent in (Echo(agent_id="echo"), Boom(agent_id="boom")):
+        resp = TraitServicer(agent).RequestProposal(
+            cambrian_pb2.ProposalRequest(task_id="t", description="anything", confidence_hint=0.2),
+            None,
+        )
+        assert resp.confidence == 0.0
+        assert resp.rationale == DEPRECATED_PROPOSAL_RATIONALE

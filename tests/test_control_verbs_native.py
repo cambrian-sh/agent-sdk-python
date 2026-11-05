@@ -40,7 +40,7 @@ def test_a_structured_answer_survives():
 def test_every_advertised_verb_is_recognised():
     # Whatever the protocol advertises, the loop must accept. A verb described in
     # the prompt and refused at dispatch is the exact shape of this bug.
-    for verb in ("memory_query", "recall_precedents", "find_tools", "describe_tool",
+    for verb in ("memory_query", "find_tools", "describe_tool",
                  "use_skill", "find_skills", "yield_subgoal", "resolve_cid"):
         act = action_from_native_turn("", _call(verb, {}), "tool_use", {})
         assert act["action"] == verb, f"{verb} was not recognised: {act}"

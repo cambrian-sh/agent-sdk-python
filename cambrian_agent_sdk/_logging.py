@@ -17,6 +17,26 @@ from contextvars import ContextVar
 _task_id_var: ContextVar[str] = ContextVar("task_id", default="")
 _agent_id_var: ContextVar[str] = ContextVar("agent_id", default="")
 
+# Attributes every LogRecord carries; anything else on a record came from
+# ``extra={...}`` and is forwarded as a structured field. Without this the SDK's
+# structured lines (react_llm_request, react_llm_usage, ...) reached the kernel log
+# with their data silently dropped (T-20261105-sdk-react-llm-request-react-llm-usage-evidence).
+_STD_ATTRS = frozenset(vars(logging.LogRecord("", 0, "", 0, "", None, None))) | {"message", "asctime"}
+_RESERVED = frozenset({"time", "level", "msg", "logger", "task_id", "agent_id"})
+
+
+def _json_safe(v, depth: int = 0):
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    if depth >= 4:
+        return str(v)[:500]
+    if isinstance(v, dict):
+        return {str(k): _json_safe(x, depth + 1) for k, x in list(v.items())[:100]}
+    if isinstance(v, (list, tuple, set, frozenset)):
+        return [_json_safe(x, depth + 1) for x in list(v)[:100]]
+    return str(v)[:500]
+
+
 _LEVEL_MAP = {
     logging.DEBUG: "debug",
     logging.INFO: "info",
@@ -42,7 +62,15 @@ class SlogHandler(logging.Handler):
             entry["task_id"] = task_id
         if agent_id:
             entry["agent_id"] = agent_id
-        sys.stdout.write(json.dumps(entry) + "\n")
+        for k, v in record.__dict__.items():
+            if k in _STD_ATTRS or k.startswith("_"):
+                continue
+            entry["x_" + k if k in _RESERVED else k] = _json_safe(v)
+        try:
+            line = json.dumps(entry)
+        except (TypeError, ValueError):  # never let a log line crash the agent
+            line = json.dumps({key: entry[key] for key in ("time", "level", "msg", "logger") if key in entry})
+        sys.stdout.write(line + "\n")
         sys.stdout.flush()
 
 

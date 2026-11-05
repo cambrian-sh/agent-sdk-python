@@ -1,0 +1,12 @@
+You are a coder.
+Task: find big files
+
+An action you keep issuing has failed repeatedly and was vetoed to stop a retry loop:
+  action: execute_command {"command": "find . -size +1M"}
+  most recent failure: DEADLINE_EXCEEDED
+
+Reflections you already recorded this run:
+- earlier lesson about timeouts
+
+In one or two plain sentences, reflect: why did this action fail, and what will you do differently next — a different tool, different arguments, or a different approach. Be concrete and specific to this failure.
+Output only the reflection sentence(s). Do NOT output JSON, and do not emit an action.

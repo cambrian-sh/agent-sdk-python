@@ -92,8 +92,21 @@ class CognitiveAgent(Agent):
 
     #: Generation parameters passed to substrate.generate() inside the ReAct loop.
     #: Override on the subclass to control creativity and length.
-    max_tokens: int = 1024
+    #:
+    #: ``max_tokens = None`` means "use run_think's default" (4096). It was a literal
+    #: 1024 here, which SHADOWED that default for every agent that goes through
+    #: think(): run_think raised 1024 -> 4096 because 1024 cut substantive outputs
+    #: (a tool call whose content arg is a multi-KB file) mid-emit, and that fix never
+    #: reached any CognitiveAgent. One default, one place (ADR-0139 Phase 0). Set an
+    #: int on the subclass to cap a deliberately short-answer agent.
+    max_tokens: Optional[int] = None
     temperature: float = 0.7
+
+    #: Lifetime of the cached system prompt in think() (ADR-0139 D1): ``"short"``
+    #: (5 min) suits machine-paced runs and is the default; ``"long"`` (1 h) suits
+    #: an agent serving a human-paced session. ``None`` defers to the
+    #: ``CAMBRIAN_AGENT_CACHE_TTL`` environment variable, then ``"short"``.
+    cache_ttl: Optional[str] = None
 
     #: Whether think() performs a mandatory initial LTM recall each run (the
     #: agent-initiated retrieval loop). On by default for every cognitive agent.
@@ -148,6 +161,9 @@ class CognitiveAgent(Agent):
             max_memory_queries = _DEFAULT_MAX_MEMORY_QUERIES
         if max_tool_rounds is None:
             max_tool_rounds = _DEFAULT_MAX_TOOL_ROUNDS
+        # max_tokens=None: omit it so run_think's own default applies (see the
+        # class attribute's comment).
+        gen_kwargs = {} if self.max_tokens is None else {"max_tokens": self.max_tokens}
 
         return run_think(
             self,
@@ -159,8 +175,8 @@ class CognitiveAgent(Agent):
             seed_recall=self.seed_recall,
             max_memory_queries=max_memory_queries,
             max_tool_rounds=max_tool_rounds,
-            max_tokens=self.max_tokens,
             temperature=self.temperature,
+            **gen_kwargs,
         )
 
     def _bind_clients(self, stub) -> None:
