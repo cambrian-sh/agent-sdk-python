@@ -55,6 +55,7 @@ from .ingress import IngressAgent, PermanentDeliveryError
 from .http_chat_ingress import HTTPChatIngress
 from .tools import tool, capability, ToolRegistry, ToolSpec
 from .react import ReActLoopError
+from .context_engine import ContextConfig, ContextEngine, DefaultContextEngine
 from .clients import (
     _lease_metadata,
     ArtifactManager,
@@ -103,6 +104,9 @@ __all__ = [
     "ToolRegistry",
     "ToolSpec",
     "ReActLoopError",
+    "ContextConfig",
+    "ContextEngine",
+    "DefaultContextEngine",
     "MemoryClient",
     "ArtifactManager",
     "WorkingMemory",
@@ -777,7 +781,7 @@ class SubstrateClient:
     def list_skills(
         self, query: str = "", k: int = 0,
         names: Optional[List[str]] = None, full: bool = False,
-        session_token_id: str = "",
+        session_token_id: str = "", rationale: str = "", discover: bool = False,
     ) -> List[Dict]:
         """Return the system skills this agent may load (ADR-0046), for the agent's
         [skills] menu section. The kernel resolves grants/scope from x-agent-id and
@@ -788,6 +792,16 @@ class SubstrateClient:
         path) to fetch Tier-2 (full instructions + bundled tool grants) for the
         named skills. query/k/names/full ride x-skill-* metadata (mirroring tools).
         Agent-local skills are NOT served here — they live in the SDK.
+
+        Per-agent skill access (decisions/skill-access-grants.md): each dict carries
+        ``access`` — "profile"/"granted" (in the agent's set), "requestable" (found,
+        outside it), "pending"/"denied" (a use_skill request an operator did not grant
+        in time / refused; no body) or "" (the kernel does not bound this agent) — and
+        ``access_detail``. A full load of a requestable skill makes the kernel ask an
+        operator and wait (up to execution.skills.access_request_timeout_seconds);
+        ``rationale`` rides x-skill-rationale to that operator.
+        ``discover`` is accepted for the profile proxy's signature; the kernel's query
+        path is already discovery, so it changes nothing here.
         """
         self._ensure()
         from ._proto import cambrian_pb2
@@ -803,6 +817,8 @@ class SubstrateClient:
             md.append(("x-skill-full", "true"))
         if session_token_id:
             md.append(("x-session-token", session_token_id))  # ADR-0046 D6: run key for grant activation
+        if rationale:
+            md.append(("x-skill-rationale", _header_safe(rationale)))
         try:
             resp = self._stub.ListSkills(cambrian_pb2.ListSkillsRequest(), metadata=md)
         except Exception:  # noqa: BLE001 — degrade to an empty menu, never crash
@@ -813,6 +829,8 @@ class SubstrateClient:
                 "description": sk.description,
                 "instructions": sk.instructions,
                 "tool_grants": list(sk.tool_grants),
+                "access": sk.access,
+                "access_detail": sk.access_detail,
             }
             for sk in resp.skills
         ]
@@ -840,6 +858,295 @@ class SubstrateClient:
         timeout = (timeout_ms / 1000.0) if timeout_ms and timeout_ms > 0 else None
         resp = self._stub.Execute(req, timeout=timeout)
         return resp.payload.data.decode("utf-8", errors="replace")
+
+    # ── ADR-0139 D12 / D14 agent-plane verbs ────────────────────────────────────
+    #
+    # All three put the lease in the request's lease_id AND in x-lease-id metadata,
+    # and the caller identity in x-agent-id. UNIMPLEMENTED (a kernel without the
+    # surface) returns None: "this deployment has no such surface", never a failed
+    # call to retry (cambrian.proto). Any other RPC error is returned as data
+    # ({"error": ..., "code": ...}) so the reasoning loop can show it to the model.
+
+    def _lease_md(self, lease: str):
+        md = [("x-agent-id", self._agent_id)] if self._agent_id else []
+        if lease:
+            md.append(("x-lease-id", lease))
+        return md
+
+    @staticmethod
+    def _rpc_failure(exc) -> Optional[Dict]:
+        """None for UNIMPLEMENTED; an error dict for any other gRPC failure."""
+        code = getattr(exc, "code", None)
+        code = code() if callable(code) else None
+        name = getattr(code, "name", "") or ""
+        if name == "UNIMPLEMENTED":
+            return None
+        details = getattr(exc, "details", None)
+        detail = details() if callable(details) else str(exc)
+        return {"error": detail or str(exc), "code": name or "UNKNOWN"}
+
+    def spawn_subagent(
+        self,
+        session_token_id: str,
+        objective: str,
+        *,
+        mode: str = "isolated",
+        toolset: Optional[List[str]] = None,
+        target_agent_id: str = "",
+        target_capability: str = "",
+        output_schema=None,
+        context_summary: str = "",
+        context_refs: Optional[List[Dict]] = None,
+        max_tool_rounds: int = 0,
+        timeout_ms: int = 0,
+        token_budget: int = 0,
+        client_spawn_id: str = "",
+    ) -> Optional[Dict]:
+        """Run one in-agent subagent and wait for its result (ADR-0139 D12).
+
+        The kernel enforces everything: ``toolset`` must be a subset of this agent's
+        tools (an entry outside it ends the spawn DENIED), depth and concurrency are
+        derived server-side, and the child's spend counts against this run's root
+        lease. ``mode`` is ``"isolated"`` (objective only) or ``"fork"`` (plus
+        ``context_summary`` / ``context_refs``). ``output_schema`` is a JSON-Schema
+        dict/str (or a :class:`ResponseSchema`).
+
+        Returns a dict (``status``, ``exit_reason``, ``text``, ``structured_json``,
+        ``truncated``, ``artifacts``, ``usage``, ``child_run_id``, ``detail``,
+        ``tool_rounds``; enum values lower-case without prefix, e.g. ``"done"`` /
+        ``"completed"``), an ``{"error", "code"}`` dict for a request the kernel
+        refused (INVALID_ARGUMENT, PERMISSION_DENIED), or None when the kernel does
+        not serve subagents.
+        """
+        self._ensure()
+        from ._proto import cambrian_pb2
+        from .llm import coerce_response_schema
+
+        req = cambrian_pb2.SpawnSubagentRequest(
+            lease_id=session_token_id,
+            mode=(cambrian_pb2.SUBAGENT_MODE_FORK if str(mode).lower() == "fork"
+                  else cambrian_pb2.SUBAGENT_MODE_ISOLATED),
+            objective=objective or "",
+            toolset=[str(t) for t in (toolset or [])],
+            target_agent_id=target_agent_id or "",
+            target_capability=target_capability or "",
+            context_summary=context_summary or "",
+            max_tool_rounds=int(max_tool_rounds or 0),
+            timeout_ms=int(timeout_ms or 0),
+            token_budget=int(token_budget or 0),
+            client_spawn_id=client_spawn_id or "",
+        )
+        if output_schema:
+            # A bare JSON Schema (dict or string) is the common case; the
+            # {"name", "schema", "strict"} wrapper and ResponseSchema also work.
+            if isinstance(output_schema, str):
+                output_schema = {"name": "subagent_output", "schema": output_schema}
+            elif isinstance(output_schema, dict) and not ("schema" in output_schema
+                                                          or "schema_json" in output_schema):
+                output_schema = {"name": "subagent_output", "schema": output_schema}
+            rs = coerce_response_schema(output_schema)
+            req.output_schema.CopyFrom(cambrian_pb2.ResponseSchema(
+                name=rs.name, schema_json=rs.schema_json, strict=bool(rs.strict)))
+        for ref in context_refs or []:
+            if isinstance(ref, str):
+                ref = {"cid": ref}
+            req.context_refs.add(cid=str(ref.get("cid", "")), type=str(ref.get("type", "") or ""),
+                                 snippet=str(ref.get("snippet", "") or ""))
+        try:
+            resp = self._stub.SpawnSubagent(req, metadata=self._lease_md(session_token_id))
+        except Exception as exc:  # noqa: BLE001 — a refusal is data for the loop
+            return self._rpc_failure(exc)
+
+        def _enum(name: str, prefix: str) -> str:
+            return name[len(prefix):].lower() if name.startswith(prefix) else name.lower()
+
+        u = resp.usage
+        return {
+            "status": _enum(cambrian_pb2.SubagentStatus.Name(resp.status), "SUBAGENT_STATUS_"),
+            "exit_reason": _enum(cambrian_pb2.SubagentExitReason.Name(resp.exit_reason),
+                                 "SUBAGENT_EXIT_REASON_"),
+            "text": resp.text,
+            "structured_json": resp.structured_json,
+            "truncated": resp.truncated,
+            "artifacts": list(resp.artifacts),
+            "usage": {"input_tokens": u.input_tokens, "output_tokens": u.output_tokens,
+                      "cache_read_tokens": u.cache_read_tokens, "estimated": u.estimated},
+            "child_run_id": resp.child_run_id,
+            "detail": resp.detail,
+            "tool_rounds": resp.tool_rounds,
+        }
+
+    def get_memory_notes(self, session_token_id: str = "") -> Optional[Dict]:
+        """The run principal's FROZEN run-start memory notes (ADR-0139 D14 / D3).
+
+        Returns ``{"version", "snapshot_at", "documents": [...]}`` with each document
+        ``{scope, owner_id, content, size_chars, budget_chars, etag, truncated,
+        updated_at}`` (``scope`` is ``"personal"`` / ``"org"``), PERSONAL first. None
+        when the kernel does not serve notes (UNIMPLEMENTED); an error dict for any
+        other refusal (e.g. PERMISSION_DENIED for a foreign lease).
+        """
+        self._ensure()
+        from ._proto import cambrian_pb2
+
+        try:
+            snap = self._stub.GetMemoryNotes(
+                cambrian_pb2.GetMemoryNotesRequest(lease_id=session_token_id),
+                metadata=self._lease_md(session_token_id))
+        except Exception as exc:  # noqa: BLE001 — notes are optional
+            return self._rpc_failure(exc)
+
+        def _ts(t) -> str:
+            try:
+                return t.ToDatetime().isoformat() + "Z" if (t.seconds or t.nanos) else ""
+            except Exception:  # noqa: BLE001
+                return ""
+
+        docs = []
+        for d in snap.documents:
+            name = cambrian_pb2.MemoryNotesScope.Name(d.scope)
+            docs.append({
+                "scope": name.replace("MEMORY_NOTES_SCOPE_", "").lower(),
+                "owner_id": d.owner_id,
+                "content": d.content,
+                "size_chars": d.size_chars,
+                "budget_chars": d.budget_chars,
+                "etag": d.etag,
+                "truncated": d.truncated,
+                "updated_at": _ts(d.updated_at),
+            })
+        docs.sort(key=lambda d: 0 if d["scope"] == "personal" else 1)
+        return {"version": snap.version, "snapshot_at": _ts(snap.snapshot_at), "documents": docs}
+
+    def propose_memory_note(
+        self,
+        session_token_id: str,
+        *,
+        scope: str = "personal",
+        op: str = "append",
+        section: str = "",
+        content: str = "",
+        reason: str = "",
+        if_match: str = "",
+    ) -> Optional[Dict]:
+        """Propose one write to the principal's memory notes (ADR-0139 D14).
+
+        ``scope`` is ``personal`` | ``org``; ``op`` is ``append`` | ``replace_section``
+        | ``remove_section``. A refused write is an OK reply with ``accepted=False``,
+        a ``rejection`` (``over_budget``, ``injection_flagged``, ``scope_denied``,
+        ``conflict``, ``section_not_found``) and a ``detail``: data for the model,
+        not an exception. The write is durable at once but reaches the prompt only
+        next run (the snapshot is frozen). None when the kernel does not serve notes.
+        """
+        self._ensure()
+        from ._proto import cambrian_pb2
+
+        scope_v = {"personal": cambrian_pb2.MEMORY_NOTES_SCOPE_PERSONAL,
+                   "org": cambrian_pb2.MEMORY_NOTES_SCOPE_ORG}.get(
+            str(scope).lower(), cambrian_pb2.MEMORY_NOTES_SCOPE_UNSPECIFIED)
+        op_v = {"append": cambrian_pb2.MEMORY_NOTE_OP_APPEND,
+                "replace_section": cambrian_pb2.MEMORY_NOTE_OP_REPLACE_SECTION,
+                "remove_section": cambrian_pb2.MEMORY_NOTE_OP_REMOVE_SECTION}.get(
+            str(op).lower(), cambrian_pb2.MEMORY_NOTE_OP_UNSPECIFIED)
+        req = cambrian_pb2.ProposeMemoryNoteRequest(
+            lease_id=session_token_id, scope=scope_v, op=op_v, section=section or "",
+            content=content or "", if_match=if_match or "", reason=reason or "")
+        try:
+            resp = self._stub.ProposeMemoryNote(req, metadata=self._lease_md(session_token_id))
+        except Exception as exc:  # noqa: BLE001 — a refusal is data for the loop
+            return self._rpc_failure(exc)
+        return self._note_reply(cambrian_pb2, resp)
+
+    def propose_skill(
+        self,
+        session_token_id: str,
+        *,
+        name: str,
+        skill_md: str,
+        rationale: str = "",
+        evidence_cids: Optional[List[str]] = None,
+        base_version: str = "",
+    ) -> Optional[Dict]:
+        """Propose a new skill, or a new version of one (ADR-0139 D13).
+
+        ``name`` must equal the SKILL.md frontmatter ``name``; ``base_version`` is ""
+        for a new skill, else the version being revised. The proposal enters the
+        operator's staged approval queue and is NEVER active until approved. A
+        refusal is an OK reply ``{"accepted": False, "rejection", "detail"}``
+        (``invalid_format``, ``name_taken``, ``locked``, ``scan_dangerous``,
+        ``quota``, ``denied``), data for the model; None when the kernel does not
+        serve skill proposals (UNIMPLEMENTED).
+        """
+        self._ensure()
+        from ._proto import cambrian_pb2
+
+        req = cambrian_pb2.ProposeSkillRequest(
+            lease_id=session_token_id, name=name or "", skill_md=skill_md or "",
+            rationale=rationale or "", evidence_cids=[str(c) for c in (evidence_cids or [])],
+            base_version=base_version or "")
+        try:
+            resp = self._stub.ProposeSkill(req, metadata=self._lease_md(session_token_id))
+        except Exception as exc:  # noqa: BLE001 — a refusal is data for the loop
+            return self._rpc_failure(exc)
+        rej = cambrian_pb2.SkillProposalRejection.Name(resp.rejection)
+        return {
+            "accepted": resp.accepted,
+            "proposal_id": resp.proposal_id,
+            "rejection": ("" if resp.accepted or rej.endswith("UNSPECIFIED")
+                          else rej.replace("SKILL_PROPOSAL_REJECTION_", "").lower()),
+            "detail": resp.detail,
+        }
+
+    # ── Live step output (ADR-0139 amendment 2026-11-06) ─────────────────────
+    #
+    # For an agent that calls its OWN model (an external adapter: Claude Code / the
+    # Claude Agent SDK as a worker, LangGraph, a custom agent). A model call through
+    # the gateway (generate_with_tools / generate_stream) is forwarded by the kernel
+    # itself; such an agent must not also push. See step_output.py for the rules and
+    # an example adapter.
+
+    def _step_output_seqs(self):
+        with self._lock:
+            seqs = getattr(self, "_seqs", None)
+            if seqs is None:
+                from .step_output import _SeqCounter
+                seqs = self._seqs = _SeqCounter()
+            return seqs
+
+    def step_output(self, session_token_id: str, timeout_ms: int = 0):
+        """A :class:`~cambrian_agent_sdk.step_output.StepOutputWriter` for the step:
+        ``with substrate.step_output(lease) as out: out.text(token)``. Leaving the
+        block sends the final marker. Failures are recorded on the writer
+        (``.error``), never raised — live output never fails the step."""
+        self._ensure()
+        from .step_output import StepOutputWriter
+        return StepOutputWriter(self._stub, self._lease_md(session_token_id), session_token_id,
+                                self._step_output_seqs(), timeout_ms=timeout_ms)
+
+    def emit_step_output(self, session_token_id: str, chunks, *, final: bool = False,
+                         timeout_ms: int = 0) -> Optional[Dict]:
+        """Push live output for the step as one stream. ``chunks`` are strings (text)
+        or dicts ``{"data", "kind": "text"|"progress"|"status", "final", "seq"}``;
+        ``final=True`` appends the final marker. Returns the kernel's ack
+        (``accepted``, ``duplicates``, ``over_cap``, ``after_final``, ``last_seq``),
+        None when the kernel does not serve the RPC, or an error dict."""
+        self._ensure()
+        from .step_output import emit_step_output
+        return emit_step_output(self._stub, self._lease_md(session_token_id),
+                                self._step_output_seqs(), session_token_id, chunks,
+                                final=final, timeout_ms=timeout_ms)
+
+    @staticmethod
+    def _note_reply(cambrian_pb2, resp) -> Dict:
+        rej = cambrian_pb2.MemoryNoteRejection.Name(resp.rejection)
+        return {
+            "accepted": resp.accepted,
+            "rejection": ("" if resp.accepted or rej.endswith("UNSPECIFIED")
+                          else rej.replace("MEMORY_NOTE_REJECTION_", "").lower()),
+            "detail": resp.detail,
+            "etag": resp.etag,
+            "size_chars": resp.size_chars,
+            "budget_chars": resp.budget_chars,
+        }
 
 # ── assemble_context ─────────────────────────────────────────────────────────
 

@@ -92,13 +92,18 @@ MODEL_ROLES = ("planner", "verifier", "router", "memory", "facts")
 
 _FIELDS = {
     "name", "description", "capabilities", "skills", "tools", "model", "trust_tier",
-    "max_tool_rounds", "max_tokens", "role", "version",
+    "max_tool_rounds", "max_tokens", "role", "version", "examples", "streams_output",
 }
 _REQUIRED = ("name", "description", "capabilities", "skills", "tools", "trust_tier", "role")
 
 _NAME = re.compile(r"^[a-z][a-z0-9_-]{0,62}$")
 _CAPABILITY = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 _SKILL_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+# Example tasks (ADR-0139 C2: "3-5 example tasks"): optional; when set, 1.._MAX_EXAMPLES
+# unique non-blank strings of at most _MAX_EXAMPLE_CHARS characters. The kernel
+# publishes them on the agent's A2A card (cambrian-core internal/agentcard).
+_MAX_EXAMPLES = 5
+_MAX_EXAMPLE_CHARS = 300
 _VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 _GENERATOR_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 # mcp:<server id>/<tool glob>. The server id is literal: an allowlist names the servers
@@ -244,6 +249,11 @@ class Profile:
     max_tool_rounds: Optional[int] = None
     max_tokens: Optional[int] = None
     version: str = "1.0.0"
+    examples: Tuple[str, ...] = ()
+    #: ADR-0139 amendment 2026-11-06: the agent pushes its own live step output
+    #: (``SubstrateClient.emit_step_output``), so the kernel forwards no gateway
+    #: deltas for its steps — one step never streams twice.
+    streams_output: bool = False
     path: Optional[Path] = None
     warnings: Tuple[str, ...] = field(default=(), compare=False)
 
@@ -276,6 +286,10 @@ class Profile:
         }
         if self.model:
             m["model"] = self.model
+        if self.examples:
+            m["examples"] = list(self.examples)
+        if self.streams_output:
+            m["streams_output"] = True
         return m
 
 
@@ -302,6 +316,18 @@ def _int_field(data: Mapping[str, Any], key: str, bounds: Tuple[int, int], where
     if not isinstance(v, int) or isinstance(v, bool) or not bounds[0] <= v <= bounds[1]:
         raise InvalidProfile(f"{where}: {key!r} must be an integer in [{bounds[0]}, {bounds[1]}]")
     return v
+
+
+def _bool_field(data: Mapping[str, Any], key: str, where: str) -> bool:
+    """An optional boolean. The frontmatter subset has no boolean scalar (an unquoted
+    ``true`` is the string "true"), so exactly "true" / "false"; absent, null or blank
+    is False. The Go port is agentprofile.boolField."""
+    v = data.get(key)
+    if v is None or v == "":
+        return False
+    if isinstance(v, str) and v.strip() in ("true", "false"):
+        return v.strip() == "true"
+    raise InvalidProfile(f"{where}: {key!r} must be true or false (got {v!r})")
 
 
 def parse_profile(
@@ -388,6 +414,22 @@ def parse_profile(
         if not _VERSION.match(version):
             raise InvalidProfile(f"{where}: version {version!r} must be MAJOR.MINOR.PATCH")
 
+    examples: List[str] = []
+    if data.get("examples") not in (None, "", []):
+        raw_examples = _list_field(data, "examples", where)
+        if len(raw_examples) > _MAX_EXAMPLES:
+            raise InvalidProfile(f"{where}: 'examples' has {len(raw_examples)} entries; "
+                                 f"at most {_MAX_EXAMPLES}")
+        for e in raw_examples:
+            if not isinstance(e, str) or not e.strip():
+                raise InvalidProfile(f"{where}: example {e!r} must be a non-empty string")
+            if len(e.strip()) > _MAX_EXAMPLE_CHARS:
+                raise InvalidProfile(f"{where}: example {e.strip()!r} is longer than "
+                                     f"{_MAX_EXAMPLE_CHARS} characters")
+            examples.append(e.strip())
+
+    streams_output = _bool_field(data, "streams_output", where)
+
     max_tool_rounds = _int_field(data, "max_tool_rounds", _MAX_TOOL_ROUNDS, where)
     max_tokens = _int_field(data, "max_tokens", _MAX_TOKENS, where)
 
@@ -408,7 +450,8 @@ def parse_profile(
         name=name, description=description, capabilities=tuple(capabilities),
         skills=tuple(skills), tools=tuple(tools), trust_tier=trust_tier, role=role,
         model=model, max_tool_rounds=max_tool_rounds, max_tokens=max_tokens,
-        version=version, path=path, warnings=tuple(warnings),
+        version=version, examples=tuple(examples), streams_output=streams_output,
+        path=path, warnings=tuple(warnings),
     )
 
 
@@ -453,10 +496,16 @@ class ProfileScopedSubstrate:
 
     - ``list_tools``: only allowlisted tools come back (menu, ``find_tools``,
       ``describe_tool`` and the skill-grant lookup all read through it).
-    - ``list_skills``: the menu is exactly the profile's skills (Tier-1, by name), and a
-      ``use_skill`` load of any other skill comes back empty; a loaded skill's
-      ``tool_grants`` are clipped to the allowlist so the loop never offers a tool the
-      profile does not allow.
+    - ``list_skills``: the menu is the agent's EFFECTIVE skill set — the profile's
+      skills plus the skills an operator granted this agent (decisions/
+      skill-access-grants.md). The kernel enforces that set and marks every skill it
+      serves with ``access``; this proxy keeps what the kernel marked, and against an
+      older kernel that marks nothing it falls back to the profile's skills alone. A
+      ``use_skill`` load of a skill outside the set is passed to the kernel, which asks
+      an operator and answers granted (body), pending or denied (no body).
+      ``discover=True`` (find_skills) also keeps skills the kernel marks
+      ``requestable``. A loaded skill's ``tool_grants`` are clipped to the allowlist so
+      the loop never offers a tool the profile does not allow.
     - ``execute_tool``: a call outside the allowlist is refused locally with a
       ``denied`` response the loop already understands.
 
@@ -498,30 +547,56 @@ class ProfileScopedSubstrate:
                 return []
         return self._keep(self._inner.list_tools(*args, **kwargs))
 
+    #: Kernel access values (cambrian.proto SkillDescriptor.access). In the set:
+    #: served with a body on use_skill. The rest carry no body and are passed through
+    #: so the loop can tell the model why.
+    _IN_SET = ("profile", "granted")
+    _OUTSIDE = ("requestable", "pending", "denied")
+
     def list_skills(self, query: str = "", k: int = 0, names: Optional[List[str]] = None,
-                    full: bool = False, session_token_id: str = "") -> List[Dict]:
+                    full: bool = False, session_token_id: str = "", rationale: str = "",
+                    discover: bool = False) -> List[Dict]:
         if not hasattr(self._inner, "list_skills"):
             return []
         own = list(self._profile.skills)
-        wanted = [n for n in (names or own) if n in own]
-        if not wanted:
-            return []
-        kwargs: Dict[str, Any] = {"names": wanted, "full": full}
+        kwargs: Dict[str, Any] = {"full": full}
+        if names:
+            kwargs["names"] = list(names)
+        elif discover and query:
+            kwargs["query"] = query
+            if k:
+                kwargs["k"] = k
+        # else: the menu — the kernel's full listing, which a bounding kernel limits to
+        # the effective set (and an older one does not, so the filter below keeps own).
         if session_token_id:
             kwargs["session_token_id"] = session_token_id
-        try:
-            specs = self._inner.list_skills(**kwargs)
-        except TypeError:  # a substrate (or fake) without the lease kwarg
-            kwargs.pop("session_token_id", None)
-            specs = self._inner.list_skills(**kwargs)
+        if rationale:
+            kwargs["rationale"] = rationale
+        specs = None
+        while True:
+            try:
+                specs = self._inner.list_skills(**kwargs)
+                break
+            except TypeError:  # a substrate (or fake) without an optional kwarg
+                for opt in ("rationale", "session_token_id"):
+                    if opt in kwargs:
+                        kwargs.pop(opt)
+                        break
+                else:
+                    raise
+        keep = self._IN_SET + (self._OUTSIDE if (names or discover) else ())
         out = []
         for s in specs or []:
-            if s.get("name") not in own:
-                continue
+            access = s.get("access") or ""
+            if access:
+                if access not in keep:
+                    continue
+            elif s.get("name") not in own:
+                continue  # an unmarked skill (older kernel): the profile's list bounds it
             if s.get("tool_grants"):
                 s = dict(s, tool_grants=self._allow.filter(s["tool_grants"]))
             out.append(s)
-        if not names:
+        if not names and not discover:
             served = {s.get("name") for s in out}
             unserved = [n for n in own if n not in served]
             if unserved:

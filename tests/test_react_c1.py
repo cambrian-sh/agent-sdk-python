@@ -106,7 +106,10 @@ def test_wire_system_is_stable_and_cached_and_notices_go_to_messages():
     for r in stub.stream_reqs:
         assert r.cache_ttl == pb.CACHE_TTL_SHORT
         assert [m.role for m in r.messages] == ["user"]
-        assert r.messages[0].content.startswith("<Task>")
+        # ADR-0139 D2/D3: the task comes LAST, after the data regions (only the
+        # per-turn notes follow it).
+        assert "<Task>" in r.messages[0].content
+        assert r.messages[0].content.index("<Task>") > r.messages[0].content.find("<Trajectory>")
         assert r.options.HasField("temperature") and r.options.HasField("max_tokens")
         assert "<Task>" not in r.system[0].text and "<Trajectory>" not in r.system[0].text
     # The budget notice reaches the model in the user turn, never the system tier.
@@ -163,7 +166,7 @@ def test_native_path_sends_identical_system_every_turn_and_honours_cache_ttl():
     bot = LongBot(agent_id="b")
     bot.substrate = _NativeDouble([("", [_ECHO], "tool_use"),
                                    ("", [dict(_ECHO, id="c2", arguments='{"text":"x"}')], "tool_use"),
-                                   ("done", [], "end_turn")])
+                                   ("", [{"id": "fa", "name": "final_answer", "arguments": '{"answer": "done"}'}], "tool_use")])
     res = _run(bot)
     assert res.data.decode() == "done"
     calls = bot.substrate.calls
@@ -178,7 +181,7 @@ def test_native_path_sends_identical_system_every_turn_and_honours_cache_ttl():
 
 def test_native_system_ignored_is_folded_into_the_first_turn():
     bot = Bot(agent_id="b")
-    bot.substrate = _NativeDouble([("discarded", [], "end_turn"), ("done", [], "end_turn")],
+    bot.substrate = _NativeDouble([("discarded", [], "end_turn"), ("", [{"id": "fa", "name": "final_answer", "arguments": '{"answer": "done"}'}], "tool_use")],
                                   ignored_first=True)
     res = _run(bot)
     assert res.data.decode() == "done"
@@ -196,7 +199,7 @@ def test_pre_c1_native_substrate_gets_the_system_in_the_first_turn():
         def generate_with_tools(self, session_token_id, messages, tools, max_tokens=1024,
                                 temperature=0.7, timeout_ms=0):
             self.convs.append([dict(m) for m in messages])
-            return "done", [], "end_turn"
+            return "", [{"id": "fa", "name": "final_answer", "arguments": '{"answer": "done"}'}], "tool_use"
 
     bot = Bot(agent_id="b")
     bot.substrate = OldSub()
@@ -224,7 +227,7 @@ def test_text_path_refusal_degrades_to_legacy_generate():
 
 def test_debug_log_names_prompt_versions_and_system_hash(caplog):
     bot = Bot(agent_id="b")
-    bot.substrate = _NativeDouble([("done", [], "end_turn")])
+    bot.substrate = _NativeDouble([("", [{"id": "fa", "name": "final_answer", "arguments": '{"answer": "done"}'}], "tool_use")])
     with caplog.at_level(logging.DEBUG, logger="cambrian.react"):
         _run(bot)
     recs = [r for r in caplog.records if r.getMessage() == "react_llm_request"]

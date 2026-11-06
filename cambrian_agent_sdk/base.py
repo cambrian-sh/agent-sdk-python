@@ -112,6 +112,16 @@ class CognitiveAgent(Agent):
     #: agent-initiated retrieval loop). On by default for every cognitive agent.
     seed_recall: bool = True
 
+    #: ADR-0139 D12 / D14 / D13 kernel-surface verbs, off for a plain CognitiveAgent
+    #: (an agent opts in): ``spawn_subagent`` (in-agent subagents), ``propose_memory_note``
+    #: (durable principal notes) and ``propose_skill`` (a skill proposal for operator
+    #: approval). Each is offered only when the substrate serves it; the kernel
+    #: enforces every limit whatever is offered. ``run_think``'s ``allow_*`` keywords
+    #: override these per call.
+    allow_subagents: bool = False
+    allow_memory_note_writes: bool = False
+    allow_skill_proposals: bool = False
+
     #: Opt-in heavy-result summarizer (ADR-0041 D3). A callable ``str -> str``
     #: applied to a tool result that exceeds the inline budget; ``None`` (default)
     #: keeps the no-LLM heuristic truncation. Set it to e.g. an LLM-backed callable

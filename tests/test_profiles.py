@@ -113,6 +113,17 @@ def test_manifest_keeps_allowlist_out_of_legacy_tools_key(skills):
     json.dumps(m)
 
 
+def test_streams_output_reaches_the_manifest(skills):
+    """ADR-0139 amendment 2026-11-06: an agent that pushes its own live output says
+    so, and the kernel then forwards no gateway deltas for it."""
+    assert parse_profile(_VALID, skills_dir=skills).streams_output is False
+    assert "streams_output" not in parse_profile(_VALID, skills_dir=skills).manifest()
+    p = parse_profile(_VALID + "streams_output: true\n", skills_dir=skills)
+    assert p.streams_output is True and p.manifest()["streams_output"] is True
+    with pytest.raises(InvalidProfile):
+        parse_profile(_VALID + "streams_output: yes\n", skills_dir=skills)
+
+
 # ── strictness ───────────────────────────────────────────────────────────────
 
 
@@ -264,11 +275,12 @@ def test_scoped_substrate(skills):
         "mcp:code-sandbox/execute_code", "mcp:filesystem/read_file"]
     assert sub.list_tools(names=["mcp:shell/shell_execute"]) == []
 
-    # The menu is the profile's skills by name, whatever the query.
+    # The menu is the kernel's full listing (no query, no names), and against a kernel
+    # that marks no access (an older one) it is bounded to the profile's skills.
     menu = sub.list_skills(query="anything", k=5)
     assert [s["name"] for s in menu] == ["report"]
-    assert inner.skill_calls[-1] == {"query": "", "names": ["report"], "full": False}
-    # A load of a skill outside the profile is refused; a load clips the grants.
+    assert inner.skill_calls[-1] == {"query": "", "names": None, "full": False}
+    # An unmarked load of a skill outside the profile is dropped; a load clips the grants.
     assert sub.list_skills(names=["other"], full=True) == []
     loaded = sub.list_skills(names=["report"], full=True, session_token_id="s")
     assert loaded[0]["tool_grants"] == ["mcp:filesystem/read_text_file"]  # shell clipped
@@ -293,3 +305,52 @@ def test_shipped_starter_profiles_validate():
     assert set(profs) >= {"assistant", "researcher", "data-analyst"}
     for p in profs.values():
         assert p.warnings == (), (p.name, p.warnings)
+
+
+# ── per-agent skill access (decisions/skill-access-grants.md) ─────────────────
+
+
+class _GrantingKernel(_Inner):
+    """A kernel that bounds the agent: profile skill "report", granted skill "granted-x",
+    "other" outside the set (requestable on discovery, pending on a load)."""
+
+    def __init__(self, load_answer="pending"):
+        super().__init__()
+        self.load_answer = load_answer
+        self.rationales = []
+
+    def list_skills(self, query="", k=0, names=None, full=False, session_token_id="",
+                    rationale=""):
+        self.skill_calls.append({"query": query, "names": names, "full": full})
+        self.rationales.append(rationale)
+        sets = {"report": "profile", "granted-x": "granted"}
+        if names:
+            out = []
+            for n in names:
+                acc = sets.get(n) or (self.load_answer if full else "requestable")
+                body = full and acc in ("profile", "granted")
+                out.append({"name": n, "description": n, "instructions": "BODY" if body else "",
+                            "tool_grants": [], "access": acc, "access_detail": "" if body else "why"})
+            return out
+        if query:
+            return [{"name": n, "description": n, "instructions": "", "tool_grants": [],
+                     "access": sets.get(n, "requestable")} for n in ("other", "report")]
+        return [{"name": n, "description": n, "instructions": "", "tool_grants": [], "access": a}
+                for n, a in sets.items()]
+
+
+def test_scoped_substrate_effective_set_from_kernel(skills):
+    prof = parse_profile(_VALID, skills_dir=skills)
+    kern = _GrantingKernel()
+    sub = ProfileScopedSubstrate(kern, prof)
+    # Menu = profile + grants, as the kernel marked them.
+    assert {s["name"]: s["access"] for s in sub.list_skills()} == {"report": "profile", "granted-x": "granted"}
+    # A granted skill loads with its body.
+    assert sub.list_skills(names=["granted-x"], full=True)[0]["instructions"] == "BODY"
+    # Discovery keeps requestable skills; the plain (menu) query does not.
+    assert {s["name"] for s in sub.list_skills(query="need", k=3, discover=True)} == {"other", "report"}
+    assert "other" not in {s["name"] for s in sub.list_skills(query="need", k=3)}
+    # A load outside the set passes to the kernel with the rationale; no body comes back.
+    pend = sub.list_skills(names=["other"], full=True, rationale="for the report")
+    assert pend[0]["access"] == "pending" and not pend[0]["instructions"]
+    assert kern.rationales[-1] == "for the report"

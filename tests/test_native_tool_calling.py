@@ -132,7 +132,7 @@ def test_loop_uses_native_path_and_offers_tools():
     agent's tool menu reaches the provider as schemas."""
     sub = _NativeLLM(turns=[
         ("", [{"id": "c1", "name": "echo", "arguments": '{"text":"hi"}'}], "tool_use"),
-        ("done", [], "end_turn"),
+        ("", [{"id": "fa", "name": "final_answer", "arguments": '{"answer": "done"}'}], "tool_use"),
     ])
     bot = ToolBot(agent_id="b")
     bot.substrate = sub
@@ -246,7 +246,7 @@ def test_conversation_accumulates_assistant_and_tool_turns():
     """
     sub = _NativeLLM(turns=[
         ("", [{"id": "call_1", "name": "echo", "arguments": '{"text":"hi"}'}], "tool_use"),
-        ("all done", [], "end_turn"),
+        ("", [{"id": "fa", "name": "final_answer", "arguments": '{"answer": "all done"}'}], "tool_use"),
     ])
     bot = ToolBot(agent_id="b")
     bot.substrate = sub
@@ -274,14 +274,16 @@ def test_notes_reach_the_model_as_turns_under_native():
     invisible unless it becomes a real turn — hence the conversation mirror."""
     sub = _NativeLLM(turns=[
         ("thinking out loud", [], "max_tokens"),   # not finished -> re-prompt note
-        ("done", [], "end_turn"),
+        ("", [{"id": "fa", "name": "final_answer", "arguments": '{"answer": "done"}'}], "tool_use"),
     ])
     bot = ToolBot(agent_id="b")
     bot.substrate = sub
     run_think(bot, AgentTask(text="do it"), seed_system_tools=False)
 
     second = sub.sent_conversations[1]
-    assert any(m["role"] == "user" and "not a valid action" in (m.get("content") or "")
+    # ADR-0139 D3: under native tool-calling the nudge names the final_answer tool
+    # (react-nudges v2 inferred-answer-native), not a JSON action.
+    assert any(m["role"] == "user" and "not a tool call" in (m.get("content") or "")
                for m in second), f"the nudge must reach the model as a turn: {second}"
 
 
@@ -310,7 +312,7 @@ def test_tool_turn_immediately_follows_its_assistant_turn():
     sub = _NativeLLM(turns=[
         ("", [{"id": "call_1", "name": "echo", "arguments": '{"text":"hi"}'}], "tool_use"),
         ("", [{"id": "call_2", "name": "echo", "arguments": '{"text":"hi"}'}], "tool_use"),
-        ("done", [], "end_turn"),
+        ("", [{"id": "fa", "name": "final_answer", "arguments": '{"answer": "done"}'}], "tool_use"),
     ])
     bot = ToolBot(agent_id="b")
     bot.substrate = sub
@@ -333,7 +335,7 @@ def test_unexecuted_call_is_still_answered():
         ("", [call], "tool_use"),
         ("", [dict(call, id="call_2")], "tool_use"),
         ("", [dict(call, id="call_3")], "tool_use"),
-        ("done", [], "end_turn"),
+        ("", [{"id": "fa", "name": "final_answer", "arguments": '{"answer": "done"}'}], "tool_use"),
     ])
     bot = ToolBot(agent_id="b")
     bot.substrate = sub
@@ -385,7 +387,7 @@ def test_discovered_tools_become_offerable():
 
     sub = _DiscoveringLLM(turns=[
         ("", [{"id": "c1", "name": "find_tools", "arguments": '{"need":"write a file"}'}], "tool_use"),
-        ("done", [], "end_turn"),
+        ("", [{"id": "fa", "name": "final_answer", "arguments": '{"answer": "done"}'}], "tool_use"),
     ])
     bot = ToolBot(agent_id="b")
     bot.substrate = sub
@@ -424,7 +426,7 @@ def test_native_definitions_request_tier_two_schemas():
             return [{"name": "mcp:fs/write_file",
                      "schema_json": '{"type":"object","properties":{"path":{"type":"string"}}}'}]
 
-    sub = _TierRecordingSub(turns=[("done", [], "end_turn")])
+    sub = _TierRecordingSub(turns=[("", [{"id": "fa", "name": "final_answer", "arguments": '{"answer": "done"}'}], "tool_use")])
     bot = ToolBot(agent_id="b")
     bot.substrate = sub
     run_think(bot, AgentTask(text="write a file"))

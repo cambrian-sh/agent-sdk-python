@@ -129,6 +129,31 @@ class OrchestratorStub:
                 request_serializer=cambrian__pb2.ApprovalDecisionRequest.SerializeToString,
                 response_deserializer=cambrian__pb2.ApprovalDecisionResponse.FromString,
                 _registered_method=True)
+        self.SpawnSubagent = channel.unary_unary(
+                '/cambrian.Orchestrator/SpawnSubagent',
+                request_serializer=cambrian__pb2.SpawnSubagentRequest.SerializeToString,
+                response_deserializer=cambrian__pb2.SpawnSubagentResponse.FromString,
+                _registered_method=True)
+        self.GetMemoryNotes = channel.unary_unary(
+                '/cambrian.Orchestrator/GetMemoryNotes',
+                request_serializer=cambrian__pb2.GetMemoryNotesRequest.SerializeToString,
+                response_deserializer=cambrian__pb2.GetMemoryNotesResponse.FromString,
+                _registered_method=True)
+        self.ProposeMemoryNote = channel.unary_unary(
+                '/cambrian.Orchestrator/ProposeMemoryNote',
+                request_serializer=cambrian__pb2.ProposeMemoryNoteRequest.SerializeToString,
+                response_deserializer=cambrian__pb2.ProposeMemoryNoteResponse.FromString,
+                _registered_method=True)
+        self.ProposeSkill = channel.unary_unary(
+                '/cambrian.Orchestrator/ProposeSkill',
+                request_serializer=cambrian__pb2.ProposeSkillRequest.SerializeToString,
+                response_deserializer=cambrian__pb2.ProposeSkillResponse.FromString,
+                _registered_method=True)
+        self.EmitStepOutput = channel.stream_unary(
+                '/cambrian.Orchestrator/EmitStepOutput',
+                request_serializer=cambrian__pb2.StepOutputChunk.SerializeToString,
+                response_deserializer=cambrian__pb2.EmitStepOutputAck.FromString,
+                _registered_method=True)
 
 
 class OrchestratorServicer:
@@ -142,7 +167,9 @@ class OrchestratorServicer:
         raise NotImplementedError('Method not implemented!')
 
     def RequestProposal(self, request, context):
-        """Auction / Qualified-Volunteering Model
+        """DEPRECATED: Auction / Qualified-Volunteering Model. The auction was retired by
+        ADR-0100 and the kernel serves no bids. Kept so the contract stays
+        wire-compatible; do not build on it.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -304,6 +331,79 @@ class OrchestratorServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SpawnSubagent(self, request, context):
+        """── ADR-0139 Phase 2/3 (C7): subagents, memory notes, skill proposals ────────
+
+        All four are additive. A kernel that does not serve one answers UNIMPLEMENTED
+        (the generated UnimplementedOrchestratorServer does that), and a client MUST
+        treat UNIMPLEMENTED as "this deployment has no such surface", never as a
+        failed call to retry. The principal is the x-agent-id metadata plus the
+        lease, as on ExecuteTool, never a body field.
+
+        ADR-0139 D12: spawn one in-agent subagent and wait for its result (unary:
+        the parent awaits). The child is a SEPARATE kernel dispatch, so the
+        ToolExecutor governs every child tool call and child spend counts against
+        the ROOT lease (tree-wide, D1). Cancelling this call MUST cancel the child.
+
+        No streaming variant, deliberately: the parent can act only on the final
+        result, the child's progress is already visible on the C6 run event log and
+        the operator feed, and a stream would need the C7 cancellation/resume
+        protocol, which is not frozen yet.
+
+        Request-shape faults are gRPC errors (INVALID_ARGUMENT; a missing, foreign or
+        expired lease is PERMISSION_DENIED). Everything that happens TO the child,
+        including a policy refusal, is an OK response with an exit_reason, so the
+        parent model sees it as a tool result.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetMemoryNotes(self, request, context):
+        """ADR-0139 D14 / D3: the run principal's memory notes as the FROZEN run-start
+        snapshot. Every call within one run MUST return the same snapshot (same
+        version), even after a ProposeMemoryNote in that run: writes are durable at
+        once but appear from the next run, which keeps the prompt cache intact.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ProposeMemoryNote(self, request, context):
+        """ADR-0139 D14: write to the run principal's notes (append, replace a section,
+        remove a section). Bounded and injection-scanned on write; a refused write is
+        an OK response with accepted=false and a rejection, never a silent trim or
+        eviction.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ProposeSkill(self, request, context):
+        """ADR-0139 D13: propose a skill (new, or an edit of an existing one). It enters
+        the staged approval queue as PENDING and is NEVER active until an operator
+        approves it (OperatorConsole/DecideSkillProposal).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def EmitStepOutput(self, request_iterator, context):
+        """ADR-0139 amendment 2026-11-06 (live step-output stream; additive within
+        contract 0101, capability "step-output-stream"): an agent that calls its OWN
+        model (Claude Code / the Claude Agent SDK as a worker, LangGraph, a custom
+        agent) pushes its step's live output here; it reaches the operator feed
+        (TokenChunkOp) and MCP progress like the gateway's deltas do. Every chunk is
+        bound to the step's lease: a dead lease, or one not issued to the caller, is
+        PERMISSION_DENIED. seq is strictly increasing per lease; a chunk at or below
+        the highest accepted seq is a duplicate (a retried stream) and is dropped. An
+        agent that pushes should declare streams_output (profile / manifest) so the
+        kernel stops forwarding gateway deltas for its steps.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_OrchestratorServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -401,6 +501,31 @@ def add_OrchestratorServicer_to_server(servicer, server):
                     servicer.SubmitApprovalDecision,
                     request_deserializer=cambrian__pb2.ApprovalDecisionRequest.FromString,
                     response_serializer=cambrian__pb2.ApprovalDecisionResponse.SerializeToString,
+            ),
+            'SpawnSubagent': grpc.unary_unary_rpc_method_handler(
+                    servicer.SpawnSubagent,
+                    request_deserializer=cambrian__pb2.SpawnSubagentRequest.FromString,
+                    response_serializer=cambrian__pb2.SpawnSubagentResponse.SerializeToString,
+            ),
+            'GetMemoryNotes': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetMemoryNotes,
+                    request_deserializer=cambrian__pb2.GetMemoryNotesRequest.FromString,
+                    response_serializer=cambrian__pb2.GetMemoryNotesResponse.SerializeToString,
+            ),
+            'ProposeMemoryNote': grpc.unary_unary_rpc_method_handler(
+                    servicer.ProposeMemoryNote,
+                    request_deserializer=cambrian__pb2.ProposeMemoryNoteRequest.FromString,
+                    response_serializer=cambrian__pb2.ProposeMemoryNoteResponse.SerializeToString,
+            ),
+            'ProposeSkill': grpc.unary_unary_rpc_method_handler(
+                    servicer.ProposeSkill,
+                    request_deserializer=cambrian__pb2.ProposeSkillRequest.FromString,
+                    response_serializer=cambrian__pb2.ProposeSkillResponse.SerializeToString,
+            ),
+            'EmitStepOutput': grpc.stream_unary_rpc_method_handler(
+                    servicer.EmitStepOutput,
+                    request_deserializer=cambrian__pb2.StepOutputChunk.FromString,
+                    response_serializer=cambrian__pb2.EmitStepOutputAck.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -926,6 +1051,141 @@ class Orchestrator:
             metadata,
             _registered_method=True)
 
+    @staticmethod
+    def SpawnSubagent(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cambrian.Orchestrator/SpawnSubagent',
+            cambrian__pb2.SpawnSubagentRequest.SerializeToString,
+            cambrian__pb2.SpawnSubagentResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetMemoryNotes(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cambrian.Orchestrator/GetMemoryNotes',
+            cambrian__pb2.GetMemoryNotesRequest.SerializeToString,
+            cambrian__pb2.GetMemoryNotesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ProposeMemoryNote(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cambrian.Orchestrator/ProposeMemoryNote',
+            cambrian__pb2.ProposeMemoryNoteRequest.SerializeToString,
+            cambrian__pb2.ProposeMemoryNoteResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ProposeSkill(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cambrian.Orchestrator/ProposeSkill',
+            cambrian__pb2.ProposeSkillRequest.SerializeToString,
+            cambrian__pb2.ProposeSkillResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def EmitStepOutput(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/cambrian.Orchestrator/EmitStepOutput',
+            cambrian__pb2.StepOutputChunk.SerializeToString,
+            cambrian__pb2.EmitStepOutputAck.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
 
 class AgentServiceStub:
     """Service that agents register with, or that agents implement (AgentService)
@@ -959,7 +1219,11 @@ class AgentServiceServicer:
     """
 
     def RequestProposal(self, request, context):
-        """Missing associated documentation comment in .proto file."""
+        """DEPRECATED 2026-11-05: the kernel no longer calls RequestProposal. Its last
+        caller was the LLM agent interview, deleted 2026-11-05 (ADR-0139 Q3); the
+        auction's bid round was retired earlier (ADR-0100). Agents may still serve it;
+        nothing asks. Kept so the contract stays wire-compatible.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')

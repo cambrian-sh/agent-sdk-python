@@ -311,7 +311,7 @@ def render_step_xml(s) -> str:
     if kind == "memory_query":
         attrs = (
             f' type="memory_query"'
-            f' query="{_esc(s.query)}"'
+            f' query="{_esc(short_query(s.query))}"'
             f' status="{_esc(s.status)}"'
         )
         body = _render_memory_results(s.results or [])
@@ -588,6 +588,36 @@ def _render_memory_results(results) -> str:
         text = r.get("text", r) if isinstance(r, dict) else getattr(r, "text", r)
         items.append(f"  <memory {memory_provenance_attrs(r)}>{_esc(text)}</memory>")
     return "\n".join(items)
+
+
+# The longest query text a memory_query rendering carries in an attribute. The query
+# is OUR text (the model's, or the task text for the seed recall), not retrieved
+# data: echoing a whole task objective into a data-marked region made it read as
+# instructions planted in evidence, and the model refused its own task
+# (T-20261106-agent-refuses-its-whole-legitimate-task-when).
+QUERY_ATTR_MAX_CHARS = 80
+
+
+def short_query(query: Any) -> str:
+    """The query as one line, at most :data:`QUERY_ATTR_MAX_CHARS` chars (an
+    ellipsis marks a cut). Not escaped: callers escape for their attribute."""
+    q = " ".join(str(query or "").split())
+    if len(q) > QUERY_ATTR_MAX_CHARS:
+        q = q[: QUERY_ATTR_MAX_CHARS - 1].rstrip() + "…"
+    return q
+
+
+EMPTY_RECALL_NOTE = "<note>no relevant memory found</note>"
+
+
+def render_memory_query_reply(query: Any, results) -> str:
+    """The reply to an explicit memory_query (the native tool turn): the hits as
+    tagged ``<documents>`` (data) with a capped query attribute, or, for no hits, a
+    one-line note and no documents block."""
+    if not results:
+        return EMPTY_RECALL_NOTE
+    return (f"<documents source='memory' query={_esc(short_query(query))!r}>\n"
+            f"{_render_memory_results(results)}\n</documents>")
 
 
 def action_text(tool: str, args: Any) -> str:

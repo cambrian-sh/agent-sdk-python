@@ -425,16 +425,22 @@ def test_menu_offers_yield_and_inline_reasoning_guidance():
 
 
 def test_no_in_agent_scheduler_introduced():
-    """ADR-0041 D5: batching is delegated to the kernel — the agent loop must NOT
-    grow an in-process scheduler / parallel executor."""
+    """ADR-0041 D5: sub-task batching is delegated to the kernel — the agent loop must
+    NOT grow an in-process scheduler.
+
+    ADR-0139 D3 narrows this deliberately: the read-only tool calls of ONE native turn
+    may run concurrently (bounded to 4). That executor lives only in
+    ``_run_parallel``; nothing else in the loop schedules work."""
     import inspect
 
     import cambrian_agent_sdk.react as r
 
     src = inspect.getsource(r)
-    assert "ThreadPool" not in src
-    assert "concurrent.futures" not in src
+    par = inspect.getsource(r._run_parallel)
+    assert src.count("ThreadPoolExecutor") == par.count("ThreadPoolExecutor") == 2
+    assert src.count("concurrent.futures") == par.count("concurrent.futures") == 1
     assert "asyncio" not in src
+    assert r._MAX_PARALLEL_READ_ONLY == 4
 
 
 def test_think_memory_query_branch_then_final():

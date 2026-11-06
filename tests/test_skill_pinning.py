@@ -162,7 +162,7 @@ def test_native_use_skill_is_offered_and_answered_with_the_full_body():
                  "instructions": _BIG_BODY, "tool_grants": ["echo"]}])
     bot.substrate = _NativeSub([
         ("", [{"id": "c1", "name": "use_skill", "arguments": json.dumps({"skill": "audit"})}], "tool_use"),
-        ("done", [], "end_turn"),
+        ("", [{"id": "fa", "name": "final_answer", "arguments": '{"answer": "done"}'}], "tool_use"),
     ])
     res = bot.think(AgentTask(text="audit the repo"))
     assert res.text == "done"
@@ -230,7 +230,7 @@ def test_native_find_tools_is_answered_in_its_tool_turn():
     bot = _SkillBot(agent_id="b")
     bot.substrate = _Disc([
         ("", [{"id": "c1", "name": "find_tools", "arguments": json.dumps({"need": "write a file"})}], "tool_use"),
-        ("done", [], "end_turn"),
+        ("", [{"id": "fa", "name": "final_answer", "arguments": '{"answer": "done"}'}], "tool_use"),
     ])
     bot.think(AgentTask(text="create a file"))
     tool_turns = [m for m in bot.substrate.sent[1] if m.get("role") == "tool"]

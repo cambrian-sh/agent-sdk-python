@@ -125,6 +125,37 @@ res.ignored        # e.g. ["temperature"]: fields this model did not honour
   a volatile user turn. Set `cache_ttl = "long"` on an agent that serves a human-paced
   session.
 
+## Live step output
+
+The kernel keeps one live output stream per step; the operator console and MCP callers
+waiting on a task watch it. A model call through the kernel (everything above,
+`generate_with_tools` included) is forwarded by the kernel itself, so an SDK agent does
+nothing.
+
+An agent that calls its **own** model (an adapter around Claude Code or the Claude Agent
+SDK, LangGraph, a custom agent) pushes its output instead, and declares
+`streams_output: true` in its profile (or `"streams_output": true` in its
+`AGENT_MANIFEST`) so the kernel stops forwarding gateway deltas for its steps:
+
+```python
+def execute(self, task):
+    parts = []
+    with self.substrate.step_output(task.session_token_id) as out:
+        out.progress("calling the model")
+        for token in my_model.stream(task.description):   # the agent's own model
+            parts.append(token)
+            out.text(token)                               # live to the console / MCP
+    return "".join(parts)                                 # the step's final output
+
+# or, all at once:
+self.substrate.emit_step_output(task.session_token_id, ["partial ", "answer"], final=True)
+```
+
+Each chunk is bound to the step's lease (a dead or foreign lease is refused);
+sequence numbers are assigned per lease and duplicates are dropped, so a re-send is safe;
+sizes are capped by the kernel. Live output is best-effort: a failed push is recorded on
+the writer (`out.error`), never raised. Rules and details: `cambrian_agent_sdk/step_output.py`.
+
 ## Connecting to a kernel
 
 The SDK dials the Substrate through one builder (`cambrian_agent_sdk.channel.build_channel`),

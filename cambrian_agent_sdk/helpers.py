@@ -281,7 +281,7 @@ def _protocol_sections(action_protocol: str, output_schema: str) -> List[str]:
 # version and static hash on every call (debug level), so an end-to-end test can
 # assert which prompt version a run actually sent.
 REACT_PROMPT_IDS = ("react-constraints", "react-anti-patterns", "react-action-protocol",
-                    "react-turn", "react-nudges")
+                    "react-turn", "react-nudges", "react-tools", "react-compaction")
 
 
 @dataclass
@@ -336,6 +336,7 @@ def build_prompt_parts(
     base_anti_patterns: "Optional[List[str]]" = None,
     notes: "Optional[List[str]]" = None,
     cache: bool = True,
+    user_content: "Optional[str]" = None,
 ) -> PromptParts:
     """Assemble the ReAct prompt as ``system`` + ``messages`` (ADR-0139 D2).
 
@@ -358,6 +359,11 @@ def build_prompt_parts(
 
     ``constraints`` must be stable for the run (caller rules, host facts); a
     step-dependent value belongs in ``notes``.
+
+    ``user_content`` (ADR-0139 D3) replaces the whole user turn: the context engine
+    renders its own regions (memory notes, instructions, evidence, history, the task
+    last, then the notes), so ``task``, ``context_str`` and ``notes`` are then unused
+    for the user turn. The system tier is built the same way either way.
     """
     system_text = "\n\n".join([
         _system_section(role, constraints=constraints, task_type=task_type,
@@ -367,6 +373,11 @@ def build_prompt_parts(
                         base_anti_patterns=base_anti_patterns),
         *_protocol_sections(action_protocol, output_schema),
     ])
+    if user_content is not None:
+        return PromptParts(
+            system=[{"text": system_text, "cache": bool(cache)}],
+            messages=[{"role": "user", "content": user_content}],
+        )
     user = [f"<Task>\n{task.strip()}\n</Task>"]
     if context_str and context_str.strip():
         user.append(

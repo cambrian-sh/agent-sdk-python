@@ -66,6 +66,8 @@ def test_profile_verdict_matches_go(case, tmp_path):
     assert got.max_tool_rounds == want["max_tool_rounds"]
     assert got.max_tokens == want["max_tokens"]
     assert got.version == want["version"]
+    assert list(got.examples) == (want.get("examples") or [])
+    assert got.streams_output == bool(want.get("streams_output"))
     assert len(got.warnings) == case["warnings"]
 
 
@@ -80,6 +82,8 @@ def test_constants_match_go():
     assert tuple(c["required"]) == pr._REQUIRED
     assert tuple(c["max_tool_rounds"]) == pr._MAX_TOOL_ROUNDS
     assert tuple(c["max_tokens"]) == pr._MAX_TOKENS
+    assert c["max_examples"] == pr._MAX_EXAMPLES
+    assert c["max_example_runes"] == pr._MAX_EXAMPLE_CHARS
 
 
 @_needs_core
