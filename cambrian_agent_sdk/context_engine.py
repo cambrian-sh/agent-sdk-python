@@ -118,7 +118,7 @@ def neutralise_closing_tags(text: str) -> str:
 # Configuration
 # ──────────────────────────────────────────────────────────────────────
 
-_BOOL_FIELDS = frozenset({"phase2_enabled", "subagent_seed_recall", "subagent_memory_notes"})
+_BOOL_FIELDS = frozenset({"phase2_enabled"})
 
 
 @dataclass
@@ -150,15 +150,6 @@ class ContextConfig:
     # Guard: content above this is not sent to the summariser (compaction fails
     # loudly and falls back to phase 1 only).
     summariser_input_max_tokens: int = 48000
-    # ADR-0139 D12 subagent children (a run whose task.context carries the kernel's
-    # `_subagent` handoff marker). False (the default) = a child gets NO automatic
-    # run-start seed recall and NO D14 memory-notes snapshot: its context is what
-    # the parent handed it (objective, FORK summary, refs), and memory_query stays
-    # available on demand. Here rather than in the kernel's Agents block because the
-    # SDK loop is what issues the seed recall and renders the notes; the kernel only
-    # marks the run. T-20261106-agent-refuses-its-whole-legitimate-task-when.
-    subagent_seed_recall: bool = False
-    subagent_memory_notes: bool = False
 
     @classmethod
     def from_env(cls, base: Optional["ContextConfig"] = None) -> "ContextConfig":
@@ -291,12 +282,6 @@ class LegacyWorkingMemoryEngine(WorkingMemory):
 
     def resolve_local(self, cid: str) -> Optional[str]:
         return None
-
-    def fork_summary(self, task_text: str, max_chars: int = 6000) -> Tuple[str, List[Dict[str, str]]]:
-        """ADR-0139 D12 FORK: the legacy engine keeps no structured state, so a fork
-        carries only the goal."""
-        goal = (task_text or "").strip()
-        return (f"## Goal\n{goal}" if goal else "", [])
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -581,50 +566,6 @@ class DefaultContextEngine:
         regions.append("<Task>\n" + "\n\n".join(task) + "\n</Task>")
         regions.extend(n.strip() for n in notes or [] if n and n.strip())
         return "\n\n".join(r for r in regions if r)
-
-    def fork_summary(self, task_text: str, max_chars: int = 6000) -> Tuple[str, List[Dict[str, str]]]:
-        """ADR-0139 D12 FORK: the compacted context a forked subagent inherits, in
-        the phase-2 summary shape (Goal, Summary of earlier turns, Done, Artifacts),
-        and the content refs it may re-open with resolve_cid.
-
-        No model call: the phase-2 summary is used as-is when compaction produced
-        one, and the turns since are condensed deterministically (one line per
-        step). Bodies never travel: a tool output is a one-line summary plus its
-        cid, so the child re-opens what it needs under its own read scope."""
-        lines: List[str] = []
-        goal = (task_text or "").strip()
-        if goal:
-            lines += ["## Goal", goal, ""]
-        if self._summary:
-            lines += ["## Summary of earlier turns", self._summary.strip(), ""]
-        done: List[str] = []
-        refs: List[Dict[str, str]] = []
-        seen: set = set()
-
-        def _ref(cid: str, kind: str, snippet: str) -> None:
-            if cid and cid not in seen:
-                seen.add(cid)
-                refs.append({"cid": cid, "type": kind, "snippet": snippet[:200]})
-
-        for it in self._history:
-            s = it.step
-            if s is None:
-                continue
-            if s.kind == "tool_call":
-                cid = it.compacted_cid or s.cid or ""
-                summ = " ".join((s.summary or it.tool_body() or "").split())[:160]
-                done.append(f"- {s.tool} ({s.status}): {summ}" + (f" [cid:{cid}]" if cid else ""))
-                _ref(cid, "tool_output", summ)
-            elif s.kind == "memory_query":
-                done.append(f"- memory_query {s.query!r}: {len(s.results or [])} result(s)")
-        if done:
-            lines += ["## Done"] + done + [""]
-        if refs:
-            lines += ["## Artifacts"] + [f"- {r['type']}: {r['cid']}" for r in refs]
-        text = "\n".join(lines).strip()
-        if len(text) > max_chars:
-            text = text[:max_chars] + "\n[fork summary cut]"
-        return text, refs
 
     def assemble(self, intent_vec: Optional[List[float]] = None, numbered: bool = False) -> str:
         """Everything gathered so far (instructions, evidence, history) without the

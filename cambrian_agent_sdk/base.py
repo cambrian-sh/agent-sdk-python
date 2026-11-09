@@ -112,15 +112,25 @@ class CognitiveAgent(Agent):
     #: agent-initiated retrieval loop). On by default for every cognitive agent.
     seed_recall: bool = True
 
-    #: ADR-0139 D12 / D14 / D13 kernel-surface verbs, off for a plain CognitiveAgent
-    #: (an agent opts in): ``spawn_subagent`` (in-agent subagents), ``propose_memory_note``
-    #: (durable principal notes) and ``propose_skill`` (a skill proposal for operator
-    #: approval). Each is offered only when the substrate serves it; the kernel
-    #: enforces every limit whatever is offered. ``run_think``'s ``allow_*`` keywords
-    #: override these per call.
-    allow_subagents: bool = False
+    #: ADR-0139 D14 / D13 kernel-surface verbs, off for a plain CognitiveAgent
+    #: (an agent opts in): ``propose_memory_note`` (durable principal notes) and
+    #: ``propose_skill`` (a skill proposal for operator approval). Each is offered only
+    #: when the substrate serves it; the kernel enforces every limit whatever is
+    #: offered. ``run_think``'s ``allow_*`` keywords override these per call.
+    #: (ADR-0145 D14 removed ``spawn_subagent`` and its ``allow_subagents`` switch.)
     allow_memory_note_writes: bool = False
     allow_skill_proposals: bool = False
+    #: Principal-owned recurring tasks (kernel capability "scheduled-tasks"):
+    #: ``schedule_task`` proposes one for the person the run is for (created only
+    #: after that person approves it) and ``manage_schedules`` lists, pauses,
+    #: resumes or deletes theirs. Off unless an agent opts in; offered only when
+    #: the substrate serves it.
+    allow_scheduled_tasks: bool = False
+    #: Knowledge proposals (Orchestrator/ProposeKnowledge): ``propose_knowledge``
+    #: writes a CANDIDATE knowledge item or link asserted by this agent, optionally
+    #: asking the person the run is for to commit it. Never a committed value. Off
+    #: unless an agent opts in; offered only when the substrate serves it.
+    allow_knowledge_proposals: bool = False
 
     #: Opt-in heavy-result summarizer (ADR-0041 D3). A callable ``str -> str``
     #: applied to a tool result that exceeds the inline budget; ``None`` (default)

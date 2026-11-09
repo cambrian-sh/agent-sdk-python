@@ -33,7 +33,8 @@ class Harness(HTTPChatIngress):
 
 @pytest.fixture()
 def served():
-    ing = Harness()
+    with pytest.warns(DeprecationWarning):
+        ing = Harness()
     ing.params = {"addr": "127.0.0.1:8899", "turn_timeout": 3}
     t = threading.Thread(target=ing.listen, daemon=True)
     t.start()
@@ -168,3 +169,36 @@ def test_external_ids_are_namespaced(served):
     t.join(timeout=5)
 
     assert served.inbound[-1][0].startswith(EXTERNAL_PREFIX)
+
+
+# ── deprecation and the loopback-only bind (ADR-0142 K-5) ────────────────────
+
+def test_construction_warns_and_names_the_canonical_lane():
+    with pytest.warns(DeprecationWarning, match="OpenConversation/SendTurn"):
+        HTTPChatIngress()
+
+
+@pytest.mark.parametrize(
+    "addr", ["0.0.0.0:8898", "10.1.2.3:8898", "example.com:8898", "[::]:8898", "192.168.0.1:8898"]
+)
+def test_a_non_loopback_address_is_refused_before_binding(addr):
+    """It authenticates nobody, so it must not be reachable from off this machine."""
+    with pytest.warns(DeprecationWarning):
+        ing = Harness()
+    ing.params = {"addr": addr}
+    with pytest.raises(ValueError, match="loopback"):
+        ing.listen()
+    assert ing._httpd is None, "nothing may be bound when the address is refused"
+
+
+@pytest.mark.parametrize("host", ["", "127.0.0.1", "127.0.0.5", "localhost", "::1", "[::1]"])
+def test_loopback_hosts_are_accepted(host):
+    from cambrian_agent_sdk.http_chat_ingress import _require_loopback
+
+    assert _require_loopback(host)
+
+
+def test_the_package_export_still_works():
+    import cambrian_agent_sdk
+
+    assert cambrian_agent_sdk.HTTPChatIngress is HTTPChatIngress

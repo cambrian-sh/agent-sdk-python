@@ -55,6 +55,7 @@ from .ingress import IngressAgent, PermanentDeliveryError
 from .http_chat_ingress import HTTPChatIngress
 from .tools import tool, capability, ToolRegistry, ToolSpec
 from .react import ReActLoopError
+from .execute_result import ExecuteResult
 from .context_engine import ContextConfig, ContextEngine, DefaultContextEngine
 from .clients import (
     _lease_metadata,
@@ -139,6 +140,7 @@ __all__ = [
     "ContextRef",
     "ExecuteRequest",
     "ExecuteResponse",
+    "ExecuteResult",
     "extract_code_block",
     "find_step_ref",
     "Payload",
@@ -835,12 +837,17 @@ class SubstrateClient:
             for sk in resp.skills
         ]
 
-    def execute(self, description: str, session_token_id: str = "", target: Optional[str] = None, timeout_ms: int = 0) -> str:
+    def execute(self, description: str, session_token_id: str = "", target: Optional[str] = None, timeout_ms: int = 0) -> "ExecuteResult":
         """Delegate a natural-language task to the Planner (ADR-0036 user story 11).
 
         Self-delegation is refused (recursion guard). Sub-plan tokens are charged to
         the **parent step's** session token by propagating ``session_token_id`` into
         the delegated handoff — delegation cannot bypass the budget (ADR-0018).
+
+        Returns the whole result (ADR-0145 D8): an :class:`ExecuteResult`, which IS the
+        report text (a ``str``, so callers that read text are unchanged) and carries the
+        run id, the action ledger, every step with its ledger reference, and the
+        partial / timeout flags as attributes (``.text`` is the plain text).
         """
         from .clients import SelfDelegationError
 
@@ -857,7 +864,11 @@ class SubstrateClient:
         )
         timeout = (timeout_ms / 1000.0) if timeout_ms and timeout_ms > 0 else None
         resp = self._stub.Execute(req, timeout=timeout)
-        return resp.payload.data.decode("utf-8", errors="replace")
+        return ExecuteResult(
+            resp.payload.data.decode("utf-8", errors="replace"),
+            metadata=dict(resp.metadata),
+            payload_type=resp.payload.type,
+        )
 
     # ── ADR-0139 D12 / D14 agent-plane verbs ────────────────────────────────────
     #
@@ -884,97 +895,6 @@ class SubstrateClient:
         details = getattr(exc, "details", None)
         detail = details() if callable(details) else str(exc)
         return {"error": detail or str(exc), "code": name or "UNKNOWN"}
-
-    def spawn_subagent(
-        self,
-        session_token_id: str,
-        objective: str,
-        *,
-        mode: str = "isolated",
-        toolset: Optional[List[str]] = None,
-        target_agent_id: str = "",
-        target_capability: str = "",
-        output_schema=None,
-        context_summary: str = "",
-        context_refs: Optional[List[Dict]] = None,
-        max_tool_rounds: int = 0,
-        timeout_ms: int = 0,
-        token_budget: int = 0,
-        client_spawn_id: str = "",
-    ) -> Optional[Dict]:
-        """Run one in-agent subagent and wait for its result (ADR-0139 D12).
-
-        The kernel enforces everything: ``toolset`` must be a subset of this agent's
-        tools (an entry outside it ends the spawn DENIED), depth and concurrency are
-        derived server-side, and the child's spend counts against this run's root
-        lease. ``mode`` is ``"isolated"`` (objective only) or ``"fork"`` (plus
-        ``context_summary`` / ``context_refs``). ``output_schema`` is a JSON-Schema
-        dict/str (or a :class:`ResponseSchema`).
-
-        Returns a dict (``status``, ``exit_reason``, ``text``, ``structured_json``,
-        ``truncated``, ``artifacts``, ``usage``, ``child_run_id``, ``detail``,
-        ``tool_rounds``; enum values lower-case without prefix, e.g. ``"done"`` /
-        ``"completed"``), an ``{"error", "code"}`` dict for a request the kernel
-        refused (INVALID_ARGUMENT, PERMISSION_DENIED), or None when the kernel does
-        not serve subagents.
-        """
-        self._ensure()
-        from ._proto import cambrian_pb2
-        from .llm import coerce_response_schema
-
-        req = cambrian_pb2.SpawnSubagentRequest(
-            lease_id=session_token_id,
-            mode=(cambrian_pb2.SUBAGENT_MODE_FORK if str(mode).lower() == "fork"
-                  else cambrian_pb2.SUBAGENT_MODE_ISOLATED),
-            objective=objective or "",
-            toolset=[str(t) for t in (toolset or [])],
-            target_agent_id=target_agent_id or "",
-            target_capability=target_capability or "",
-            context_summary=context_summary or "",
-            max_tool_rounds=int(max_tool_rounds or 0),
-            timeout_ms=int(timeout_ms or 0),
-            token_budget=int(token_budget or 0),
-            client_spawn_id=client_spawn_id or "",
-        )
-        if output_schema:
-            # A bare JSON Schema (dict or string) is the common case; the
-            # {"name", "schema", "strict"} wrapper and ResponseSchema also work.
-            if isinstance(output_schema, str):
-                output_schema = {"name": "subagent_output", "schema": output_schema}
-            elif isinstance(output_schema, dict) and not ("schema" in output_schema
-                                                          or "schema_json" in output_schema):
-                output_schema = {"name": "subagent_output", "schema": output_schema}
-            rs = coerce_response_schema(output_schema)
-            req.output_schema.CopyFrom(cambrian_pb2.ResponseSchema(
-                name=rs.name, schema_json=rs.schema_json, strict=bool(rs.strict)))
-        for ref in context_refs or []:
-            if isinstance(ref, str):
-                ref = {"cid": ref}
-            req.context_refs.add(cid=str(ref.get("cid", "")), type=str(ref.get("type", "") or ""),
-                                 snippet=str(ref.get("snippet", "") or ""))
-        try:
-            resp = self._stub.SpawnSubagent(req, metadata=self._lease_md(session_token_id))
-        except Exception as exc:  # noqa: BLE001 — a refusal is data for the loop
-            return self._rpc_failure(exc)
-
-        def _enum(name: str, prefix: str) -> str:
-            return name[len(prefix):].lower() if name.startswith(prefix) else name.lower()
-
-        u = resp.usage
-        return {
-            "status": _enum(cambrian_pb2.SubagentStatus.Name(resp.status), "SUBAGENT_STATUS_"),
-            "exit_reason": _enum(cambrian_pb2.SubagentExitReason.Name(resp.exit_reason),
-                                 "SUBAGENT_EXIT_REASON_"),
-            "text": resp.text,
-            "structured_json": resp.structured_json,
-            "truncated": resp.truncated,
-            "artifacts": list(resp.artifacts),
-            "usage": {"input_tokens": u.input_tokens, "output_tokens": u.output_tokens,
-                      "cache_read_tokens": u.cache_read_tokens, "estimated": u.estimated},
-            "child_run_id": resp.child_run_id,
-            "detail": resp.detail,
-            "tool_rounds": resp.tool_rounds,
-        }
 
     def get_memory_notes(self, session_token_id: str = "") -> Optional[Dict]:
         """The run principal's FROZEN run-start memory notes (ADR-0139 D14 / D3).
@@ -1095,6 +1015,178 @@ class SubstrateClient:
                           else rej.replace("SKILL_PROPOSAL_REJECTION_", "").lower()),
             "detail": resp.detail,
         }
+
+    # ── Principal-owned recurring tasks (capability "scheduled-tasks") ───────
+    #
+    # The OWNER is never a parameter: the kernel resolves it from the lease (the
+    # person the run is for). A proposal BLOCKS while that person is asked through
+    # the approval channel (the console Inbox), up to the kernel's
+    # execution.schedules.approval_timeout_seconds, and creates nothing unless they
+    # approve. UNIMPLEMENTED -> None, any other failure -> an error dict (data).
+
+    @staticmethod
+    def _scheduled_task_dict(t) -> Dict:
+        return {"id": t.id, "owner_id": t.owner_id, "title": t.title, "goal": t.goal,
+                "cron": t.cron, "timezone": t.timezone, "agent_id": t.agent_id,
+                "delivery": t.delivery, "active": t.active,
+                "conversation_id": t.conversation_id, "created_at": t.created_at}
+
+    def propose_scheduled_task(
+        self,
+        session_token_id: str,
+        *,
+        goal: str,
+        cron: str = "",
+        rrule: str = "",
+        timezone: str = "",
+        title: str = "",
+        agent_id: str = "",
+        delivery: str = "",
+        timeout_s: Optional[float] = None,
+    ) -> Optional[Dict]:
+        """Propose a recurring task for the person this run is for.
+
+        Give exactly one of ``cron`` (5 fields or @daily/@weekly/...) or ``rrule``
+        (FREQ=HOURLY|DAILY|WEEKLY|MONTHLY with BYHOUR/BYMINUTE/BYDAY/BYMONTHDAY).
+        ``delivery`` is ``conversation`` (default), ``notify`` or ``email``. Returns
+        ``{"created": True, "task": {...}}`` once approved, or ``{"created": False,
+        "rejection": "invalid"|"limit"|"too_frequent"|"denied"|"no_decision"|
+        "no_principal", "detail": ...}``; None when the kernel has no scheduled tasks.
+        """
+        self._ensure()
+        from ._proto import cambrian_pb2
+
+        req = cambrian_pb2.ProposeScheduledTaskRequest(
+            lease_id=session_token_id, goal=goal or "", cron=cron or "", rrule=rrule or "",
+            timezone=timezone or "", title=title or "", agent_id=agent_id or "",
+            delivery=delivery or "")
+        try:
+            resp = self._stub.ProposeScheduledTask(req, metadata=self._lease_md(session_token_id),
+                                                   timeout=timeout_s)
+        except Exception as exc:  # noqa: BLE001 — a refusal is data for the loop
+            return self._rpc_failure(exc)
+        if resp.created:
+            return {"created": True, "task": self._scheduled_task_dict(resp.task)}
+        rej = cambrian_pb2.ScheduledTaskRejection.Name(resp.rejection)
+        return {"created": False,
+                "rejection": "" if rej.endswith("UNSPECIFIED") else rej.replace("SCHEDULED_TASK_REJECTION_", "").lower(),
+                "detail": resp.detail}
+
+    def propose_knowledge(
+        self,
+        session_token_id: str,
+        *,
+        item: Optional[Dict] = None,
+        link: Optional[Dict] = None,
+        request_commit: bool = False,
+        reason: str = "",
+        client_ref: str = "",
+    ) -> Optional[Dict]:
+        """Propose a knowledge item or a candidate link (Orchestrator/ProposeKnowledge).
+
+        ``item`` is ``{"kind", "entity_id", "values": [{"predicate", "type", "value"}],
+        "valid_from"?, "valid_to"?, "negation"?, "evidence_id"?, "classification"?}`` —
+        ``type`` is ``text`` | ``number`` | ``date`` (an aware datetime or an ISO-8601
+        string) | ``entity``. It is stored as a CANDIDATE asserted by this agent (the
+        kernel takes the identity from the lease); ``request_commit`` also asks the
+        person this run is for to approve it, and the approver becomes the committed
+        value's asserter. ``link`` is ``{"relation", "from_ref", "to_ref", "evidence_id",
+        "family"?, "confidence"?}`` and is only ever a candidate. Returns ``{"accepted",
+        "detail", "candidate_id", "created", "approval_id", "approval_state"}``; a
+        refusal is ``accepted=False`` with the named reason. None when the kernel does
+        not serve knowledge proposals.
+        """
+        self._ensure()
+        from datetime import datetime
+
+        from google.protobuf import timestamp_pb2
+
+        from ._proto import cambrian_pb2
+
+        def ts(v):
+            if v is None or v == "":
+                return None
+            if isinstance(v, str):
+                v = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            if v.tzinfo is None:
+                raise ValueError("propose_knowledge: datetimes must be timezone-aware")
+            out = timestamp_pb2.Timestamp()
+            out.FromDatetime(v)
+            return out
+
+        req = cambrian_pb2.ProposeKnowledgeRequest(
+            lease_id=session_token_id, request_commit=bool(request_commit),
+            reason=reason or "", client_ref=client_ref or "")
+        if item is not None:
+            pi = req.item
+            pi.kind = str(item.get("kind") or "")
+            pi.entity_id = str(item.get("entity_id") or "")
+            pi.negation = bool(item.get("negation", False))
+            pi.evidence_id = str(item.get("evidence_id") or "")
+            pi.classification.extend([str(t) for t in (item.get("classification") or [])])
+            for field in ("valid_from", "valid_to"):
+                t = ts(item.get(field))
+                if t is not None:
+                    getattr(pi, field).CopyFrom(t)
+            for v in item.get("values") or []:
+                kv = pi.values.add(predicate=str(v.get("predicate") or ""), type=str(v.get("type") or "text"))
+                val = v.get("value")
+                if kv.type == "number":
+                    kv.number = float(val or 0)
+                elif kv.type == "date":
+                    t = ts(val)
+                    if t is not None:
+                        kv.date.CopyFrom(t)
+                elif kv.type == "entity":
+                    kv.entity_ref = str(val or "")
+                else:
+                    kv.text = "" if val is None else str(val)
+        elif link is not None:
+            req.link.CopyFrom(cambrian_pb2.ProposedKnowledgeLink(
+                family=str(link.get("family") or ""), from_ref=str(link.get("from_ref") or ""),
+                to_ref=str(link.get("to_ref") or ""), relation=str(link.get("relation") or ""),
+                evidence_id=str(link.get("evidence_id") or ""),
+                confidence=float(link.get("confidence") or 0)))
+        else:
+            return {"accepted": False, "detail": "propose_knowledge needs an item or a link"}
+        try:
+            resp = self._stub.ProposeKnowledge(req, metadata=self._lease_md(session_token_id))
+        except Exception as exc:  # noqa: BLE001 — a refusal is data for the loop
+            return self._rpc_failure(exc)
+        return {"accepted": resp.accepted, "detail": resp.detail, "candidate_id": resp.candidate_id,
+                "created": resp.created, "approval_id": resp.approval_id,
+                "approval_state": resp.approval_state}
+
+    def list_scheduled_tasks(self, session_token_id: str) -> Optional[Dict]:
+        """The scheduled tasks of the person this run is for: ``{"tasks": [...]}``."""
+        self._ensure()
+        from ._proto import cambrian_pb2
+
+        try:
+            resp = self._stub.ListScheduledTasks(
+                cambrian_pb2.ListScheduledTasksRequest(lease_id=session_token_id),
+                metadata=self._lease_md(session_token_id))
+        except Exception as exc:  # noqa: BLE001
+            return self._rpc_failure(exc)
+        return {"tasks": [self._scheduled_task_dict(t) for t in resp.tasks]}
+
+    def manage_scheduled_task(self, session_token_id: str, task_id: str, action: str) -> Optional[Dict]:
+        """Pause, resume or delete one of the person's scheduled tasks.
+        ``action`` is ``pause`` | ``resume`` | ``delete``; ``{"ok": bool, "detail"}``."""
+        self._ensure()
+        from ._proto import cambrian_pb2
+
+        act = {"pause": cambrian_pb2.SCHEDULED_TASK_ACTION_PAUSE,
+               "resume": cambrian_pb2.SCHEDULED_TASK_ACTION_RESUME,
+               "delete": cambrian_pb2.SCHEDULED_TASK_ACTION_DELETE}.get(
+            str(action).lower(), cambrian_pb2.SCHEDULED_TASK_ACTION_UNSPECIFIED)
+        try:
+            resp = self._stub.ManageScheduledTask(
+                cambrian_pb2.ManageScheduledTaskRequest(lease_id=session_token_id, id=task_id or "", action=act),
+                metadata=self._lease_md(session_token_id))
+        except Exception as exc:  # noqa: BLE001
+            return self._rpc_failure(exc)
+        return {"ok": resp.ok, "detail": resp.detail}
 
     # ── Live step output (ADR-0139 amendment 2026-11-06) ─────────────────────
     #

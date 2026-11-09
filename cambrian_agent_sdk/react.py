@@ -46,6 +46,7 @@ from .host import host_block
 from .recurrence import count_failed_duplicates, count_successful_duplicates
 from .reflection import DEFAULT_MAX_REFLECTION_TOKENS, build_reflection_prompt
 from .errors import ToolCallingUnsupported
+from . import run_trace as _run_trace  # ADR-0145 D10: no-op unless CAMBRIAN_TRACE_DIR
 from .step_dependencies import covered_steps, parse_step_dependencies, render_step_dependencies
 from .types import AgentResult, AgentTask, yield_subgoal
 from .working_memory import (
@@ -72,7 +73,18 @@ logger = logging.getLogger("cambrian.react")
 
 
 class ReActLoopError(Exception):
-    """Raised when the tool-round budget is exhausted (runaway loop guard)."""
+    """Raised when the tool-round budget is exhausted (runaway loop guard).
+
+    ``draft`` is the last answer the model wrote as plain text before it was re-prompted
+    to deliver it as final_answer (an inferred answer), or "" when it wrote none. A loop
+    that dies on its budget after such a re-prompt has a usable answer in hand; the caller
+    can return it instead of a fallback
+    (T-20261108-chat-agent-throws-away-a-drafted-answer-and).
+    """
+
+    def __init__(self, message: str = "", *, draft: str = ""):
+        super().__init__(message)
+        self.draft = draft or ""
 
 
 _DEFAULT_MAX_MEMORY_QUERIES = 3
@@ -117,6 +129,18 @@ _MAX_TRUNCATION_RETRIES = 3
 # How many times a non-action response is re-prompted before it is accepted as the
 # answer. 1 = nudge once. See INFERRED_FINAL_ANSWER_NOTE for why this exists at all.
 _MAX_INFERRED_ANSWER_RETRIES = 1
+# ADR-0145 D3: the evidence re-prompt. When a plain-text reply arrives and the run has
+# gathered NO evidence (no tool ran, no memory hit, no upstream / workspace / seed /
+# yield evidence, and the caller did not say the turn holds any), the re-prompt offers
+# delegation or the next tool instead of pushing toward final_answer, so a draft that
+# promises to look something up is not turned into an answer from general knowledge.
+# Decided structurally, never by reading the reply's words. Default off; the kernel
+# sets the variable from execution.workers.evidence_reprompt (internal/kernel).
+EVIDENCE_REPROMPT_ENV = "CAMBRIAN_EVIDENCE_REPROMPT"
+
+
+def _evidence_reprompt_default() -> bool:
+    return (os.getenv(EVIDENCE_REPROMPT_ENV, "") or "").strip().lower() in ("1", "true", "yes", "on")
 # An action kind no branch handles (a hallucinated verb, or one removed from the
 # menu, e.g. recall_precedents on 2026-11-05) used to fall through to the
 # final_answer tail and return an EMPTY answer as success. It is re-prompted this
@@ -167,8 +191,8 @@ def build_output_schema(
     """Describe the closed action menu + the agent's tools for the LLM (v2).
 
     ``kernel_verbs`` (ADR-0139 D12/D14/D13) adds the sections of the offered
-    kernel-surface verbs (``spawn_subagent``, ``propose_memory_note``,
-    ``propose_skill``) from the react-control-verbs prompt, after the answer block.
+    kernel-surface verbs (``propose_memory_note``, ``propose_skill``, ...) from the
+    react-control-verbs prompt, after the answer block.
     Empty (the default) renders exactly what it rendered before.
 
     The menu lists BOTH the agent's intra-process ``@tool`` registry and the
@@ -271,6 +295,126 @@ def _looks_like_truncated_action(text: str) -> bool:
 
 # Sent back when the model produces something that is not an action. Names both
 # legitimate continuations so the model does not read it as "you must call a tool".
+# Kernel handoff keys naming whom a plan step acts for (cambrian-core domain/acting_for.go).
+ACTING_FOR_KEY = "_acting_for"
+ACTING_FOR_NAME_KEY = "_acting_for_name"
+
+
+def with_acting_for(task_text: str, context: Optional[Dict[str, str]]) -> str:
+    """The step objective, followed by the react-turn ``acting-for`` line when the kernel
+    stamped the run principal on the handoff. Both values are kernel-written; they are
+    still neutralised so neither can close its region. Without the key the text is
+    returned unchanged."""
+    ctx = context or {}
+    principal = str(ctx.get(ACTING_FOR_KEY) or "").strip()
+    if not principal:
+        return task_text
+    name = str(ctx.get(ACTING_FOR_NAME_KEY) or "").strip()
+    who = f"{name} (principal {principal})" if name else principal
+    who = re.sub(r"(?i)</\s*acting_for\s*>", "[/acting_for]", who)
+    line = fragment("react-turn", "acting-for").render({"acting_for": who})
+    return f"{(task_text or '').rstrip()}\n\n{line}"
+
+
+# Kernel handoff key carrying the organisation's date (cambrian-core domain/calendar.go).
+CURRENT_DATE_KEY = "_current_date"
+
+
+def with_current_date(task_text: str, context: Optional[Dict[str, str]]) -> str:
+    """The step text, followed by the react-turn ``current-date`` block when the kernel
+    stamped today's date on the handoff (T-20261107-planner-and-chat-agent-are-not-told-
+    today-s). The date is the kernel's, never this process's clock, so every step of a
+    plan and the planner agree on it. Kernel-written; still neutralised so it cannot
+    close its region. Without the key the text is returned unchanged."""
+    today = str((context or {}).get(CURRENT_DATE_KEY) or "").strip()
+    if not today:
+        return task_text
+    today = re.sub(r"(?i)</\s*today\s*>", "[/today]", today)
+    block = fragment("react-turn", "current-date").render({"today": today})
+    return f"{(task_text or '').rstrip()}\n\n{block}"
+
+
+# Kernel handoff key carrying a fan-out child's whole item object (cambrian-core
+# domain/plan.go HandoffKeyFanOutItem, ADR-0145 D6.3).
+FAN_OUT_ITEM_KEY = "_fan_out_item"
+
+
+def with_fan_out_item(task_text: str, context: Optional[Dict[str, str]]) -> str:
+    """The step text, followed by the react-turn ``fan-out-item`` block when the kernel
+    stamped a fan-out child's whole item (the source record, not only the label in the
+    query). Kernel-written JSON; still neutralised so it cannot close its region.
+    Without the key the text is returned unchanged."""
+    item = str((context or {}).get(FAN_OUT_ITEM_KEY) or "").strip()
+    if not item:
+        return task_text
+    item = re.sub(r"(?i)</\s*item\s*>", "[/item]", item)
+    block = fragment("react-turn", "fan-out-item").render({"item": item})
+    return f"{(task_text or '').rstrip()}\n\n{block}"
+
+
+# Kernel handoff keys of the ADR-0145 D6 answer envelope (cambrian-core
+# domain/requirements.go HandoffKeyAnswerItems / domain/plan.go HandoffKeyStepInputs /
+# HandoffKeyEnvelopeViolations). Kernel-written; their presence is what tells this
+# step to finish with the envelope.
+ANSWER_ITEMS_KEY = "_answer_items"
+STEP_INPUTS_KEY = "_step_inputs"
+ENVELOPE_VIOLATIONS_KEY = "_envelope_violations"
+
+
+def answer_items(context: Optional[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """The checklist items the kernel asked this step to answer (ADR-0145 D6), or []."""
+    raw = str((context or {}).get(ANSWER_ITEMS_KEY) or "").strip()
+    if not raw:
+        return []
+    try:
+        items = json.loads(raw)
+    except ValueError:
+        return []
+    return [i for i in items if isinstance(i, dict) and i.get("id")] if isinstance(items, list) else []
+
+
+def with_answer_items(task_text: str, context: Optional[Dict[str, str]]) -> str:
+    """The step text, followed by the react-turn ``answer-items``, ``step-inputs`` and
+    ``envelope-repair`` blocks when the kernel stamped them (ADR-0145 D6): the items
+    the step's final answer must report on, the values bound to it from earlier
+    steps, and, on the one repair turn, what was wrong with its previous envelope.
+    Kernel-written JSON; still neutralised so it cannot close its region. Without the
+    keys the text is returned unchanged."""
+    ctx = context or {}
+    out = (task_text or "").rstrip()
+    for key, section, slot, tag in ((ANSWER_ITEMS_KEY, "answer-items", "items", "items"),
+                                    (STEP_INPUTS_KEY, "step-inputs", "inputs", "inputs"),
+                                    (ENVELOPE_VIOLATIONS_KEY, "envelope-repair", "violations", "violations")):
+        val = str(ctx.get(key) or "").strip()
+        if not val:
+            continue
+        val = re.sub(rf"(?i)</\s*{tag}\s*>", f"[/{tag}]", val)
+        out = f"{out}\n\n{fragment('react-turn', section).render({slot: val})}"
+    return out
+
+
+def build_answer_envelope(answer: str, action: Dict[str, Any]) -> str:
+    """The fixed answer envelope (ADR-0145 D6) from a final_answer action: the
+    answer text, the per-item results and the evidence refs the model gave. The
+    kernel validates it; this only shapes it, keeping whatever was given (a missing
+    item_results is reported by the kernel, never invented here)."""
+    results = action.get("item_results")
+    if isinstance(results, str):
+        try:
+            results = json.loads(results)
+        except ValueError:
+            results = []
+    if not isinstance(results, list):
+        results = []
+    refs = action.get("evidence_refs")
+    if isinstance(refs, str):
+        refs = [refs]
+    if not isinstance(refs, list):
+        refs = []
+    return json.dumps({"answer_text": answer, "item_results": results,
+                       "evidence_refs": [str(r) for r in refs]}, ensure_ascii=False)
+
+
 def _nudge(section: str, **values) -> str:
     """A mid-run loop note (prompts/react-nudges/v1.md). Notes are volatile: they go
     into the message stream, never into the system blocks (ADR-0139 D2)."""
@@ -278,6 +422,25 @@ def _nudge(section: str, **values) -> str:
 
 
 INFERRED_FINAL_ANSWER_NOTE = _nudge("inferred-answer")
+
+
+def _no_evidence_note(delegation_tool: Optional[str], system_tools: Any, agent: Any) -> str:
+    """The ADR-0145 D3 re-prompt for a plain-text reply in a run with no evidence, or ""
+    when the agent has no way to gather any (no delegation tool, no tool on its menu):
+    then the ordinary re-prompt applies. The delegation tool must be one the agent can
+    actually call (a local ``@tool`` or a menu entry), so the note never names a tool
+    that would be refused."""
+    registry = getattr(agent, "tools", None)
+    try:
+        local = set(registry.names()) if hasattr(registry, "names") else set(registry or ())
+    except Exception:  # noqa: BLE001 — a malformed registry offers no local tool
+        local = set()
+    names = {t.get("name") for t in system_tools or [] if isinstance(t, dict)}
+    if delegation_tool and (delegation_tool in local or delegation_tool in names):
+        return _nudge("inferred-answer-no-evidence-delegate", delegate=delegation_tool)
+    if names or local:
+        return _nudge("inferred-answer-no-evidence-tool")
+    return ""
 
 
 # OpenAI (and every gateway that mirrors it) constrains a function name to
@@ -489,6 +652,28 @@ _FINAL_ANSWER_TOOL_DEF = _control_def(
                                 "description": "the deliverable, in the required output format"},
                      "type": {"type": "string", "description": "result type; normally text"}},
     ["answer"])
+# ADR-0145 D6: final_answer for a step that answers checklist items. Same verb,
+# with the fixed envelope's per-item results; offered INSTEAD of the plain one
+# when the kernel stamped _answer_items, so every other agent's menu is unchanged.
+_FINAL_ANSWER_ENVELOPE_TOOL_DEF = _control_def(
+    "final_answer", {
+        "answer": {"type": "string", "description": "the answer text, in the required output format"},
+        "item_results": {"type": "array", "description": "one entry per requirement item", "items": {
+            "type": "object", "properties": {
+                "item": {"type": "string"},
+                "status": {"type": "string", "enum": ["satisfied", "not_found", "not_permitted", "failed"]},
+                "values": {"type": "array", "items": {"type": "object", "properties": {
+                    "name": {"type": "string"},
+                    "type": {"type": "string", "enum": ["string", "number", "money", "date", "id", "ref",
+                                                        "citation", "bool", "list", "object"]},
+                    "value": {"description": "the value, exactly as the evidence states it"},
+                    "evidence_ref": {"type": "string", "description": "the ledger id it was read from"}},
+                    "required": ["name", "type", "value", "evidence_ref"]}},
+                "reason": {"type": "string"}},
+            "required": ["item", "status"]}},
+        "evidence_refs": {"type": "array", "items": {"type": "string"}},
+        "type": {"type": "string", "description": "result type; normally text"}},
+    ["answer", "item_results"])
 _YIELD_TOOL_DEF = _control_def(
     "yield_subgoal", {"intent": {"type": "string", "description": "the sub-task to delegate"},
                       "capability_hint": {"type": "string",
@@ -496,7 +681,9 @@ _YIELD_TOOL_DEF = _control_def(
     ["intent"])
 
 
-# ADR-0139 D12 / D14 / D13: the control verbs that call a kernel surface. Their
+# ADR-0139 D14 / D13: the control verbs that call a kernel surface (ADR-0145 D14
+# removed D12's spawn_subagent: a worker hands extra work to the planner through its
+# own local delegate_to_planner tool, never through an SDK kernel verb). Their
 # texts are the react-control-verbs prompt (a separate id, so the prompts above and
 # their goldens are unchanged); each is offered only when the loop allows the verb.
 def _kernel_verb_def(name: str, properties: Dict[str, Any], required: List[str]) -> Dict[str, Any]:
@@ -505,17 +692,6 @@ def _kernel_verb_def(name: str, properties: Dict[str, Any], required: List[str])
             "parameters": {"type": "object", "properties": properties, "required": required}}
 
 
-_SPAWN_TOOL_DEF = _kernel_verb_def("spawn_subagent", {
-    "objective": {"type": "string", "description": "the sub-task and what to return"},
-    "mode": {"type": "string", "enum": ["isolated", "fork"],
-             "description": "isolated: fresh context; fork: also inherit a summary of your progress"},
-    "toolset": {"type": "array", "items": {"type": "string"},
-                "description": "tool names or globs, a subset of yours; empty for none"},
-    "target_agent_id": {"type": "string", "description": "optional: run another agent"},
-    "target_capability": {"type": "string", "description": "optional: run an agent with this capability"},
-    "output_schema": {"type": "object", "description": "optional JSON Schema for the answer"},
-    "max_tool_rounds": {"type": "integer", "description": "optional tool-call cap (narrows only)"},
-}, ["objective"])
 _NOTE_TOOL_DEF = _kernel_verb_def("propose_memory_note", {
     "scope": {"type": "string", "enum": ["personal", "org"]},
     "op": {"type": "string", "enum": ["append", "replace_section", "remove_section"]},
@@ -530,7 +706,37 @@ _PROPOSE_SKILL_TOOL_DEF = _kernel_verb_def("propose_skill", {
     "evidence_cids": {"type": "array", "items": {"type": "string"}},
     "base_version": {"type": "string", "description": "empty for a new skill, else the version revised"},
 }, ["name", "skill_md", "rationale"])
-_KERNEL_VERB_DEFS = {d["name"]: d for d in (_SPAWN_TOOL_DEF, _NOTE_TOOL_DEF, _PROPOSE_SKILL_TOOL_DEF)}
+_SCHEDULE_TOOL_DEF = _kernel_verb_def("schedule_task", {
+    "goal": {"type": "string", "description": "what to do at each run, written as the user's request"},
+    "cron": {"type": "string", "description": "5-field cron or @daily/@weekly; give cron OR rrule"},
+    "rrule": {"type": "string", "description": "e.g. FREQ=WEEKLY;BYDAY=MO;BYHOUR=8;BYMINUTE=0"},
+    "timezone": {"type": "string", "description": "IANA zone, e.g. Europe/Berlin; empty = UTC"},
+    "title": {"type": "string", "description": "a short name for the task"},
+    "delivery": {"type": "string", "enum": ["conversation", "notify", "email"]},
+}, ["goal"])
+_MANAGE_SCHEDULES_TOOL_DEF = _kernel_verb_def("manage_schedules", {
+    "op": {"type": "string", "enum": ["list", "pause", "resume", "delete"]},
+    "id": {"type": "string", "description": "the task id (not needed for list)"},
+}, ["op"])
+_PROPOSE_KNOWLEDGE_TOOL_DEF = _kernel_verb_def("propose_knowledge", {
+    "kind": {"type": "string", "description": "the knowledge kind (for an item)"},
+    "entity_id": {"type": "string", "description": "the entity the item is about"},
+    "values": {"type": "array", "description": "the item's predicate values",
+               "items": {"type": "object", "properties": {
+                   "predicate": {"type": "string"},
+                   "type": {"type": "string", "enum": ["text", "number", "date", "entity"]},
+                   "value": {"description": "the value; a date as ISO-8601 with an offset"}},
+                   "required": ["predicate", "type", "value"]}},
+    "request_commit": {"type": "boolean", "description": "ask the person to approve it as the committed value"},
+    "link": {"type": "object", "description": "instead of an item: a candidate link",
+             "properties": {"relation": {"type": "string"}, "from_ref": {"type": "string"},
+                            "to_ref": {"type": "string"}, "evidence_id": {"type": "string"}}},
+    "evidence_id": {"type": "string", "description": "the evidence the proposal rests on"},
+    "reason": {"type": "string", "description": "why; shown to the approver"},
+}, [])
+_KERNEL_VERB_DEFS = {d["name"]: d for d in (_NOTE_TOOL_DEF, _PROPOSE_SKILL_TOOL_DEF,
+                                            _SCHEDULE_TOOL_DEF, _MANAGE_SCHEDULES_TOOL_DEF,
+                                            _PROPOSE_KNOWLEDGE_TOOL_DEF)}
 _KERNEL_VERB_NAMES = tuple(_KERNEL_VERB_DEFS)
 
 # The loop's OWN vocabulary, as the model may emit it under native tool-calling.
@@ -564,7 +770,8 @@ def build_tool_definitions(agent, system_tools, include_discovery: bool = True,
                            include_skills: bool = False, *, include_memory: bool = False,
                            include_resolve: bool = False, include_final: bool = False,
                            include_yield: bool = False,
-                           kernel_verbs: Sequence[str] = ()) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+                           kernel_verbs: Sequence[str] = (),
+                           final_envelope: bool = False) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """Render the agent's tool menu as native tool definitions (ADR-0097 Phase B).
 
     Returns ``(definitions, name_map)`` where ``name_map`` is sanitized→original. The
@@ -607,10 +814,11 @@ def build_tool_definitions(agent, system_tools, include_discovery: bool = True,
         [_MEMORY_TOOL_DEF] if include_memory else []) + (
         [_RESOLVE_TOOL_DEF] if include_resolve else []) + (
         [_YIELD_TOOL_DEF] if include_yield else []) + [
-        # ADR-0139 D12/D14/D13: spawn_subagent, propose_memory_note, propose_skill,
-        # only those the loop offers this run.
+        # ADR-0139 D14/D13: propose_memory_note, propose_skill, ..., only those the
+        # loop offers this run.
         _KERNEL_VERB_DEFS[v] for v in kernel_verbs if v in _KERNEL_VERB_DEFS] + (
-        [_FINAL_ANSWER_TOOL_DEF] if include_final else [])
+        [_FINAL_ANSWER_ENVELOPE_TOOL_DEF if final_envelope else _FINAL_ANSWER_TOOL_DEF]
+        if include_final else [])
     for d in control_defs:
         name_map[d["name"]] = d["name"]
         defs.append(dict(d))
@@ -808,21 +1016,32 @@ def run_think(
     context_config: Any = None,
     expected_output: str = "",
     acceptance: str = "",
-    allow_spawn_subagent: Optional[bool] = None,
     allow_memory_note_writes: Optional[bool] = None,
     allow_skill_proposals: Optional[bool] = None,
+    allow_scheduled_tasks: Optional[bool] = None,
+    allow_knowledge_proposals: Optional[bool] = None,
+    evidence_reprompt: Optional[bool] = None,
+    turn_evidence: Optional[bool] = None,
+    delegation_tool: Optional[str] = None,
 ) -> AgentResult:
     """Drive the reason/retrieve/act loop for one task and return the final result.
 
-    ADR-0139 D12/D14/D13 kernel-surface verbs: ``allow_spawn_subagent``,
-    ``allow_memory_note_writes`` and ``allow_skill_proposals`` (None = the agent's
-    ``allow_subagents`` / ``allow_memory_note_writes`` / ``allow_skill_proposals``
-    attribute, False on a plain CognitiveAgent) offer ``spawn_subagent``,
-    ``propose_memory_note`` and ``propose_skill``, each only when the substrate
-    has the method (and, for notes, when the kernel served the notes snapshot). A
-    subagent run (``task.context['_subagent']``) is shaped by its handoff: its
-    tool-round cap, its toolset, its output schema and, for a fork, the parent's
-    summary in the Evidence region.
+    ADR-0145 D3 evidence re-prompt: ``evidence_reprompt`` (None = ``$CAMBRIAN_EVIDENCE_REPROMPT``,
+    default off) changes the one re-prompt a plain-text reply gets. When the run has
+    gathered no evidence — no tool ran, no memory query returned anything, and nothing
+    was seeded (upstream steps, workspace, seed recall, a resumed yield) — the re-prompt
+    offers ``delegation_tool`` (None = the agent's ``delegation_tool`` attribute; e.g. the
+    chat front desk's ``delegate_to_planner``) or, without one, the next tool, instead of
+    pushing toward final_answer. ``turn_evidence`` lets a caller that seeds its own
+    evidence outside the loop (the chat agent's recalled memory) say whether it did:
+    True counts as evidence, False/None leave the decision to what the loop saw.
+
+    ADR-0139 D14/D13 kernel-surface verbs: ``allow_memory_note_writes`` and
+    ``allow_skill_proposals`` (None = the agent's attribute of the same name, False
+    on a plain CognitiveAgent) offer ``propose_memory_note`` and ``propose_skill``,
+    each only when the substrate has the method (and, for notes, when the kernel
+    served the notes snapshot). ADR-0145 D14 removed ``spawn_subagent`` and the
+    subagent-child shaping that came with it.
 
     The retrieval loop always fires: the scratchpad is seeded with the
     server-assembled Global Workspace (``task.working_memory``, ADR-0022) and a
@@ -876,59 +1095,15 @@ def run_think(
     # budget is its default, so a deployment that tuned one keeps its meaning.
     skill_budget_tokens = (ctx_cfg.instructions_budget_tokens
                            or _DEFAULT_MAX_SKILL_CHARS // CHARS_PER_TOKEN)
-    # ADR-0139 D12: a subagent run is shaped by the kernel's handoff keys. Every
-    # limit is ALSO enforced kernel-side; these keep the child's own loop honest.
-    # The marker is the kernel's own handoff key (SubagentKeyMarker in
-    # internal/substrate/network/subagent.go), not a signal the SDK invents.
-    _sub_ctx = getattr(task, "context", None) or {}
-    is_subagent = _sub_ctx.get("_subagent") == "1"
-    # T-20261106-agent-refuses-its-whole-legitimate-task-when: a child's context is
-    # what its parent handed it (objective, FORK summary, refs), not a second
-    # run-start trawl. By default a child gets NO automatic seed recall and NO D14
-    # memory-notes snapshot: its answer goes to the parent, not to the user, and
-    # the parent passes whatever notes or memory matter in its FORK summary. The
-    # child can still call memory_query on demand. ContextConfig.subagent_seed_recall
-    # / subagent_memory_notes turn them back on.
-    #
-    # Deliberately NOT done: trusting the child objective more than any other task
-    # text. The objective is model-written by a parent that may itself have read
-    # attacker content (a web page, a document, a tool result), so promoting it to
-    # trusted instructions would let one spawn launder an indirect injection into
-    # the child's rules. The real bounds on a child are structural: the toolset
-    # subset, the child lease, the depth limit and the D11 hooks, all enforced
-    # kernel-side; the prompt's data/instruction separation stays as a second line.
-    child_skip_recall = is_subagent and not ctx_cfg.subagent_seed_recall
-    child_skip_notes = is_subagent and not ctx_cfg.subagent_memory_notes
     # ADR-0139 D14 slot: the principal's memory notes, read ONCE, frozen for the run.
-    # A no-op until the substrate grows the RPC (see _fetch_memory_notes). Still READ
-    # for a child (notes_served decides whether propose_memory_note can be offered,
-    # as D12/D14 decided), only not rendered.
+    # A no-op until the substrate grows the RPC (see _fetch_memory_notes).
     _notes, notes_served = _fetch_memory_notes_ex(agent, task)
-    if _notes and not child_skip_notes:
+    if _notes:
         wm.set_memory_notes(_notes)
-    sub_toolset: Optional[set] = None
-    if is_subagent:
-        try:
-            cap = int(_sub_ctx.get("_subagent_max_tool_rounds") or 0)
-        except ValueError:
-            cap = 0
-        if cap > 0:
-            max_tool_rounds = min(max_tool_rounds, cap)
-        sub_toolset = {t for t in (_sub_ctx.get("_subagent_toolset") or "").split(",") if t}
-        if _sub_ctx.get("_subagent_context_summary"):
-            wm.add_evidence(_sub_ctx["_subagent_context_summary"], source="parent_context")
-        if _sub_ctx.get("_subagent_context_refs"):
-            wm.add_evidence(
-                "Content the parent shared (re-open with resolve_cid): "
-                + _sub_ctx["_subagent_context_refs"], source="parent_refs")
-        if _sub_ctx.get("_subagent_output_schema"):
-            constraints = list(constraints or []) + [
-                "Your final answer must be only a JSON document valid against this JSON "
-                "Schema: " + _sub_ctx["_subagent_output_schema"]]
     kernel_verbs = _offered_kernel_verbs(
-        agent, task, is_subagent=is_subagent, sub_ctx=_sub_ctx, sub_toolset=sub_toolset,
-        notes_served=notes_served, spawn=allow_spawn_subagent, notes=allow_memory_note_writes,
-        skills=allow_skill_proposals)
+        agent, task, notes_served=notes_served, notes=allow_memory_note_writes,
+        skills=allow_skill_proposals, schedules=allow_scheduled_tasks,
+        knowledge=allow_knowledge_proposals)
     disabled_verbs: set = set()  # verbs the kernel answered UNIMPLEMENTED this run
     # Only the legacy engine ranks entries by cosine to the task; the default engine
     # budgets by tokens, so it does not spend an Embed RPC on the intent.
@@ -953,12 +1128,22 @@ def run_think(
     mem_exhausted = False
     tool_exhausted = False
     veto_counts: Dict[str, int] = {}  # ADR-0041 D4: per-action hard-veto tally
+    # ADR-0145 D14.5: kernel refusals per (tool, canonical args, reason). The same
+    # refusal twice ends the loop: the kernel's answer is deterministic.
+    denial_counts: Dict[Tuple[str, str, str], int] = {}
     success_dedup_counts: Dict[str, int] = {}  # ADR-0041 D4: per-action already-succeeded tally
     truncation_retries = 0  # #2: consecutive token-limit truncations re-prompted
     inferred_answer_retries = 0  # non-action responses re-prompted (see note above)
+    drafted_answer = ""  # the last inferred answer re-prompted; carried on ReActLoopError
     unknown_action_retries = 0  # unrecognised action kinds re-prompted (_MAX_UNKNOWN_ACTION_RETRIES)
     reflections: List[str] = []  # ADR-0052: verbal reflections extracted on hard-veto
     inline_resolves: int = 0   # ADR-0048 residual: budget for resolve_cid as="inline"
+    # ADR-0145 D3: whether this run holds any evidence. Structural only: set by what
+    # the loop seeded or executed, never by what the model wrote.
+    evidence_on = _evidence_reprompt_default() if evidence_reprompt is None else bool(evidence_reprompt)
+    evidence_seen = bool(turn_evidence)
+    if delegation_tool is None:
+        delegation_tool = getattr(agent, "delegation_tool", None) or None
 
     # Seed A — the Global Workspace context the Substrate already assembled (given).
     # Wire fetch_fn so a high-precision prior-step result is resolved to its FULL body
@@ -973,6 +1158,24 @@ def run_think(
     upstream = parse_step_dependencies(getattr(task, "context", None))
     if upstream:
         wm.add_evidence(render_step_dependencies(upstream), source="upstream")
+        evidence_seen = True
+    # Whom this step acts for, stamped by the kernel on every plan step (_acting_for,
+    # domain.HandoffKeyActingFor): the run principal its tools authenticate as. Shown
+    # in the Task region after the objective, so a step that names that person ("read
+    # <name>'s email") is read as the user's own data, not another user's
+    # (T-20261107-delegated-steps-name-the-conversation-owner-in). Recall and tool
+    # ranking keep the bare objective.
+    task_prompt_text = with_acting_for(task.text, getattr(task, "context", None))
+    # Today's date, stamped by the kernel on every plan step (_current_date): relative
+    # asks resolve against it. Task region only, like acting-for; recall and tool
+    # ranking keep the bare objective.
+    task_prompt_text = with_current_date(task_prompt_text, getattr(task, "context", None))
+    # A fan-out child's whole item (_fan_out_item, ADR-0145 D6.3), Task region too.
+    task_prompt_text = with_fan_out_item(task_prompt_text, getattr(task, "context", None))
+    # ADR-0145 D6: the requirement items this step answers, its bound inputs and the
+    # repair notes, Task region too; their presence makes the final answer the envelope.
+    task_prompt_text = with_answer_items(task_prompt_text, getattr(task, "context", None))
+    envelope_items = answer_items(getattr(task, "context", None))
     _covered = covered_steps(upstream)
     _refs = [r for r in (task.working_memory or [])
              if not (r.type == "step_result" and _covered.intersection(r.labels or []))]
@@ -984,6 +1187,7 @@ def run_think(
             fetch_fn = lambda cid: _sub.get_context_node(cid, task.session_token_id)  # noqa: E731
         given = assemble_context(_refs, fetch_fn=fetch_fn)
     if given:
+        evidence_seen = True
         # The seed's CID is the canonical "workspace has content" pointer: the model
         # can pass it as ``{"$cid": "<seed_cid>"}`` in a tool_call to write the full
         # workspace content to a file in one call. (Surface this hint inside the
@@ -1000,10 +1204,8 @@ def run_think(
     # (the agent-initiated retrieval loop, not just server-pushed context).
     # v2: emitted as a typed Step(kind="memory_query") so the query + status
     # are both visible in the trajectory (issue #1: "memory queries don't show
-    # what was queried"). A subagent child skips it by default (child_skip_recall
-    # above).
-    if (seed_recall and not child_skip_recall
-            and getattr(agent, "memory", None) is not None and task.text.strip()):
+    # what was queried").
+    if seed_recall and getattr(agent, "memory", None) is not None and task.text.strip():
         mem_queries += 1
         seed_q = task.text.strip()
         seed_results = _safe_recall(agent, seed_q, task.session_token_id)
@@ -1013,14 +1215,15 @@ def run_think(
         # the task look like instructions planted in evidence (T-20261106-agent-
         # refuses-its-whole-legitimate-task-when).
         wm.add_seed_recall(seed_q, seed_results)
-    elif seed_recall and child_skip_recall:
-        logger.info("react_seed_recall_skipped", extra={"reason": "subagent_child"})
+        if seed_results:
+            evidence_seen = True
 
     # Seed C — a RESUMED yield (ADR-0037 D10 delegate-and-continue): the kernel
     # re-dispatched us with a delegated sub-goal's result. Surface it so the
     # Executive incorporates it and answers, rather than re-yielding the same intent.
     _ctx = getattr(task, "context", None) or {}
     if _ctx.get("_yield_result"):
+        evidence_seen = True
         resumed_intent = _ctx.get("_yield_resumed_intent", "")
         wm.add_evidence(
             f"<delegated intent={resumed_intent!r}>{_ctx['_yield_result']}</delegated>\n"
@@ -1060,19 +1263,12 @@ def run_think(
     # Defaulting to seed_system_tools preserves the first shape for callers that
     # say nothing; the second asks for it explicitly.
     find_tools_enabled = seed_system_tools if allow_find_tools is None else bool(allow_find_tools)
-    system_tools = _list_system_tools(agent, query=_seed_tool_query, full=True) if seed_system_tools else []
+    system_tools = _list_system_tools(agent, query=_seed_tool_query, full=True,
+                                      session_token_id=task.session_token_id) if seed_system_tools else []
     # ADR-0046: the loadable skill menu — agent-local skills (always present) first,
     # then task-relevant system skills (the push), with same-name system skills
     # shadowed by agent-local ones (structural prioritization, no central ranking).
     system_skills = _assemble_skill_menu(agent, query=task.text)
-    def _child_menu(tools: List[Dict]) -> List[Dict]:
-        """ADR-0139 D12: a subagent's menu is its toolset, on every (re)listing (the
-        kernel's lease ceiling holds whatever the client shows)."""
-        if sub_toolset is None:
-            return tools
-        return [t for t in tools or [] if t.get("name") in sub_toolset]
-
-    system_tools = _child_menu(system_tools)
 
     # #4: the ActionProtocol is loop-INVARIANT (agent, granted tools/skills, and the
     # domain answer-format are fixed for the task). Compose it ONCE so it is identical
@@ -1096,7 +1292,7 @@ def run_think(
             agent, system_tools, include_discovery=find_tools_enabled,
             include_skills=bool(system_skills), include_memory=allow_memory,
             include_resolve=True, include_final=True, include_yield=allow_yield_subgoal,
-            kernel_verbs=kernel_verbs)
+            kernel_verbs=kernel_verbs, final_envelope=bool(envelope_items))
 
     tool_defs, tool_name_map = _native_defs()
     # ADR-0097 D8: under native tool-calling the model's history is THIS list, not a
@@ -1211,11 +1407,11 @@ def run_think(
         # turn (memory notes, instructions, evidence, history, then the task); the
         # legacy engine returns None and keeps the Task + Trajectory layout.
         user_content = engine.render_user_turn(
-            task_text=task.text, step_no=round_no + 1, notes=notes,
+            task_text=task_prompt_text, step_no=round_no + 1, notes=notes,
             expected_output=expected_output, acceptance=acceptance)
         parts = build_prompt_parts(
             role=role,
-            task=task.text,
+            task=task_prompt_text,
             # #3 trajectory reframe: number the bounded buffer as an ordered loop
             # history and stamp the current step, so the model reads its own progress
             # ("you are at step N; here is what you did") instead of a flat tag pile.
@@ -1245,7 +1441,7 @@ def run_think(
         if (user_content is not None and not native_prompt
                 and engine.compact_prompt(estimate_tokens(parts.legacy_prompt()))):
             parts.messages[0]["content"] = engine.render_user_turn(
-                task_text=task.text, step_no=round_no + 1, notes=notes,
+                task_text=task_prompt_text, step_no=round_no + 1, notes=notes,
                 expected_output=expected_output, acceptance=acceptance)
         # No client-side timeout on the agent's LLM call: passing the inbound RPC's
         # remaining budget here makes the managed-generate gRPC deadline strangle a
@@ -1292,7 +1488,8 @@ def run_think(
             pending_tool_call_id = ""
             pending_extra_call_ids = []
             if seed_system_tools:
-                system_tools = _child_menu(_list_system_tools(agent, query=_seed_tool_query, full=False))
+                system_tools = _list_system_tools(agent, query=_seed_tool_query, full=False,
+                                                     session_token_id=task.session_token_id)
             system_tools = _merge_tools(system_tools, skill_tools)
             action_protocol = _compose_action_protocol(
                 agent, output_schema, system_tools, system_skills,
@@ -1327,6 +1524,7 @@ def run_think(
                 kw = {"system": native_system, "cache_ttl": run_cache_ttl}
             _log_llm_call("native", round_no + 1, native_system if not fold_system else [],
                           len(conversation))
+            _trace_t0 = _run_trace.now_ns()
             try:
                 n_res = native_fn(
                     task.session_token_id,
@@ -1353,6 +1551,10 @@ def run_think(
                                         conversation[0].get("content") or "") if p)}
                     continue
                 _log_llm_result("native", n_res)
+                _run_trace.model_call(agent, task, path="native", round_no=round_no + 1,
+                                      system=native_system if not fold_system else [],
+                                      messages=conversation, tools=tool_defs, text=n_text,
+                                      tool_calls=n_calls, stop=n_stop, res=n_res, start_ns=_trace_t0)
                 # Echo the assistant turn back VERBATIM, tool_calls included. This is
                 # what lets the model see that the call was its own.
                 assistant_turn: Dict[str, Any] = {"role": "assistant", "content": n_text or ""}
@@ -1394,7 +1596,8 @@ def run_think(
                 # Back on the prose menu, which wants Tier-1: full schemas would bloat
                 # every prompt with detail the menu never renders.
                 if seed_system_tools:
-                    system_tools = _child_menu(_list_system_tools(agent, query=_seed_tool_query, full=False))
+                    system_tools = _list_system_tools(agent, query=_seed_tool_query, full=False,
+                                                     session_token_id=task.session_token_id)
                 system_tools = _merge_tools(system_tools, skill_tools)
                 # The action menu is composed ONCE before the loop and currently says
                 # "your tools are attached to this request". That is now false, so
@@ -1458,15 +1661,27 @@ def run_think(
             if mem_queries >= max_memory_queries:
                 # Graceful degradation. First time over budget: nudge the LLM to
                 # answer best-effort. If it *still* insists on querying, terminate
-                # with a best-effort answer rather than loop forever (never crash).
+                # rather than loop forever (never crash). The model never declared an
+                # answer, so the run ends as an ERROR carrying what it gathered — not
+                # as a "text" result a caller would read as the agent's finished reply
+                # (ADR-0145 D14: a refusal or failure is never reported as success).
                 if mem_exhausted:
                     logger.warning("react_memory_budget_exceeded", extra={"round": round_no})
-                    return AgentResult.from_text(_best_effort(wm), type=result_type or "text")
+                    gathered = _best_effort(wm)
+                    return AgentResult.from_text(
+                        f"Could not complete the task: the memory-query budget "
+                        f"({max_memory_queries}) was exhausted and the model kept querying "
+                        f"instead of answering."
+                        + (f" What was gathered:\n{gathered}" if gathered else ""),
+                        type="error",
+                    )
                 mem_exhausted = True
                 _control_reply(_nudge("memory-budget"))
                 continue
             mem_queries += 1
             results = _safe_recall(agent, query, task.session_token_id)
+            if results:
+                evidence_seen = True
             logger.info(
                 "react_memory_query",
                 extra={"round": round_no, "query": query, "results_count": len(results)},
@@ -1538,6 +1753,8 @@ def run_think(
                 if call_id in outs:
                     _note_call(wm, call_id, name, args)
                     out = outs[call_id]
+                    _run_trace.tool_call(agent, task, name=name, args=args, result=out,
+                                         call_id=call_id, round_no=round_no)
                     card = ToolCard.from_result(
                         name, args, out, summarizer=getattr(agent, "tool_summarizer", None))
                     full_body_str = out if isinstance(out, str) else json.dumps(out, default=str)
@@ -1555,7 +1772,8 @@ def run_think(
                 wm.release()
             if tool_rounds >= max_tool_rounds and len(to_run) < len(action["calls"]):
                 if tool_exhausted and not to_run:
-                    raise ReActLoopError(f"tool-round budget ({max_tool_rounds}) exceeded")
+                    raise ReActLoopError(f"tool-round budget ({max_tool_rounds}) exceeded",
+                                         draft=drafted_answer)
                 tool_exhausted = True
                 wm.add_text(_nudge("tool-budget", max_tool_rounds=max_tool_rounds))
             continue
@@ -1652,7 +1870,8 @@ def run_think(
                 # loop closes an unanswered tool_call_id before the next request,
                 # which is what keeps the conversation valid for the provider.
                 if tool_exhausted:
-                    raise ReActLoopError(f"tool-round budget ({max_tool_rounds}) exceeded")
+                    raise ReActLoopError(f"tool-round budget ({max_tool_rounds}) exceeded",
+                                         draft=drafted_answer)
                 tool_exhausted = True
                 logger.info("react_tool_budget_exhausted",
                             extra={"round": round_no, "budget": max_tool_rounds})
@@ -1679,12 +1898,25 @@ def run_think(
                 # sandboxed evaluation (interview) session and auto-approve
                 # dangerous tools within it (ADR-0037/0039).
                 out = _call_system_tool(agent, name, args, task.session_token_id, task.task_id)
+                stop = _repeated_denial(denial_counts, name, args, out)
+                if stop:
+                    logger.warning("react_repeated_denial_stop",
+                                   extra={"round": round_no, "tool": name, "reason": stop[:300]})
+                    _run_trace.tool_call(agent, task, name=name, args=args, result=out,
+                                         call_id=pending_tool_call_id, round_no=round_no)
+                    return AgentResult.from_text(
+                        f"Could not complete this part: the kernel refused {name!r} twice with the "
+                        f"same reason, so it was not tried again. Reason: {stop}",
+                        type="error",
+                    )
             logger.info(
                 "react_tool_call",
                 # NOTE: "args" is a RESERVED LogRecord attribute — using it as an
                 # extra= key raises KeyError("Attempt to overwrite 'args'"). Use tool_args.
                 extra={"round": round_no, "tool": name, "tool_args": args},
             )
+            _run_trace.tool_call(agent, task, name=name, args=args, result=out,
+                                 call_id=pending_tool_call_id, round_no=round_no)
             # ADR-0041 D1/D3: record an invocation card (tool + args + status +
             # summary). A heavy system-tool result the kernel offloaded keeps
             # {summary + cid}; otherwise it is summarized inline (heuristic by
@@ -1744,7 +1976,8 @@ def run_think(
                 _control_reply("<note>tool-discovery budget exhausted; use a tool already "
                                "in your menu, or answer/yield.</note>")
                 continue
-            found = _list_system_tools(agent, query=need, full=native_tools)
+            found = _list_system_tools(agent, query=need, full=native_tools,
+                                       session_token_id=task.session_token_id)
             seen = {t.get("name") for t in system_tools}
             added = [t for t in found if t.get("name") not in seen]
             system_tools = system_tools + added
@@ -1933,7 +2166,7 @@ def run_think(
                 wm.add_text("<note>describe budget exhausted; call a tool you've already "
                             "described, or answer/yield.</note>")
                 continue
-            spec = _describe_tool(agent, name)
+            spec = _describe_tool(agent, name, session_token_id=task.session_token_id)
             logger.info("react_describe_tool", extra={"round": round_no, "tool": name,
                                                       "found": spec is not None})
             if spec:
@@ -2054,25 +2287,16 @@ def run_think(
             continue
 
         if kind in _KERNEL_VERB_NAMES:
-            # ADR-0139 D12/D14/D13: a verb that calls a kernel surface. Its outcome,
+            # ADR-0139 D14/D13: a verb that calls a kernel surface. Its outcome,
             # refusals included, is an observation for the model, never a crash.
             if kind not in kernel_verbs or kind in disabled_verbs:
                 _control_reply(_kernel_verb_unavailable(kind))
                 continue
-            if kind == "spawn_subagent":
-                if tool_rounds >= max_tool_rounds:
-                    _control_reply(_nudge("tool-budget", max_tool_rounds=max_tool_rounds))
-                    continue
-                tool_rounds += 1
-            reply = _run_kernel_verb(agent, task, kind, action, _base_engine(wm), round_no)
-            if reply is None:
+            rendered = _run_kernel_verb(agent, task, kind, action, round_no)
+            if rendered is None:
                 disabled_verbs.add(kind)
                 _control_reply(_kernel_verb_unavailable(kind))
                 continue
-            rendered, evidence = reply
-            if evidence:
-                # The structured result is EVIDENCE (data), in the Evidence region.
-                _base_engine(wm).add_evidence(evidence, source=f"subagent:{action.get('mode') or 'isolated'}")
             if not _answer_native_turn(rendered):
                 wm.add_text(rendered)
             continue
@@ -2130,15 +2354,26 @@ def run_think(
                 continue
             raise ReActLoopError(
                 f"model kept emitting an unknown action {kind!r} "
-                f"({_MAX_UNKNOWN_ACTION_RETRIES} re-prompts)")
+                f"({_MAX_UNKNOWN_ACTION_RETRIES} re-prompts)", draft=drafted_answer)
 
         if action.get("_inferred") and inferred_answer_retries < _MAX_INFERRED_ANSWER_RETRIES:
             inferred_answer_retries += 1
+            if isinstance(action.get("answer"), str) and action["answer"].strip():
+                drafted_answer = action["answer"]
             logger.info(
                 "react_inferred_answer_reprompt",
                 extra={"round": round_no, "retry": inferred_answer_retries,
                        "text_preview": str(action.get("answer", ""))[:200]},
             )
+            # ADR-0145 D3: with no evidence in the run, offer delegation or the next
+            # tool rather than pushing the draft toward final_answer (structural).
+            no_evidence_note = (_no_evidence_note(delegation_tool, system_tools, agent)
+                                if evidence_on and not evidence_seen and tool_rounds == 0 else "")
+            if no_evidence_note:
+                logger.info("react_inferred_answer_no_evidence",
+                            extra={"round": round_no, "delegation_tool": delegation_tool or ""})
+                wm.add_text(no_evidence_note)
+                continue
             # Native: plain text is not an answer, the final_answer tool is (ADR-0139 D3).
             wm.add_text(_nudge("inferred-answer-native") if native_tools and conversation
                         else INFERRED_FINAL_ANSWER_NOTE)
@@ -2164,6 +2399,10 @@ def run_think(
             "react_final_answer",
             extra={"round": round_no, "answer_preview": answer[:200]},
         )
+        if envelope_items:
+            # ADR-0145 D6: the step answers checklist items, so its deliverable is the
+            # fixed envelope; the kernel validates it against the ledger.
+            return AgentResult.from_text(build_answer_envelope(answer, action), type="json")
         return AgentResult.from_text(answer, type=result_type or action.get("type", "text"))
 
 
@@ -2331,6 +2570,7 @@ def _generate_text_turn(agent, task, parts, *, structured: bool, cache_ttl: str,
     req_fn = getattr(sub, "generate_request", None) if structured else None
     if req_fn is not None:
         _log_llm_call("text", round_no, parts.system, len(parts.messages))
+        _trace_t0 = _run_trace.now_ns()
         try:
             res = req_fn(task.session_token_id, system=parts.system, messages=parts.messages,
                          cache_ttl=cache_ttl, max_tokens=max_tokens, temperature=temperature,
@@ -2345,8 +2585,11 @@ def _generate_text_turn(agent, task, parts, *, structured: bool, cache_ttl: str,
                 structured = False
             else:
                 _log_llm_result("text", res)
+                _run_trace.model_call(agent, task, path="text", round_no=round_no, system=parts.system,
+                                      messages=parts.messages, text=res.text, res=res, start_ns=_trace_t0)
                 return res.text, True
     _log_llm_call("text-legacy", round_no, [], 1)
+    _trace_t0 = _run_trace.now_ns()
     raw = sub.generate(
         task.session_token_id,
         parts.legacy_prompt(),
@@ -2354,6 +2597,9 @@ def _generate_text_turn(agent, task, parts, *, structured: bool, cache_ttl: str,
         temperature=temperature,
         timeout_ms=0,
     )
+    _run_trace.model_call(agent, task, path="text-legacy", round_no=round_no,
+                          prompt=parts.legacy_prompt(), text=raw if isinstance(raw, str) else str(raw),
+                          start_ns=_trace_t0)
     return raw, structured and req_fn is not None
 
 
@@ -2547,35 +2793,40 @@ def _flag(explicit: Optional[bool], agent, attr: str) -> bool:
     return bool(getattr(agent, attr, False))
 
 
-def _offered_kernel_verbs(agent, task, *, is_subagent: bool, sub_ctx: Dict[str, str],
-                          sub_toolset: Optional[set], notes_served: bool,
-                          spawn: Optional[bool], notes: Optional[bool],
-                          skills: Optional[bool]) -> List[str]:
-    """The kernel-surface verbs this run offers (ADR-0139 D12/D14/D13), fixed for the
+def _offered_kernel_verbs(agent, task, *, notes_served: bool, notes: Optional[bool],
+                          skills: Optional[bool], schedules: Optional[bool] = None,
+                          knowledge: Optional[bool] = None) -> List[str]:
+    """The kernel-surface verbs this run offers (ADR-0139 D14/D13), fixed for the
     run so the tool definitions stay a stable, cacheable prefix.
 
-    - spawn_subagent: the agent allows it, the substrate has the method, the run has a
-      lease, and (for a subagent) the kernel said another level is allowed.
-    - propose_memory_note: allowed, the method exists, the kernel served the notes
-      snapshot, and a subagent only when its toolset named the verb (the kernel would
-      refuse it SCOPE_DENIED otherwise).
-    - propose_skill: allowed and the method exists; never offered to a subagent unless
-      its toolset named it.
+    - propose_memory_note: allowed, the method exists and the kernel served the notes
+      snapshot.
+    - propose_skill: allowed, the method exists and the run has a lease.
+    - schedule_task / manage_schedules (capability "scheduled-tasks"): allowed
+      (``allow_scheduled_tasks``), the methods exist and the run has a lease — the
+      kernel takes the owner from it.
+    - propose_knowledge: allowed (``allow_knowledge_proposals``), the method exists and
+      the run has a lease.
+
+    ADR-0145 D14 removed spawn_subagent, and with it the subagent-child toolset
+    narrowing these verbs used to honour.
     """
     sub = getattr(agent, "substrate", None)
     lease = getattr(task, "session_token_id", "") or ""
     has = lambda name: sub is not None and callable(getattr(sub, name, None))  # noqa: E731
-    named = lambda verb: sub_toolset is not None and verb in sub_toolset  # noqa: E731
     out: List[str] = []
-    if (_flag(spawn, agent, "allow_subagents") and has("spawn_subagent") and lease
-            and sub_ctx.get("_subagent_may_spawn", "true") != "false"):
-        out.append("spawn_subagent")
     if (_flag(notes, agent, "allow_memory_note_writes") and has("propose_memory_note")
-            and notes_served and (not is_subagent or named("propose_memory_note"))):
+            and notes_served):
         out.append("propose_memory_note")
-    if (_flag(skills, agent, "allow_skill_proposals") and has("propose_skill") and lease
-            and (not is_subagent or named("propose_skill"))):
+    if _flag(skills, agent, "allow_skill_proposals") and has("propose_skill") and lease:
         out.append("propose_skill")
+    if _flag(schedules, agent, "allow_scheduled_tasks") and lease:
+        if has("propose_scheduled_task"):
+            out.append("schedule_task")
+        if has("manage_scheduled_task") and has("list_scheduled_tasks"):
+            out.append("manage_schedules")
+    if _flag(knowledge, agent, "allow_knowledge_proposals") and has("propose_knowledge") and lease:
+        out.append("propose_knowledge")
     return out
 
 
@@ -2591,44 +2842,12 @@ def _as_list(v) -> List[str]:
     return [str(t) for t in v if str(t).strip()]
 
 
-def _run_kernel_verb(agent, task, kind: str, action: Dict[str, Any], engine,
-                     round_no: int) -> Optional[Tuple[str, str]]:
-    """Call one kernel-surface verb. Returns (the observation for the model, the
-    structured evidence to keep or ""), or None when the kernel does not serve it."""
+def _run_kernel_verb(agent, task, kind: str, action: Dict[str, Any],
+                     round_no: int) -> Optional[str]:
+    """Call one kernel-surface verb. Returns the observation for the model, or None
+    when the kernel does not serve it."""
     sub = agent.substrate
     lease = task.session_token_id
-    if kind == "spawn_subagent":
-        objective = str(action.get("objective") or "").strip()
-        if not objective:
-            return ("<note>spawn_subagent needs an objective.</note>", "")
-        mode = "fork" if str(action.get("mode") or "").lower() == "fork" else "isolated"
-        summary, refs = "", []
-        if mode == "fork":
-            fork = getattr(engine, "fork_summary", None)
-            if callable(fork):
-                try:
-                    summary, refs = fork(task.text)
-                except Exception:  # noqa: BLE001 — a fork without a summary still runs
-                    summary, refs = "", []
-        import hashlib
-        key = hashlib.sha256(f"{task.task_id}|{round_no}|{objective}".encode("utf-8")).hexdigest()[:24]
-        try:
-            rounds = int(action.get("max_tool_rounds") or 0)
-        except (TypeError, ValueError):
-            rounds = 0
-        res = sub.spawn_subagent(
-            lease, objective, mode=mode, toolset=_as_list(action.get("toolset")),
-            target_agent_id=str(action.get("target_agent_id") or ""),
-            target_capability=str(action.get("target_capability") or ""),
-            output_schema=action.get("output_schema") or None,
-            context_summary=summary, context_refs=refs, max_tool_rounds=max(rounds, 0),
-            client_spawn_id=key)
-        if res is None:
-            return None
-        logger.info("react_spawn_subagent", extra={
-            "round": round_no, "mode": mode, "status": res.get("status"),
-            "exit_reason": res.get("exit_reason"), "error": res.get("error", "")})
-        return _render_subagent_result(res)
     if kind == "propose_memory_note":
         res = sub.propose_memory_note(
             lease, scope=str(action.get("scope") or "personal"), op=str(action.get("op") or "append"),
@@ -2636,7 +2855,7 @@ def _run_kernel_verb(agent, task, kind: str, action: Dict[str, Any], engine,
             reason=str(action.get("reason") or ""))
         if res is None:
             return None
-        return (_render_verb_observation("propose_memory_note", res), "")
+        return _render_verb_observation("propose_memory_note", res)
     if kind == "propose_skill":
         res = sub.propose_skill(
             lease, name=str(action.get("name") or ""), skill_md=str(action.get("skill_md") or ""),
@@ -2648,8 +2867,54 @@ def _run_kernel_verb(agent, task, kind: str, action: Dict[str, Any], engine,
         obs = dict(res)
         if obs.get("accepted"):
             obs["note"] = "queued for operator approval; inactive until approved"
-        return (_render_verb_observation("propose_skill", obs), "")
-    return ("<note>unknown verb.</note>", "")
+        return _render_verb_observation("propose_skill", obs)
+    if kind == "schedule_task":
+        goal = str(action.get("goal") or "").strip()
+        if not goal:
+            return "<note>schedule_task needs a goal.</note>"
+        res = sub.propose_scheduled_task(
+            lease, goal=goal, cron=str(action.get("cron") or ""), rrule=str(action.get("rrule") or ""),
+            timezone=str(action.get("timezone") or ""), title=str(action.get("title") or ""),
+            delivery=str(action.get("delivery") or ""))
+        if res is None:
+            return None
+        logger.info("react_schedule_task", extra={
+            "round": round_no, "created": res.get("created"), "rejection": res.get("rejection", "")})
+        return _render_verb_observation("schedule_task", res)
+    if kind == "manage_schedules":
+        # "op", not "action": in the text protocol "action" names the verb itself.
+        op = str(action.get("op") or "list").lower()
+        if op == "list":
+            res = sub.list_scheduled_tasks(lease)
+        elif op in ("pause", "resume", "delete"):
+            task_id = str(action.get("id") or "").strip()
+            if not task_id:
+                return f"<note>manage_schedules {op} needs the task id (list first).</note>"
+            res = sub.manage_scheduled_task(lease, task_id, op)
+        else:
+            return "<note>manage_schedules op must be list, pause, resume or delete.</note>"
+        if res is None:
+            return None
+        return _render_verb_observation("manage_schedules", res)
+    if kind == "propose_knowledge":
+        link = action.get("link") if isinstance(action.get("link"), dict) else None
+        item = None
+        if link is None:
+            item = {"kind": str(action.get("kind") or ""), "entity_id": str(action.get("entity_id") or ""),
+                    "values": [v for v in (action.get("values") or []) if isinstance(v, dict)],
+                    "evidence_id": str(action.get("evidence_id") or "")}
+        elif action.get("evidence_id") and not link.get("evidence_id"):
+            link = dict(link, evidence_id=str(action.get("evidence_id")))
+        try:
+            res = sub.propose_knowledge(
+                lease, item=item, link=link, request_commit=bool(action.get("request_commit")),
+                reason=str(action.get("reason") or ""))
+        except ValueError as exc:  # a malformed date: data for the model, not a crash
+            return _render_verb_observation("propose_knowledge", {"accepted": False, "detail": str(exc)})
+        if res is None:
+            return None
+        return _render_verb_observation("propose_knowledge", res)
+    return "<note>unknown verb.</note>"
 
 
 def _render_verb_observation(verb: str, res: Dict[str, Any]) -> str:
@@ -2658,27 +2923,6 @@ def _render_verb_observation(verb: str, res: Dict[str, Any]) -> str:
     return (f"<observation verb={verb!r} kind='data'>\n"
             + json.dumps(res, ensure_ascii=False, sort_keys=True, default=str)
             + "\n</observation>")
-
-
-def _render_subagent_result(res: Dict[str, Any]) -> Tuple[str, str]:
-    """ADR-0139 D12: the child's structured result, as the parent's observation and
-    as Evidence. A stopped or truncated result is flagged as incomplete in words too,
-    so a parent cannot mistake "stopped" for "done"."""
-    if "error" in res:
-        body = {"status": "failed", "exit_reason": "error", "detail": res.get("error"),
-                "code": res.get("code", "")}
-    else:
-        body = {k: res.get(k) for k in ("status", "exit_reason", "text", "structured_json",
-                                         "truncated", "artifacts", "detail", "tool_rounds",
-                                         "child_run_id") if res.get(k) not in (None, "", [])}
-        if "truncated" not in body:
-            body["truncated"] = False
-    structured = json.dumps(body, ensure_ascii=False, sort_keys=True, default=str)
-    incomplete = body.get("status") != "done" or body.get("truncated")
-    note = ("\n<note>This result is incomplete (status/truncated above); do not treat it "
-            "as finished work.</note>" if incomplete else "")
-    rendered = f"<subagent_result kind='data'>\n{structured}\n</subagent_result>{note}"
-    return rendered, structured
 
 
 def _fetch_memory_notes(agent, task) -> str:
@@ -2710,6 +2954,32 @@ def _fetch_memory_notes(agent, task) -> str:
         return memory_notes_text(value)
     except Exception:  # noqa: BLE001 — an unexpected reply shape is no notes
         return ""
+
+
+_REPEATED_REFUSAL_MARK = " (This identical call was already refused in this step"
+
+
+def _repeated_denial(counts: Dict[Tuple[str, str, str], int], name: str, args: Any, out: Any) -> str:
+    """ADR-0145 D14.5: count a kernel refusal of (tool, canonical args, reason) and
+    return the reason once the same refusal happened twice ("" otherwise). The
+    kernel's own repeated-refusal note is stripped, so its second answer counts as
+    the same refusal."""
+    if not isinstance(out, dict):
+        return ""
+    err = out.get("error")
+    if not isinstance(err, str) or not err.startswith("denied:"):
+        return ""
+    reason = err[len("denied:"):].strip()
+    i = reason.find(_REPEATED_REFUSAL_MARK)
+    if i >= 0:
+        reason = reason[:i].strip()
+    try:
+        canon = json.dumps(args, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        canon = str(args)
+    key = (name, canon, reason)
+    counts[key] = counts.get(key, 0) + 1
+    return reason if counts[key] >= 2 else ""
 
 
 def _latest_failure_summary(wm: WorkingMemory, tool: str) -> str:
@@ -2780,17 +3050,34 @@ def _call_system_tool(agent, name: str, args: dict, session_token_id: str = "", 
         return {"error": f"denied: {resp.get('deny_reason', '')}", "tool": name}
     if resp.get("error"):
         return {"error": resp["error"], "tool": name}
+    rj = resp.get("result_json") or ""
+    if resp.get("result_cid") and rj:
+        # ADR-0145 D6: an inline result with its ledger reference (the kernel sets
+        # both when steps answer requirement items), so the model can cite it.
+        try:
+            parsed = json.loads(rj)
+        except (ValueError, TypeError):
+            parsed = rj
+        if isinstance(parsed, dict):
+            return {**parsed, "_ledger_ref": resp["result_cid"]}
+        return {"result": parsed, "_ledger_ref": resp["result_cid"], "tool": name}
     if resp.get("result_cid"):
         return {"cid": resp["result_cid"], "tool": name}
-    rj = resp.get("result_json") or ""
     try:
         return json.loads(rj) if rj else {}
     except (ValueError, TypeError):
         return {"result": rj, "tool": name}
 
 
-def _list_system_tools(agent, query: str = "", full: bool = False) -> List[Dict]:
+def _list_system_tools(agent, query: str = "", full: bool = False,
+                       session_token_id: str = "") -> List[Dict]:
     """Fetch the agent's granted kernel system tools for the prompt menu (ADR-0039).
+
+    ADR-0145 D14: the step's lease (``session_token_id``) rides every menu fetch, so
+    the kernel resolves the principal the step runs for (a composed step's tools,
+    run-scoped grants) and the menu is what ExecuteTool will allow. A menu is the
+    kernel-ranked short list for the query; the agent searches for more within the
+    person's access.
 
     ADR-0044: when ``query`` is given, the kernel returns only the top-k
     task-relevant tools (semantic retrieval) instead of the full granted set.
@@ -2808,6 +3095,12 @@ def _list_system_tools(agent, query: str = "", full: bool = False) -> List[Dict]
     if substrate is None or not hasattr(substrate, "list_tools"):
         return []
     try:
+        if session_token_id:
+            try:
+                return substrate.list_tools(query=query, k=_DEFAULT_TOOL_MENU_K, full=full,
+                                            session_token_id=session_token_id)
+            except TypeError:
+                pass  # a substrate (or fake) without the lease kwarg
         return substrate.list_tools(query=query, k=_DEFAULT_TOOL_MENU_K, full=full)
     except TypeError:
         # Substrate/test fake without the ADR-0044 query parameter — full menu.
@@ -2819,7 +3112,7 @@ def _list_system_tools(agent, query: str = "", full: bool = False) -> List[Dict]
         return []
 
 
-def _describe_tool(agent, name: str) -> Optional[Dict]:
+def _describe_tool(agent, name: str, session_token_id: str = "") -> Optional[Dict]:
     """Fetch a tool's Tier-2 full spec (ADR-0045 describe_tool): the full
     description + full arg schema for one named tool. Returns the descriptor
     dict, or None when the tool is unavailable to the agent (ungranted/unknown)
@@ -2828,7 +3121,10 @@ def _describe_tool(agent, name: str) -> Optional[Dict]:
     if substrate is None or not hasattr(substrate, "list_tools"):
         return None
     try:
-        specs = substrate.list_tools(names=[name], full=True)
+        try:
+            specs = substrate.list_tools(names=[name], full=True, session_token_id=session_token_id)
+        except TypeError:  # a substrate (or fake) without the lease kwarg
+            specs = substrate.list_tools(names=[name], full=True)
     except TypeError:
         return None  # substrate/test fake without the ADR-0045 names/full params
     except Exception:  # noqa: BLE001 — degrade, never crash the loop

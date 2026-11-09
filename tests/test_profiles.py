@@ -354,3 +354,26 @@ def test_scoped_substrate_effective_set_from_kernel(skills):
     pend = sub.list_skills(names=["other"], full=True, rationale="for the report")
     assert pend[0]["access"] == "pending" and not pend[0]["instructions"]
     assert kern.rationales[-1] == "for the report"
+
+
+def test_scoped_skill_menu_order_is_deterministic():
+    """T-20261108-system-prompt-skill-list-order-is-not-stable: whatever order the kernel
+    serves the menu in, the profile menu (rendered into the system prompt) is sorted."""
+
+    class _Shuffled:
+        def __init__(self, order):
+            self.order = order
+
+        def list_skills(self, **kw):
+            return [{"name": n, "description": n, "access": "profile"} for n in self.order]
+
+    class _Prof:
+        name = "p"
+        skills = ("summarise", "file-report", "organise-files")
+        allowlist = None
+
+    a = ProfileScopedSubstrate(_Shuffled(["summarise", "file-report", "organise-files"]), _Prof())
+    b = ProfileScopedSubstrate(_Shuffled(["organise-files", "summarise", "file-report"]), _Prof())
+    want = ["file-report", "organise-files", "summarise"]
+    assert [s["name"] for s in a.list_skills(query="step one")] == want
+    assert [s["name"] for s in b.list_skills(query="step two")] == want

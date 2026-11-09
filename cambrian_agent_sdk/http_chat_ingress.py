@@ -1,5 +1,16 @@
 """HTTP chat ingress — a synchronous protocol on top of the fire-and-forget core.
 
+.. deprecated::
+    Not the conversation lane. The canonical lane for a person talking to
+    Cambrian is the operator plane's ``OpenConversation`` / ``SendTurn`` on
+    ``OperatorConsole``, authenticated per principal through the kernel
+    Authenticator (ADR-0142 K-5, ADR-0090 D12). This ingress has **no
+    authentication** and sits outside the kernel's listener policy: anyone who
+    can reach the port speaks as every conversation it serves. It therefore
+    refuses to bind anything but a loopback address, and warns
+    (``DeprecationWarning``) on construction. It remains only for local
+    harnesses (the airline benchmark driver) and will be removed.
+
 This is the SDK replacement for the Go chat ingress (ADR-0080 D1, renamed by
 ADR-0090). It serves the same three endpoints::
 
@@ -23,9 +34,11 @@ the protocol, not of the model, and worth knowing about rather than hiding.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import threading
+import warnings
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Optional
 
@@ -41,6 +54,40 @@ EXTERNAL_PREFIX = "chat:"
 #: How long ``/turn`` waits for a reply before giving up. Generous because a turn
 #: may involve tool calls and an LLM; the caller's own timeout should be longer.
 DEFAULT_TURN_TIMEOUT = 240.0
+
+#: Named in the deprecation warning and in the refusal, so the reader is sent
+#: somewhere rather than only told no.
+CANONICAL_LANE = (
+    "the operator plane's OpenConversation/SendTurn on OperatorConsole, "
+    "authenticated per principal (ADR-0142)"
+)
+
+
+def _require_loopback(host: str) -> str:
+    """Return the host to bind, refusing anything that is not loopback.
+
+    The ingress authenticates nobody, so the only acceptable audience is this
+    machine. An empty host means the default loopback address. Fail closed: a
+    name that is not ``localhost`` and does not parse as a loopback IP is refused
+    rather than resolved, because a resolver answer is not a promise about who
+    can connect.
+    """
+    h = host.strip()
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    if not h:
+        return "127.0.0.1"
+    if h.lower() == "localhost":
+        return h
+    try:
+        if ipaddress.ip_address(h).is_loopback:
+            return h
+    except ValueError:
+        pass
+    raise ValueError(
+        f"HTTPChatIngress refuses to bind {host!r}: it has no authentication, so it "
+        f"may listen on a loopback address only. Serve people through {CANONICAL_LANE}."
+    )
 
 
 class _Waiter:
@@ -69,12 +116,25 @@ class _Waiter:
 class HTTPChatIngress(IngressAgent):
     """Serves an HTTP chat surface and relays it to Cambrian.
 
+    .. deprecated::
+        Use the canonical conversation lane instead: ``OpenConversation`` /
+        ``SendTurn`` on the operator plane, authenticated per principal
+        (ADR-0142). This class has no authentication; it binds loopback only
+        (a non-loopback ``addr`` raises ``ValueError``) and warns on
+        construction.
+
     Daemon params::
 
         {"addr": "127.0.0.1:8890", "turn_timeout": 240}
     """
 
     def __init__(self, agent_id: str = "http_chat_ingress", **kwargs) -> None:
+        warnings.warn(
+            "HTTPChatIngress is deprecated: it is unauthenticated and binds loopback "
+            f"only. The canonical conversation lane is {CANONICAL_LANE}.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         super().__init__(agent_id=agent_id, **kwargs)
         self._waiters: Dict[str, _Waiter] = {}
         self._waiters_lock = threading.Lock()
@@ -86,6 +146,9 @@ class HTTPChatIngress(IngressAgent):
     def listen(self) -> None:
         addr = self.params.get("addr", "127.0.0.1:8890")
         host, _, port = addr.rpartition(":")
+        # Checked before anything binds: an unauthenticated listener must never be
+        # reachable from off this machine (ADR-0142 K-5).
+        host = _require_loopback(host)
         ingress = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -132,7 +195,7 @@ class HTTPChatIngress(IngressAgent):
             daemon_threads = True
             allow_reuse_address = True
 
-        self._httpd = _Server((host or "127.0.0.1", int(port)), Handler)
+        self._httpd = _Server((host, int(port)), Handler)
         logger.info("http chat ingress listening on %s", addr)
         self._httpd.serve_forever()
 

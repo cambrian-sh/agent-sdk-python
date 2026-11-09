@@ -78,7 +78,7 @@ CAPABILITY_VOCABULARY = frozenset({
     "general_purpose",
     "analysis", "data_analysis", "code_execution",
     "research", "web_research",
-    "file_read", "file_write",
+    "file_read", "file_write", "file_organisation",
     "summarisation",
 })
 
@@ -597,6 +597,10 @@ class ProfileScopedSubstrate:
                 s = dict(s, tool_grants=self._allow.filter(s["tool_grants"]))
             out.append(s)
         if not names and not discover:
+            # The menu is rendered into the system prompt: a deterministic order keeps
+            # that prompt byte-stable across the steps of a run (provider caching,
+            # replay; T-20261108-system-prompt-skill-list-order-is-not-stable).
+            out.sort(key=lambda s: str(s.get("name") or ""))
             served = {s.get("name") for s in out}
             unserved = [n for n in own if n not in served]
             if unserved:

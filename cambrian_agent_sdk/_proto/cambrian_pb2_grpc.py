@@ -154,6 +154,26 @@ class OrchestratorStub:
                 request_serializer=cambrian__pb2.StepOutputChunk.SerializeToString,
                 response_deserializer=cambrian__pb2.EmitStepOutputAck.FromString,
                 _registered_method=True)
+        self.ProposeScheduledTask = channel.unary_unary(
+                '/cambrian.Orchestrator/ProposeScheduledTask',
+                request_serializer=cambrian__pb2.ProposeScheduledTaskRequest.SerializeToString,
+                response_deserializer=cambrian__pb2.ProposeScheduledTaskResponse.FromString,
+                _registered_method=True)
+        self.ListScheduledTasks = channel.unary_unary(
+                '/cambrian.Orchestrator/ListScheduledTasks',
+                request_serializer=cambrian__pb2.ListScheduledTasksRequest.SerializeToString,
+                response_deserializer=cambrian__pb2.ListScheduledTasksResponse.FromString,
+                _registered_method=True)
+        self.ManageScheduledTask = channel.unary_unary(
+                '/cambrian.Orchestrator/ManageScheduledTask',
+                request_serializer=cambrian__pb2.ManageScheduledTaskRequest.SerializeToString,
+                response_deserializer=cambrian__pb2.ManageScheduledTaskResponse.FromString,
+                _registered_method=True)
+        self.ProposeKnowledge = channel.unary_unary(
+                '/cambrian.Orchestrator/ProposeKnowledge',
+                request_serializer=cambrian__pb2.ProposeKnowledgeRequest.SerializeToString,
+                response_deserializer=cambrian__pb2.ProposeKnowledgeResponse.FromString,
+                _registered_method=True)
 
 
 class OrchestratorServicer:
@@ -404,6 +424,50 @@ class OrchestratorServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ProposeScheduledTask(self, request, context):
+        """Principal-owned recurring tasks (T-20261106-the-assistant-cannot-set-up-a-recurring-task;
+        additive within contract 0101, capability "scheduled-tasks"). The OWNER is the run
+        principal resolved from the presented lease (conversation owner -> task beneficiary
+        -> configured default) — never a request field. ProposeScheduledTask asks the
+        principal's approval through the operator approval hub (kind "schedule", the console
+        Inbox) and creates the task only on an explicit approve; a denial or no answer within
+        execution.schedules.approval_timeout_seconds creates nothing. Once created it is a
+        premium schedule watch that runs ONE chat turn, as its owner, at each firing.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListScheduledTasks(self, request, context):
+        """The run principal's own scheduled tasks.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ManageScheduledTask(self, request, context):
+        """Pause, resume or delete one of the run principal's own scheduled tasks. A task owned
+        by anyone else is NOT_FOUND (no existence leak).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ProposeKnowledge(self, request, context):
+        """Knowledge proposals (T-20261107-knowledge-substrate-extensions-for-case; additive
+        within contract 0101). An agent proposes a knowledge item — stored as a CANDIDATE
+        asserted by the calling agent (resolved from the lease, never a request field) —
+        and may ask for it to be committed: a knowledge_commit approval for the run
+        principal, whose approver becomes the committed item's asserter. Or it proposes a
+        candidate link (mechanism scored, capped at candidate; evidence required). An agent
+        can never write a committed value or a confirmed link. Only kinds the deployment
+        resolves by designated_actor accept proposals. A refusal is an OK response with
+        accepted=false and a detail; UNIMPLEMENTED when the kernel has no knowledge bridge.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_OrchestratorServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -526,6 +590,26 @@ def add_OrchestratorServicer_to_server(servicer, server):
                     servicer.EmitStepOutput,
                     request_deserializer=cambrian__pb2.StepOutputChunk.FromString,
                     response_serializer=cambrian__pb2.EmitStepOutputAck.SerializeToString,
+            ),
+            'ProposeScheduledTask': grpc.unary_unary_rpc_method_handler(
+                    servicer.ProposeScheduledTask,
+                    request_deserializer=cambrian__pb2.ProposeScheduledTaskRequest.FromString,
+                    response_serializer=cambrian__pb2.ProposeScheduledTaskResponse.SerializeToString,
+            ),
+            'ListScheduledTasks': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListScheduledTasks,
+                    request_deserializer=cambrian__pb2.ListScheduledTasksRequest.FromString,
+                    response_serializer=cambrian__pb2.ListScheduledTasksResponse.SerializeToString,
+            ),
+            'ManageScheduledTask': grpc.unary_unary_rpc_method_handler(
+                    servicer.ManageScheduledTask,
+                    request_deserializer=cambrian__pb2.ManageScheduledTaskRequest.FromString,
+                    response_serializer=cambrian__pb2.ManageScheduledTaskResponse.SerializeToString,
+            ),
+            'ProposeKnowledge': grpc.unary_unary_rpc_method_handler(
+                    servicer.ProposeKnowledge,
+                    request_deserializer=cambrian__pb2.ProposeKnowledgeRequest.FromString,
+                    response_serializer=cambrian__pb2.ProposeKnowledgeResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -1176,6 +1260,114 @@ class Orchestrator:
             '/cambrian.Orchestrator/EmitStepOutput',
             cambrian__pb2.StepOutputChunk.SerializeToString,
             cambrian__pb2.EmitStepOutputAck.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ProposeScheduledTask(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cambrian.Orchestrator/ProposeScheduledTask',
+            cambrian__pb2.ProposeScheduledTaskRequest.SerializeToString,
+            cambrian__pb2.ProposeScheduledTaskResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListScheduledTasks(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cambrian.Orchestrator/ListScheduledTasks',
+            cambrian__pb2.ListScheduledTasksRequest.SerializeToString,
+            cambrian__pb2.ListScheduledTasksResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ManageScheduledTask(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cambrian.Orchestrator/ManageScheduledTask',
+            cambrian__pb2.ManageScheduledTaskRequest.SerializeToString,
+            cambrian__pb2.ManageScheduledTaskResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ProposeKnowledge(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cambrian.Orchestrator/ProposeKnowledge',
+            cambrian__pb2.ProposeKnowledgeRequest.SerializeToString,
+            cambrian__pb2.ProposeKnowledgeResponse.FromString,
             options,
             channel_credentials,
             insecure,
