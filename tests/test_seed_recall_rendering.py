@@ -140,3 +140,22 @@ def test_the_continue_rule_reaches_the_prompt_when_evidence_is_present():
     assert "<Evidence>" in p
     assert "no reason to refuse or abandon the task: continue it" in p
     assert "comes only from the <Task> section" in p
+
+
+def test_a_recalled_fact_names_its_document_section_and_ledger_entry():
+    """T-20261109-chat-agent-answers-a-published-rule: the kernel records every recall
+    in the run ledger and sends the source document and section; the <memory> tag
+    carries them so a reply can cite the entry and name where an organisation's rule
+    comes from (the citizen gate's TR reply dropped 'Madde 4')."""
+    from cambrian_agent_sdk.working_memory import memory_provenance_attrs
+    hit = {"text": "**MADDE 4 – Cevap süresi** ... 15 iş günü ...",
+           "metadata": json.dumps({"source_agent": "operator",
+                                   "_source_document": "Bilgi Edinme Yönergesi",
+                                   "_section_path": "MADDE 4 – Cevap süresi",
+                                   "_ledger_ref": "led_recall01"}, ensure_ascii=False)}
+    attrs = memory_provenance_attrs(hit)
+    assert "document='Bilgi Edinme Yönergesi'" in attrs
+    assert "section='MADDE 4 – Cevap süresi'" in attrs
+    assert "ledger='led_recall01'" in attrs
+    # Absent fields stay absent.
+    assert "ledger=" not in memory_provenance_attrs({"text": "x", "metadata": "{}"})

@@ -552,8 +552,9 @@ def memory_provenance_attrs(r) -> str:
     ``source='LTM'`` always leads; then, only when present: ``author`` + ``session``
     (D9 — kernel-stamped, non-forgeable; a ``System`` source renders as ``author='system'``
     so the agent can discount its own auto-recorded step echoes), ``written`` + ``age`` +
-    ``freshness`` (D10), then ``content_cid`` last. Absent fields are omitted entirely —
-    no empty ``author=''``."""
+    ``freshness`` (D10), ``document`` + ``section`` + ``ledger`` (the source document,
+    its section path and the recall's ledger entry, when the kernel sent them), then
+    ``content_cid`` last. Absent fields are omitted entirely — no empty ``author=''``."""
     meta = _memory_meta(r)
     attrs = ["source='LTM'"]
     src = str(meta.get("source_agent", "") or "")
@@ -572,6 +573,18 @@ def memory_provenance_attrs(r) -> str:
         if age is not None:
             attrs.append(f"age={_esc(f'{age}d')!r}")
         attrs.append(f"freshness={_esc(fresh)!r}")
+    # Where the fact comes from and the ledger entry to cite (the kernel records
+    # every recall in the run ledger: T-20261109-chat-agent-answers-a-published-rule).
+    # An organisation's rule or figure is stated with its document and section.
+    doc = str(meta.get("_source_document", "") or "")
+    if doc:
+        attrs.append(f"document={_esc(doc)!r}")
+    sec = str(meta.get("_section_path", "") or "")
+    if sec:
+        attrs.append(f"section={_esc(sec)!r}")
+    ledger = str(meta.get("_ledger_ref", "") or "")
+    if ledger:
+        attrs.append(f"ledger={_esc(ledger)!r}")
     cid = str(meta.get("content_cid", "") or "")
     if cid:
         attrs.append(f"content_cid={_esc(cid)!r}")

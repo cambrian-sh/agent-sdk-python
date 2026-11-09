@@ -239,7 +239,18 @@ def test_released_prompt_versions_are_unchanged():
     # section is byte-identical.
     # react-turn v7 only ADDS answer-items, step-inputs and envelope-repair
     # (ADR-0145 D6); every v6 section is byte-identical.
-    assert pl.get("react-turn").version == 7
+    # react-turn v8 revises answer-items (ref = ledger id only; record identifiers
+    # are ids; a document item's text is the answer) and envelope-repair (correct,
+    # do not redo), and ADDS repair-prior-calls (ADR-0145 D6/D14.6); every other v7
+    # section is byte-identical.
+    assert pl.get("react-turn").version == 8
+    for section in ("contract-text", "contract-native", "trajectory-header",
+                    "trajectory-header-unnumbered", "data-note", "memory-notes-header",
+                    "memory-notes-cut", "instructions-header", "evidence-header",
+                    "expected-output", "acceptance", "acting-for", "current-date", "fan-out-item",
+                    "step-inputs"):
+        assert (pl.fragment("react-turn", section, version=7).body
+                == pl.fragment("react-turn", section).body), section
     for section in ("contract-text", "contract-native", "trajectory-header",
                     "trajectory-header-unnumbered", "data-note", "memory-notes-header",
                     "memory-notes-cut", "instructions-header", "evidence-header",

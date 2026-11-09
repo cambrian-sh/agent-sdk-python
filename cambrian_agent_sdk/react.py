@@ -359,6 +359,11 @@ def with_fan_out_item(task_text: str, context: Optional[Dict[str, str]]) -> str:
 ANSWER_ITEMS_KEY = "_answer_items"
 STEP_INPUTS_KEY = "_step_inputs"
 ENVELOPE_VIOLATIONS_KEY = "_envelope_violations"
+# cambrian-core domain/requirements.go HandoffKeyRepairPriorCalls: on the one repair
+# turn, the step's earlier tool results by ledger reference and its executed writes
+# (ADR-0145 D6/D14), so the repair cites them instead of calling the tools again
+# (T-20261109-d6-envelope-repair-turn-re-runs-the-step-s).
+REPAIR_PRIOR_CALLS_KEY = "_repair_prior_calls"
 
 
 def answer_items(context: Optional[Dict[str, str]]) -> List[Dict[str, Any]]:
@@ -374,17 +379,20 @@ def answer_items(context: Optional[Dict[str, str]]) -> List[Dict[str, Any]]:
 
 
 def with_answer_items(task_text: str, context: Optional[Dict[str, str]]) -> str:
-    """The step text, followed by the react-turn ``answer-items``, ``step-inputs`` and
-    ``envelope-repair`` blocks when the kernel stamped them (ADR-0145 D6): the items
-    the step's final answer must report on, the values bound to it from earlier
-    steps, and, on the one repair turn, what was wrong with its previous envelope.
+    """The step text, followed by the react-turn ``answer-items``, ``step-inputs``,
+    ``envelope-repair`` and ``repair-prior-calls`` blocks when the kernel stamped
+    them (ADR-0145 D6): the items the step's final answer must report on, the values
+    bound to it from earlier steps, and, on the one repair turn, what was wrong with
+    its previous envelope and the calls the step already made (by ledger reference),
+    so the repair corrects the envelope instead of redoing the work.
     Kernel-written JSON; still neutralised so it cannot close its region. Without the
     keys the text is returned unchanged."""
     ctx = context or {}
     out = (task_text or "").rstrip()
     for key, section, slot, tag in ((ANSWER_ITEMS_KEY, "answer-items", "items", "items"),
                                     (STEP_INPUTS_KEY, "step-inputs", "inputs", "inputs"),
-                                    (ENVELOPE_VIOLATIONS_KEY, "envelope-repair", "violations", "violations")):
+                                    (ENVELOPE_VIOLATIONS_KEY, "envelope-repair", "violations", "violations"),
+                                    (REPAIR_PRIOR_CALLS_KEY, "repair-prior-calls", "prior_calls", "prior_calls")):
         val = str(ctx.get(key) or "").strip()
         if not val:
             continue
