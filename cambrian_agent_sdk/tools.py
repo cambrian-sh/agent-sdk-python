@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, get_args, get_origin, get_type_hints
+from typing import Any, Callable, Dict, Iterable, List, Optional, get_args, get_origin, get_type_hints
 import typing
 
 
@@ -162,9 +162,15 @@ class ToolRegistry:
     invokes by direct call. Returns a structured ``{"error", "tool"}`` dict on any
     failure (unknown tool, schema violation, or in-tool exception) — never raises
     into the reasoning loop.
+
+    ``hidden`` names tools left off this menu: not listed, not offered to the
+    model, and an ``unknown tool`` error if called anyway — for a tool the agent
+    defines but may not use in this run (ADR-0150: ``delegate_to_planner`` in the
+    single-agent lane, where the kernel refuses it).
     """
 
-    def __init__(self, agent: Any) -> None:
+    def __init__(self, agent: Any, hidden: Iterable[str] = ()) -> None:
+        hidden_names = frozenset(hidden)
         self._specs: Dict[str, ToolSpec] = {}
         self._bound: Dict[str, Callable] = {}
         # Scan the class MRO (raw functions carry the @tool marker). We deliberately
@@ -178,6 +184,8 @@ class ToolRegistry:
                 spec = getattr(member, _TOOL_ATTR, None)
                 if spec is not None:
                     seen.add(attr_name)
+                    if spec.name in hidden_names:
+                        continue
                     self._specs[spec.name] = spec
                     self._bound[spec.name] = getattr(agent, attr_name)  # bound to the instance
 

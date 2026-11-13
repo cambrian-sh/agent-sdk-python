@@ -50,6 +50,9 @@ from . import run_trace as _run_trace  # ADR-0145 D10: no-op unless CAMBRIAN_TRA
 from .step_dependencies import covered_steps, parse_step_dependencies, render_step_dependencies
 from .content_window import read_window
 from .types import AgentResult, AgentTask, capability_missing, yield_subgoal
+from .stopping import (ASK_PERSON_TOOL, EXIT_CAP, EXIT_STUCK, EXIT_WALL, LaneClock, LaneLimits,
+                       StuckDetector, ask_person_result_data, forced_summary, is_subtask,
+                       partial_metadata)
 from .working_memory import (
     Step,
     ToolCard,
@@ -802,10 +805,18 @@ _PROPOSE_ONTOLOGY_CHANGE_TOOL_DEF = _kernel_verb_def("propose_ontology_change", 
     "namespace": {"type": "string", "description": "the namespace; empty = default"},
     "reason": {"type": "string", "description": "why; shown to the person who approves it"},
 }, ["change"])
+# ADR-0150 D5: the single-agent lane's top-level ask-back. Handled by the loop
+# itself (it ends the run with an input_required result), not a kernel RPC.
+_ASK_PERSON_TOOL_DEF = _kernel_verb_def(ASK_PERSON_TOOL, {
+    "questions": {"type": "array", "items": {"type": "string"},
+                  "description": "the questions for the person"},
+    "reason": {"type": "string", "description": "why the work cannot go on without the answer"},
+}, ["questions"])
 _KERNEL_VERB_DEFS = {d["name"]: d for d in (_NOTE_TOOL_DEF, _PROPOSE_SKILL_TOOL_DEF,
                                             _SCHEDULE_TOOL_DEF, _MANAGE_SCHEDULES_TOOL_DEF,
                                             _PROPOSE_KNOWLEDGE_TOOL_DEF,
-                                            _PROPOSE_ONTOLOGY_CHANGE_TOOL_DEF)}
+                                            _PROPOSE_ONTOLOGY_CHANGE_TOOL_DEF,
+                                            _ASK_PERSON_TOOL_DEF)}
 _KERNEL_VERB_NAMES = tuple(_KERNEL_VERB_DEFS)
 
 # The loop's OWN vocabulary, as the model may emit it under native tool-calling.
@@ -1101,6 +1112,8 @@ def run_think(
     evidence_reprompt: Optional[bool] = None,
     turn_evidence: Optional[bool] = None,
     delegation_tool: Optional[str] = None,
+    lane_limits: Any = None,
+    allow_ask_person: Optional[bool] = None,
 ) -> AgentResult:
     """Drive the reason/retrieve/act loop for one task and return the final result.
 
@@ -1191,6 +1204,49 @@ def run_think(
         agent, task, notes_served=notes_served, notes=allow_memory_note_writes,
         skills=allow_skill_proposals, schedules=allow_scheduled_tasks,
         knowledge=allow_knowledge_proposals, ontology=allow_ontology_proposals)
+    # ADR-0150 D4/D5: the single-agent lane's stopping rule and ask-back. The kernel
+    # stamps the lane and its limits on the task (stopping.py); outside the lane
+    # (lane_limits None) nothing below changes the loop. lane_limits=False opts out.
+    lane = LaneLimits.from_task(task) if lane_limits is None else (lane_limits or None)
+    lane_clock = LaneClock(max_wall_seconds=lane.max_wall_seconds) if lane else None
+    stuck = StuckDetector(lane.same_result_repeats, lane.same_failure_repeats) if lane else None
+    if lane and lane.max_tool_rounds > 0:
+        # The lane cap is a runaway guard, not a budget: it replaces the per-agent
+        # default (12) so normal work never reaches it.
+        max_tool_rounds = lane.max_tool_rounds
+    # Top-level ask-back: the lane's main agent only, never a subtask (D5); a chat
+    # turn's agent asks by answering (allow_ask_person=False).
+    if allow_ask_person is None:
+        allow_ask_person = bool(lane) and not is_subtask(_ctx_task)
+    if allow_ask_person:
+        kernel_verbs = list(kernel_verbs) + [ASK_PERSON_TOOL]
+
+    def _lane_stop(reason: str, detail: str) -> AgentResult:
+        """D4.3: one tool-less summary call; the result is partial and resumable."""
+        gathered = _best_effort(wm)
+        note = _nudge("lane-summary", reason=detail)
+        text = forced_summary(agent, task, role, gathered, note,
+                              temperature=min(temperature, 0.3))
+        logger.warning("react_lane_stop", extra={"reason": reason, "detail": detail,
+                                                 "tool_rounds": tool_rounds})
+        return AgentResult(data=(text or gathered or detail).encode("utf-8"),
+                           type=result_type or "text", confidence=0.5,
+                           metadata=partial_metadata(reason))
+
+    def _lane_observe(name: str, args: Any, out: Any) -> Optional[AgentResult]:
+        """D4.4: the stuck detector, after a tool result. Returns a result to end with."""
+        if stuck is None:
+            return None
+        verdict = stuck.observe(name, args, out)
+        if verdict == EXIT_STUCK:
+            return _lane_stop(EXIT_STUCK, f"{name} kept repeating without progress")
+        if verdict == "same_result":
+            wm.add_text(_nudge("lane-stuck", tool=repr(name), repeats=str(stuck.same_result_repeats)))
+        elif verdict == "same_failure":
+            wm.add_text(_nudge("lane-stuck-failing", tool=repr(name),
+                               repeats=str(stuck.same_failure_repeats)))
+        return None
+
     disabled_verbs: set = set()  # verbs the kernel answered UNIMPLEMENTED this run
     # Only the legacy engine ranks entries by cosine to the task; the default engine
     # budgets by tokens, so it does not spend an Embed RPC on the intent.
@@ -1487,6 +1543,8 @@ def run_think(
 
     round_no = 0
     while True:
+        if lane_clock is not None and lane_clock.expired():
+            return _lane_stop(EXIT_WALL, f"the run reached its wall-time cap ({lane.max_wall_seconds} s)")
         extra = list(constraints or [])
         if host_constraint:
             extra.append(host_constraint)
@@ -1893,7 +1951,14 @@ def run_think(
             pending_extra_call_ids = []
             if isinstance(wm, _ConversationMirror):
                 wm.release()
+            if lane is not None:
+                for call_id, name, args in to_run:
+                    ended = _lane_observe(name, args, outs.get(call_id))
+                    if ended is not None:
+                        return ended
             if tool_rounds >= max_tool_rounds and len(to_run) < len(action["calls"]):
+                if lane is not None:
+                    return _lane_stop(EXIT_CAP, f"the run reached its tool-round cap ({max_tool_rounds})")
                 if tool_exhausted and not to_run:
                     raise ReActLoopError(f"tool-round budget ({max_tool_rounds}) exceeded",
                                          draft=drafted_answer)
@@ -1992,6 +2057,9 @@ def run_think(
                 # `continue` is safe with a tool call outstanding: the top of the
                 # loop closes an unanswered tool_call_id before the next request,
                 # which is what keeps the conversation valid for the provider.
+                if lane is not None:
+                    # ADR-0150 D4.3: a runaway cap ends in a partial answer, not an error.
+                    return _lane_stop(EXIT_CAP, f"the run reached its tool-round cap ({max_tool_rounds})")
                 if tool_exhausted:
                     raise ReActLoopError(f"tool-round budget ({max_tool_rounds}) exceeded",
                                          draft=drafted_answer)
@@ -2048,6 +2116,10 @@ def run_think(
             _run_trace.tool_call(agent, task, name=name, args=args, result=out,
                                  call_id=pending_tool_call_id, round_no=round_no,
                                  start_ns=_tool_t0, span_id=_tool_sid, executed_by=_tool_by)
+            if lane is not None and served is None:
+                ended = _lane_observe(name, args, out)
+                if ended is not None:
+                    return ended
             # ADR-0041 D1/D3: record an invocation card (tool + args + status +
             # summary). A heavy system-tool result the kernel offloaded keeps
             # {summary + cid}; otherwise it is summarized inline (heuristic by
@@ -2447,6 +2519,17 @@ def run_think(
                         extra={"round": round_no, "from_cid": cid, "to_cid": new_cid,
                                "chars": len(body)})
             continue
+
+        if kind == ASK_PERSON_TOOL and ASK_PERSON_TOOL in kernel_verbs:
+            # ADR-0150 D5: the top-level agent stops to ask the person. The kernel
+            # returns it as the InputRequired shape; the answer starts the next request.
+            questions = action.get("questions") or action.get("question") or []
+            data = ask_person_result_data(questions, str(action.get("reason") or ""))
+            if b'"questions": []' in data:
+                _control_reply("<note>ask_person needs at least one question.</note>")
+                continue
+            logger.info("react_ask_person", extra={"round": round_no})
+            return AgentResult(data=data, type="input_required", confidence=0.7)
 
         if kind in _KERNEL_VERB_NAMES:
             # ADR-0139 D14/D13: a verb that calls a kernel surface. Its outcome,

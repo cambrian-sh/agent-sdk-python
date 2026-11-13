@@ -129,3 +129,30 @@ def test_tool_and_capability_are_independent_registries():
     # the @capability is in the capability registry, NOT among tools
     assert "answer_questions" in m.capability_names
     assert "answer_questions" not in m.tools
+
+
+def test_hidden_tools_are_neither_listed_nor_callable():
+    # ADR-0150: an agent can leave one of its own @tools off a run's menu
+    # (delegate_to_planner in the single-agent lane); calling it anyway is an
+    # unknown tool, never a dispatch.
+    from cambrian_agent_sdk.tools import ToolRegistry
+
+    class Two(CognitiveAgent):
+        @tool
+        def keep(self, x: str) -> str:
+            return x
+
+        @tool
+        def drop(self, x: str) -> str:
+            raise AssertionError("a hidden tool must never run")
+
+        def run(self, task):
+            return "x"
+
+    reg = ToolRegistry(Two(agent_id="t"), hidden=("drop",))
+    assert reg.names() == ["keep"]
+    assert "drop" not in reg and "keep" in reg
+    assert [s.name for s in reg.specs()] == ["keep"]
+    assert reg.call("drop", x="1") == {"error": "unknown tool 'drop'", "tool": "drop"}
+    assert reg.call("keep", x="1") == "1"
+    assert ToolRegistry(Two(agent_id="t")).names() == ["drop", "keep"]

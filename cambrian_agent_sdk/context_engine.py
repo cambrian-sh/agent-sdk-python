@@ -153,6 +153,11 @@ class ContextConfig:
     # Protected tail: the last N history steps (text) / assistant-led turn groups
     # (native) are never compacted.
     protect_tail: int = 3
+    # ADR-0150 D7 age trigger: a tool output older than this many tool rounds is
+    # cleared to its placeholder even when the prompt is under budget (no LLM;
+    # Anthropic's "tool-result clearing"). 0 = off. Served by the kernel as
+    # CAMBRIAN_CONTEXT_KEEP_RECENT_TOOL_RESULTS (execution.content).
+    keep_recent_tool_results: int = 0
     # Phase 2.
     phase2_enabled: bool = True
     summary_max_tokens: int = 1200
@@ -663,12 +668,71 @@ class DefaultContextEngine:
                         chars=len(body))
         return max(saved, 0)
 
+    def _placeholder(self, tool: str, body: str, cid: str) -> str:
+        """The placeholder of a cleared tool output: its run-ledger id when the kernel
+        recorded it (readable with ledger_get), else the SDK cid (ADR-0150 D7)."""
+        ref = ledger_ref_of(body)
+        if ref:
+            return _cp("placeholder-ledger", tool=tool, chars=len(body), ref=ref)
+        return _cp("placeholder", tool=tool, chars=len(body), cid=cid)
+
+    def _clear_aged_native(self, conversation: List[Dict[str, Any]]) -> bool:
+        """ADR-0150 D7 age trigger (native path): every tool output but the newest
+        ``keep_recent_tool_results`` becomes its placeholder, under budget or not.
+        Pinned (skill) turns and resolve windows are left to the budget pass."""
+        keep = self.config.keep_recent_tool_results
+        if keep <= 0:
+            return False
+        tool_idx = [i for i, m in enumerate(conversation) if m.get("role") == "tool"]
+        old = tool_idx[:max(len(tool_idx) - keep, 0)]
+        if not old:
+            return False
+        names = {c.get("id"): c.get("name", "") for m in conversation
+                 for c in (m.get("tool_calls") or [])}
+        cids = []
+        for i in old:
+            m = conversation[i]
+            tid = m.get("tool_call_id", "")
+            body = m.get("content") or ""
+            if (tid in self._pinned_ids or tid in self._compacted_ids or tid in self._window_by_tid
+                    or len(body) <= self.config.tool_output_compact_chars):
+                continue
+            cid = self._store(body)
+            m["content"] = self._placeholder(names.get(tid) or "the tool", body, cid)
+            self._compacted_ids.add(tid)
+            sig = self._sig_by_tid.get(tid)
+            if sig:
+                self._compacted_by_sig[sig] = cid
+            cids.append(cid)
+        if cids:
+            self._event(event="compaction", phase=1, path="native", reason="age", items=len(cids),
+                        cids=cids, keep_recent=keep)
+        return bool(cids)
+
+    def _clear_aged_text(self) -> bool:
+        """ADR-0150 D7 age trigger (text path), as ``_clear_aged_native``."""
+        keep = self.config.keep_recent_tool_results
+        if keep <= 0:
+            return False
+        calls = [it for it in self._history if it.step is not None and it.step.kind == "tool_call"]
+        cids = []
+        for it in calls[:max(len(calls) - keep, 0)]:
+            if it.compacted_cid or it.step.cid or len(it.tool_body()) <= self.config.tool_output_compact_chars:
+                continue
+            self._compact_item(it)
+            cids.append(it.compacted_cid)
+        if cids:
+            self._event(event="compaction", phase=1, path="text", reason="age", items=len(cids),
+                        cids=cids, keep_recent=keep)
+        return bool(cids)
+
     def compact_prompt(self, prompt_tokens: int) -> bool:
         """Bring the text-path prompt under budget. ``prompt_tokens`` is the estimate
         of the full prompt just rendered. Returns True when anything changed."""
+        aged = self._clear_aged_text()
         excess = prompt_tokens - self.config.budget_tokens
         if excess <= 0:
-            return False
+            return aged
         tail = max(self.config.protect_tail, 0)
         cut = max(len(self._history) - tail, 0)
         saved, cids = 0, []
@@ -678,7 +742,7 @@ class DefaultContextEngine:
                     and len(it.tool_body()) > self.config.tool_output_compact_chars):
                 saved += self._compact_item(it)
                 cids.append(it.compacted_cid)
-        changed = bool(cids)
+        changed = bool(cids) or aged
         if cids:
             self._event(event="compaction", phase=1, path="text", items=len(cids), cids=cids,
                         tokens_before=prompt_tokens, tokens_saved=saved)
@@ -735,10 +799,11 @@ class DefaultContextEngine:
         the system tier plus the tool definitions."""
         if len(conversation) < 2:
             return False
+        aged = self._clear_aged_native(conversation)
         before = fixed_tokens + self.conversation_tokens(conversation)
         excess = before - self.config.budget_tokens
         if excess <= 0:
-            return False
+            return aged
         if self._native_head is None:
             self._native_head = conversation[0].get("content") or ""
         groups = self._groups(conversation)
@@ -766,15 +831,14 @@ class DefaultContextEngine:
                     cids.append(cid)
                     continue
                 cid = self._store(body)
-                m["content"] = _cp("placeholder", tool=names.get(tid) or "the tool",
-                                   chars=len(body), cid=cid)
+                m["content"] = self._placeholder(names.get(tid) or "the tool", body, cid)
                 self._compacted_ids.add(tid)
                 sig = self._sig_by_tid.get(tid)
                 if sig:
                     self._compacted_by_sig[sig] = cid
                 saved += estimate_tokens(body) - estimate_tokens(m["content"])
                 cids.append(cid)
-        changed = bool(cids)
+        changed = bool(cids) or aged
         if cids:
             self._event(event="compaction", phase=1, path="native", items=len(cids), cids=cids,
                         tokens_before=before, tokens_saved=saved)
@@ -805,6 +869,16 @@ class DefaultContextEngine:
                     messages=len(raw), tokens_before=before,
                     tokens_after=fixed_tokens + self.conversation_tokens(conversation))
         return True
+
+
+_LEDGER_REF_RE = re.compile(r'"(?:_ledger_ref|cid)"\s*:\s*"(led_[0-9a-f]+)"')
+
+
+def ledger_ref_of(body: str) -> str:
+    """The run-ledger id a tool output carries (the kernel's ``_ledger_ref`` of an
+    inline result, or an offloaded result's ``cid``), or "" (ADR-0150 D7)."""
+    m = _LEDGER_REF_RE.search(body or "")
+    return m.group(1) if m else ""
 
 
 def _render_turns(messages: List[Dict[str, Any]]) -> str:
