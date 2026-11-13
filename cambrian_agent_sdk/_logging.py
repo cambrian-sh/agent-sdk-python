@@ -25,6 +25,22 @@ _STD_ATTRS = frozenset(vars(logging.LogRecord("", 0, "", 0, "", None, None))) | 
 _RESERVED = frozenset({"time", "level", "msg", "logger", "task_id", "agent_id"})
 
 
+# LogRecord's own attribute names. ``logger.info(..., extra={"created": ...})``
+# raises KeyError("Attempt to overwrite 'created' in LogRecord") the moment the
+# record is built, i.e. only when the level is enabled: a chat turn failed that way
+# right after schedule_task succeeded (T-20261109-chat-turn-crashes-after-schedule-task-succeeds).
+LOG_RECORD_RESERVED = _STD_ATTRS
+
+
+def safe_extra(fields) -> dict:
+    """Return ``fields`` as a logging ``extra`` mapping that can never collide with a
+    LogRecord attribute: a reserved key (``created``, ``name``, ``msg``, ``module``...)
+    is renamed ``x_<key>``, the same convention SlogHandler uses for its own keys.
+    Every ``extra=`` built from a non-literal mapping goes through this; literal keys
+    are checked by tests/test_logging_extras.py."""
+    return {("x_" + str(k) if k in LOG_RECORD_RESERVED else str(k)): v for k, v in dict(fields).items()}
+
+
 def _json_safe(v, depth: int = 0):
     if v is None or isinstance(v, (bool, int, float, str)):
         return v

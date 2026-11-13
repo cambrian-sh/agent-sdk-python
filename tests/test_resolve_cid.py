@@ -204,33 +204,24 @@ def test_resolve_cid_inline_puts_body_in_context():
     assert "mode='inline'" in last_prompt
 
 
-def test_resolve_cid_inline_budget_caps_at_three():
-    """The per-run cap on inline resolves is enforced. The 4th inline resolve
-    is rejected with a note; the agent must fall back to offload or answer."""
+def test_resolve_cid_inline_has_no_count_cap_any_more():
+    """Owner decision A3 (2026-11-12): every inline resolve returns ONE bounded window,
+    so the old 3-per-run count cap protected nothing and only blocked reading a
+    document page by page. Four inline resolves in a row all answer."""
     store = _Store()
     cids = [store.put(f"body {i}") for i in range(5)]
-    # The agent does 4 inline resolves in a row. The 4th must be capped.
-    responses = [
-        json.dumps({"action": "resolve_cid", "cid": cids[0], "as": "inline"}),
-        json.dumps({"action": "resolve_cid", "cid": cids[1], "as": "inline"}),
-        json.dumps({"action": "resolve_cid", "cid": cids[2], "as": "inline"}),
-        json.dumps({"action": "resolve_cid", "cid": cids[3], "as": "inline"}),  # capped
-        json.dumps({"action": "final_answer", "answer": "done", "type": "text"}),
-    ]
+    responses = [json.dumps({"action": "resolve_cid", "cid": cids[i], "as": "inline"})
+                 for i in range(4)]
+    responses.append(json.dumps({"action": "final_answer", "answer": "done", "type": "text"}))
     sub = _ResolveSubstrate(store, responses)
     bot = Bot(agent_id="b")
     bot.substrate = sub
     res = run_think(bot, AgentTask(text="x"))
     assert res.type != "error"
     last_prompt = sub.prompts[-1]
-    # The 4th inline resolve was rejected (the budget-exhausted note is in the
-    # trajectory, NOT a 4th inline body).
-    assert "inline budget exhausted" in last_prompt
-    # Only 3 of the 4 cids' bodies were inlined.
-    assert "body 0" in last_prompt
-    assert "body 1" in last_prompt
-    assert "body 2" in last_prompt
-    assert "body 3" not in last_prompt
+    assert "inline budget exhausted" not in last_prompt
+    for i in range(4):
+        assert f"body {i}" in last_prompt
 
 
 def test_resolve_cid_missing_cid_emits_note():

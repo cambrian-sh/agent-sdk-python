@@ -86,6 +86,10 @@ def composition_from_task(task: Any) -> Optional[Composition]:
     return Composition.from_json(raw) if raw else None
 
 
+#: The kernel's in-process ledger tools (cambrian-core internal/ledger ToolGet/ToolFind).
+KERNEL_LEDGER_TOOLS = frozenset({"ledger_get", "ledger_find"})
+
+
 class ComposedScopedSubstrate:
     """A substrate proxy for the composed runtime: the current step's composition and
     lease are bound with :meth:`bind` at the start of each task.
@@ -143,6 +147,30 @@ class ComposedScopedSubstrate:
         self._served.update(t.get("name", "") for t in tools)
         return tools
 
+    def find_tools(self, query: str, k: int = 0, full: bool = False,
+                   session_token_id: str = "") -> Tuple[List[Dict], List[str]]:
+        """The find_tools pull under the step's lease, WITH the query: the kernel names
+        the matching tools that exist within the person's access but are not in this
+        step only for a query (response header x-tool-outside-step). Returns
+        ``(tools, outside)``; ``outside`` names are never added to the served set, so
+        a call to one is refused here as well as by the kernel
+        (T-20261112-yield-sub-goal-on-a-composed-lease-runs-under). ``list_tools``
+        keeps dropping the query on purpose: the menu is the whole composition."""
+        comp = self._comp
+        if comp is None:
+            return [], []
+        inner_find = getattr(self._inner, "find_tools", None)
+        if inner_find is None:
+            return self.list_tools(query=query, k=k, full=full,
+                                   session_token_id=session_token_id), []
+        kwargs: Dict[str, Any] = {"k": k, "full": full,
+                                  "session_token_id": session_token_id or self._lease}
+        tools, outside = self._call(lambda **kw: inner_find(query, **kw), kwargs,
+                                    ("session_token_id",)) or ([], [])
+        tools = list(tools or [])
+        self._served.update(t.get("name", "") for t in tools)
+        return tools, [n for n in (outside or []) if n and n not in self._served]
+
     def list_skills(self, query: str = "", k: int = 0, names: Optional[List[str]] = None,
                     full: bool = False, session_token_id: str = "", rationale: str = "",
                     discover: bool = False) -> List[Dict]:
@@ -172,7 +200,12 @@ class ComposedScopedSubstrate:
 
     def execute_tool(self, name: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         comp = self._comp
-        if comp is None or not (comp.allows_tool(name) or name in self._served):
+        # ledger_get / ledger_find are kernel-native reads every agent has (they read
+        # only what the caller's own scope admits, kernel-side). resolve_cid reads a
+        # led_ id through ledger_get (owner decision A3, 2026-11-12), so it must not
+        # depend on the menu fetch having listed them.
+        kernel_read = comp is not None and name in KERNEL_LEDGER_TOOLS
+        if comp is None or not (kernel_read or comp.allows_tool(name) or name in self._served):
             return {"denied": True,
                     "deny_reason": f"tool {name!r} is outside the tools composed for this step "
                                    "(client-side check; the kernel enforces the same composition)"}

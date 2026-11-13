@@ -9,7 +9,7 @@ from __future__ import annotations
 import base64
 import json
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 
 def _check(condition: bool, msg: str) -> None:
@@ -300,6 +300,41 @@ def yield_subgoal(
     if continuation_state:
         ctx["_yield_continuation_state"] = base64.b64encode(continuation_state).decode("ascii")
     return AgentResult(type=YIELD_RESULT_TYPE, context=ctx, subgoal=sg)
+
+
+# CAPABILITY_MISSING_RESULT_TYPE marks an AgentResult as the capability_missing
+# outcome (cambrian-core domain/step_recovery.go, CapabilityMissingResultType):
+# the worker cannot do its step because no tool it has performs an action the step
+# needs. The kernel ends the step and the re-planner re-plans it with a worker
+# composed for that capability (T-20261112-yield-sub-goal-on-a-composed-lease-runs-under).
+CAPABILITY_MISSING_RESULT_TYPE = "capability_missing"
+
+# The tried account is a short note for the re-planner, not a transcript.
+_CAPABILITY_TRIED_MAX = 500
+
+
+def capability_missing(needed: str, tools: Sequence[str] = (), tried: str = "") -> AgentResult:
+    """End the step as capability_missing: ``needed`` is the action or effect the step
+    needs that none of the worker's tools can do ("run a PowerShell command"),
+    ``tools`` the tool names find_tools reported as existing outside this step, and
+    ``tried`` a short account of what the worker tried.
+
+    The yield's sibling on the same return path: the payload type and the handoff
+    metadata keys ``_capability_missing`` / ``_capability_needed`` /
+    ``_capability_tool`` (comma-separated) / ``_capability_tried`` the kernel reads
+    (domain.CapabilityMissingFromHandoff). The worker never widens its own tools; the
+    kernel composes the re-planned step's worker from the person's grants.
+    """
+    if not needed or not needed.strip():
+        raise ValueError("capability_missing: needed must name the action the step needs")
+    ctx: Dict[str, str] = {"_capability_missing": "true", "_capability_needed": needed.strip()}
+    names = [t.strip() for t in tools or () if isinstance(t, str) and t.strip()]
+    if names:
+        ctx["_capability_tool"] = ",".join(dict.fromkeys(names))
+    if tried and tried.strip():
+        ctx["_capability_tried"] = tried.strip()[:_CAPABILITY_TRIED_MAX]
+    return AgentResult(type=CAPABILITY_MISSING_RESULT_TYPE, data=needed.strip().encode("utf-8"),
+                       context=ctx)
 
 
 @dataclass

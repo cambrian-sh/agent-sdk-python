@@ -168,10 +168,25 @@ class TraitServicer:
         try:
             result = dispatch_run(self._agent, task)
         except Exception as exc:  # author bug — surface as INTERNAL, never crash the server
-            logger.error("run() raised: %s", exc, exc_info=True)
             import grpc
 
-            context.set_code(grpc.StatusCode.INTERNAL)
+            from .errors import is_context_overflow
+
+            # A prompt over the model's context window is deterministic for this
+            # step: OUT_OF_RANGE, which the kernel's self-healer never retries.
+            # Reported as INTERNAL it was retried as "unclassified" and the whole
+            # 12-round step re-ran into the same overflow (owner decision A4,
+            # T-20261112-worker-resolve-cid-inline-has-no-size-cap-a).
+            if is_context_overflow(exc):
+                logger.error("run() ended on a context overflow: %s", exc)
+                context.set_code(grpc.StatusCode.OUT_OF_RANGE)
+            else:
+                logger.error("run() raised: %s", exc, exc_info=True)
+                context.set_code(grpc.StatusCode.INTERNAL)
+            try:
+                context.set_details(str(exc)[:2000])
+            except Exception:  # noqa: BLE001 — a context double without set_details
+                pass
             return cambrian_pb2.Handoff()
         return _handoff_from_result(result, request, self._agent.agent_id)
 

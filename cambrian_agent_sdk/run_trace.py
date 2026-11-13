@@ -8,6 +8,13 @@ records, as OpenTelemetry-GenAI-shaped spans in one JSONL file per agent process
   exactly as sent, and the response (text, tool calls, stop reason, usage);
 - every tool call: the arguments and the result the loop received.
 
+Each call is also announced when it BEGINS by a start event: a line with the
+same ``span_id`` as the finished span, the request (system instructions,
+messages, tools offered; tool name and arguments), ``"cambrian.phase": "start"``
+and ``end_time_unix_nano`` 0. The file is appended and closed per line, so a
+follower (cambrian-benchmarks' ``usecases.watch``) sees a call while it runs. A
+reader that wants finished spans only skips the start events.
+
 The kernel writes its own file to the same directory (model calls as the
 gateway saw them, kernel-executed tools, step outputs). The two join on
 ``cambrian.lease.id`` / ``cambrian.step.task_id``. Names follow
@@ -38,8 +45,18 @@ _DEFAULT_MAX_CHARS = 20000
 _DEDUPED = ("gen_ai.system_instructions", "gen_ai.tool.definitions")
 
 
+#: The start event of a call carries this attribute with value PHASE_START
+#: (cambrian-core domain.TraceAttrPhase / TracePhaseStart).
+PHASE_ATTR = "cambrian.phase"
+PHASE_START = "start"
+
+
 def now_ns() -> int:
     return time.time_ns()
+
+
+def new_span_id() -> str:
+    return secrets.token_hex(8)
 
 
 class RunTraceWriter:
@@ -58,9 +75,14 @@ class RunTraceWriter:
 
     def span(self, name: str, attributes: Dict[str, Any], *, kind: str = "INTERNAL",
              start_ns: Optional[int] = None, end_ns: Optional[int] = None,
-             error: Optional[str] = None, trace_key: str = "") -> None:
+             error: Optional[str] = None, trace_key: str = "",
+             span_id: str = "", phase: str = "") -> None:
+        """Append one span, or with ``phase="start"`` the start event of one (end
+        time 0). ``span_id`` joins a start event to its finished span; "" mints one."""
         end = end_ns or now_ns()
         attrs = dict(attributes)
+        if phase:
+            attrs[PHASE_ATTR] = phase
         with self._lock:
             if self._broken:
                 return
@@ -76,11 +98,11 @@ class RunTraceWriter:
                     self._seen.add((key, digest))
             rec = {
                 "trace_id": _trace_id(trace_key),
-                "span_id": secrets.token_hex(8),
+                "span_id": span_id or new_span_id(),
                 "name": name,
                 "kind": kind,
                 "start_time_unix_nano": start_ns or end,
-                "end_time_unix_nano": end,
+                "end_time_unix_nano": 0 if phase == PHASE_START else end,
                 "attributes": _bound(attrs, self.max_chars),
                 "status": {"code": "ERROR", "message": error} if error else {"code": "OK"},
                 "resource": {"service.name": self.service},
@@ -162,6 +184,25 @@ def _task_attrs(agent, task) -> Dict[str, Any]:
     return out
 
 
+def _composition_attrs(task) -> Dict[str, Any]:
+    """The composed worker's composition (ADR-0145 D12), for start events."""
+    try:
+        from .composition import composition_from_task
+        comp = composition_from_task(task)
+    except Exception:  # noqa: BLE001 - tracing must never break the loop
+        return {}
+    if comp is None:
+        return {}
+    out: Dict[str, Any] = {"cambrian.composition.runtime": comp.runtime}
+    if comp.skills:
+        out["cambrian.composition.skills"] = list(comp.skills)
+    if comp.professions:
+        out["cambrian.composition.professions"] = list(comp.professions)
+    if comp.step >= 0:
+        out["cambrian.step.index"] = comp.step
+    return out
+
+
 def _messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """OpenAI-style chat messages → GenAI {role, parts} messages."""
     out = []
@@ -187,33 +228,65 @@ def _tool_call_part(c: Any) -> Dict[str, Any]:
             "arguments": c.get("arguments", fn.get("arguments", ""))}
 
 
+def _model_request_attrs(agent, task, *, path: str, round_no: int,
+                         system: Optional[List[Dict[str, Any]]], messages: Optional[List[Dict[str, Any]]],
+                         prompt: Optional[str], tools: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    attrs: Dict[str, Any] = {
+        "gen_ai.operation.name": "chat",
+        "cambrian.react.path": path,
+        "cambrian.react.round": round_no,
+        **_task_attrs(agent, task),
+    }
+    if system:
+        attrs["gen_ai.system_instructions"] = [{"type": "text", "content": b.get("text", "")} for b in system]
+    if messages is not None:
+        attrs["gen_ai.input.messages"] = _messages(messages)
+    elif prompt is not None:
+        attrs["gen_ai.input.messages"] = [{"role": "user", "parts": [{"type": "text", "content": prompt}]}]
+    if tools:
+        attrs["gen_ai.tool.definitions"] = tools
+        attrs["cambrian.tools.offered"] = [
+            (t.get("function") or {}).get("name") or t.get("name", "") for t in tools if isinstance(t, dict)]
+    return attrs
+
+
+def model_call_start(agent, task, *, path: str, round_no: int, system: Optional[List[Dict[str, Any]]] = None,
+                     messages: Optional[List[Dict[str, Any]]] = None, prompt: Optional[str] = None,
+                     tools: Optional[List[Dict[str, Any]]] = None, start_ns: Optional[int] = None) -> str:
+    """Write the start event of a model call (the request, before the model answers).
+
+    Returns the span id :func:`model_call` completes it with; "" when tracing is off.
+    Never raises."""
+    try:
+        w = writer(getattr(agent, "agent_id", ""))
+        if w is None:
+            return ""
+        sid = new_span_id()
+        attrs = _model_request_attrs(agent, task, path=path, round_no=round_no, system=system,
+                                     messages=messages, prompt=prompt, tools=tools)
+        attrs.update(_composition_attrs(task))
+        w.span("chat model", attrs, kind="CLIENT", start_ns=start_ns or now_ns(),
+               trace_key=getattr(task, "session_token_id", "") or "", span_id=sid, phase=PHASE_START)
+        return sid
+    except Exception as exc:  # noqa: BLE001 - tracing must never break the loop
+        logger.debug("run_trace_model_call_start_failed", extra={"err": str(exc)})
+        return ""
+
+
 def model_call(agent, task, *, path: str, round_no: int, system: Optional[List[Dict[str, Any]]] = None,
                messages: Optional[List[Dict[str, Any]]] = None, prompt: Optional[str] = None,
                tools: Optional[List[Dict[str, Any]]] = None, text: str = "",
                tool_calls: Optional[List[Any]] = None, stop: str = "", res: Any = None,
-               start_ns: Optional[int] = None, error: Optional[str] = None) -> None:
-    """Record one model call as a ``chat`` span. Never raises."""
+               start_ns: Optional[int] = None, error: Optional[str] = None, span_id: str = "") -> None:
+    """Record one model call as a ``chat`` span (completing the start event
+    ``span_id`` names, when given). Never raises."""
     try:
         w = writer(getattr(agent, "agent_id", ""))
         if w is None:
             return
         model = getattr(res, "model", "") or ""
-        attrs: Dict[str, Any] = {
-            "gen_ai.operation.name": "chat",
-            "cambrian.react.path": path,
-            "cambrian.react.round": round_no,
-            **_task_attrs(agent, task),
-        }
-        if system:
-            attrs["gen_ai.system_instructions"] = [{"type": "text", "content": b.get("text", "")} for b in system]
-        if messages is not None:
-            attrs["gen_ai.input.messages"] = _messages(messages)
-        elif prompt is not None:
-            attrs["gen_ai.input.messages"] = [{"role": "user", "parts": [{"type": "text", "content": prompt}]}]
-        if tools:
-            attrs["gen_ai.tool.definitions"] = tools
-            attrs["cambrian.tools.offered"] = [
-                (t.get("function") or {}).get("name") or t.get("name", "") for t in tools if isinstance(t, dict)]
+        attrs = _model_request_attrs(agent, task, path=path, round_no=round_no, system=system,
+                                     messages=messages, prompt=prompt, tools=tools)
         parts: List[Dict[str, Any]] = []
         if text:
             parts.append({"type": "text", "content": text})
@@ -230,31 +303,72 @@ def model_call(agent, task, *, path: str, round_no: int, system: Optional[List[D
             attrs["gen_ai.usage.output_tokens"] = getattr(usage, "output_tokens", 0)
             attrs["gen_ai.usage.cache_read.input_tokens"] = getattr(usage, "cache_read_tokens", 0)
         w.span("chat " + (model or "model"), attrs, kind="CLIENT", start_ns=start_ns, error=error,
-               trace_key=getattr(task, "session_token_id", "") or "")
+               trace_key=getattr(task, "session_token_id", "") or "", span_id=span_id)
     except Exception as exc:  # noqa: BLE001 - tracing must never break the loop
         logger.debug("run_trace_model_call_failed", extra={"err": str(exc)})
 
 
+def _executed_by(agent, name: str) -> str:
+    """"agent" for a tool the agent runs in-process, else "kernel" (ExecuteTool, which
+    the kernel traces too: a reader can show one side of such a call)."""
+    try:
+        return "agent" if name in (getattr(agent, "tools", None) or {}) else "kernel"
+    except Exception:  # noqa: BLE001 - a custom tool registry without __contains__
+        return "kernel"
+
+
+def _tool_request_attrs(agent, task, *, name: str, args: Any, call_id: str, round_no: int,
+                        executed_by: str = "") -> Dict[str, Any]:
+    attrs: Dict[str, Any] = {
+        "cambrian.tool.executed_by": executed_by or _executed_by(agent, name),
+        "gen_ai.operation.name": "execute_tool",
+        "gen_ai.tool.name": name,
+        "gen_ai.tool.call.arguments": args if isinstance(args, str) else json.dumps(args, default=str, ensure_ascii=False),
+        "cambrian.react.round": round_no,
+        **_task_attrs(agent, task),
+    }
+    if call_id:
+        attrs["gen_ai.tool.call.id"] = call_id
+    return attrs
+
+
+def tool_call_start(agent, task, *, name: str, args: Any, call_id: str = "", round_no: int = 0,
+                    start_ns: Optional[int] = None, executed_by: str = "") -> str:
+    """Write the start event of a tool call (name and arguments, before it runs).
+
+    Returns the span id :func:`tool_call` completes it with; "" when tracing is off.
+    Never raises."""
+    try:
+        w = writer(getattr(agent, "agent_id", ""))
+        if w is None:
+            return ""
+        sid = new_span_id()
+        w.span("execute_tool " + name,
+               _tool_request_attrs(agent, task, name=name, args=args, call_id=call_id, round_no=round_no,
+                                   executed_by=executed_by),
+               start_ns=start_ns or now_ns(), trace_key=getattr(task, "session_token_id", "") or "",
+               span_id=sid, phase=PHASE_START)
+        return sid
+    except Exception as exc:  # noqa: BLE001 - tracing must never break the loop
+        logger.debug("run_trace_tool_call_start_failed", extra={"err": str(exc)})
+        return ""
+
+
 def tool_call(agent, task, *, name: str, args: Any, result: Any, call_id: str = "",
-              round_no: int = 0, start_ns: Optional[int] = None, error: Optional[str] = None) -> None:
-    """Record one tool call as an ``execute_tool`` span. Never raises."""
+              round_no: int = 0, start_ns: Optional[int] = None, error: Optional[str] = None,
+              span_id: str = "", executed_by: str = "") -> None:
+    """Record one tool call as an ``execute_tool`` span (completing the start event
+    ``span_id`` names, when given). Never raises."""
     try:
         w = writer(getattr(agent, "agent_id", ""))
         if w is None:
             return
         if not isinstance(result, str):
             result = json.dumps(result, default=str, ensure_ascii=False)
-        attrs: Dict[str, Any] = {
-            "gen_ai.operation.name": "execute_tool",
-            "gen_ai.tool.name": name,
-            "gen_ai.tool.call.arguments": args if isinstance(args, str) else json.dumps(args, default=str, ensure_ascii=False),
-            "gen_ai.tool.call.result": result,
-            "cambrian.react.round": round_no,
-            **_task_attrs(agent, task),
-        }
-        if call_id:
-            attrs["gen_ai.tool.call.id"] = call_id
+        attrs = _tool_request_attrs(agent, task, name=name, args=args, call_id=call_id, round_no=round_no,
+                                    executed_by=executed_by)
+        attrs["gen_ai.tool.call.result"] = result
         w.span("execute_tool " + name, attrs, start_ns=start_ns, error=error,
-               trace_key=getattr(task, "session_token_id", "") or "")
+               trace_key=getattr(task, "session_token_id", "") or "", span_id=span_id)
     except Exception as exc:  # noqa: BLE001 - tracing must never break the loop
         logger.debug("run_trace_tool_call_failed", extra={"err": str(exc)})

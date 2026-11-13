@@ -6,6 +6,11 @@ their results, JSON-encoded in the handoff metadata under ``_step_dependencies``
 ``step`` index, ``objective`` (what it was asked), ``status`` (``completed``, ``empty``
 or ``unavailable``), ``content`` (bounded by the kernel; ``shortened`` marks a preview),
 ``bytes`` (full size) and ``cid`` (the full result in the content store).
+A shortened result from a current kernel also carries ``tail`` (its end),
+``omitted_from``/``omitted_to`` (the byte range not shown), ``page_bytes``, ``outline``
+(headings with their ledger_get pages) and ``read`` (the exact call for the omitted
+pages); it is rendered head, omission marker, tail, outline (owner decision B2,
+2026-11-12).
 
 This module renders it as one Evidence region, marked as data. It replaces reading
 the same results as anonymous ``<fact>`` blocks from ``working_memory`` (which carried
@@ -66,6 +71,55 @@ def _attr(value: Any) -> str:
     return str(value).replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
 
 
+def _omitted_pages(d: Mapping[str, Any]) -> str:
+    """The ledger pages the omitted range spans, as "a" or "a–b" ("" if unknown)."""
+    try:
+        size = int(d.get("page_bytes") or 0)
+        lo, hi = int(d.get("omitted_from")), int(d.get("omitted_to"))
+    except (TypeError, ValueError):
+        return ""
+    if size <= 0 or hi <= lo:
+        return ""
+    a, b = lo // size + 1, (hi - 1) // size + 1
+    return str(a) if a == b else f"{a}–{b}"
+
+
+def _render_head_tail(d: Mapping[str, Any], head: str) -> str:
+    """Beginning + an explicit omission marker with the exact read call + end + the
+    outline of the whole result (owner decision B2, 2026-11-12,
+    T-20261112-summarise-a-document-step-gets-only-the-first). A head-only cut biased a
+    summary to the start of the report and the passive "re-open it" hint was ignored
+    (p12); the marker now says which part is missing and exactly how to read it."""
+    cid = str(d.get("cid") or "")
+    tail = _neutralise(str(d.get("tail") or ""))
+    pages = _omitted_pages(d)
+    first = pages.split("–")[0] if pages else "1"
+    read = str(d.get("read") or (f"ledger_get id='{cid}' page={first}" if cid else ""))
+    span = ""
+    if d.get("omitted_from") is not None and d.get("omitted_to") is not None:
+        span = f" (bytes {d.get('omitted_from')}–{d.get('omitted_to')} of {d.get('bytes', '?')})"
+    if cid:
+        # A led_ id is read with ledger_get; any other cid (a legacy content-store
+        # result) only through resolve_cid, which pages and searches the same way.
+        search = (f"ledger_get id='{cid}' find='<text>'" if cid.startswith("led_")
+                  else f"resolve_cid cid='{cid}' find='<text>'")
+        plural = "–" in pages
+        what = f"Pages {pages}" if plural else (f"Page {pages}" if pages else "The middle part")
+        marker = (f"[OMITTED{span}. {what} of this result {'are' if plural else 'is'} NOT shown "
+                  f"here. Before answering anything that depends on the whole result, read "
+                  f"{'them' if plural else 'it'}: {read} (or resolve_cid cid='{cid}' "
+                  f"page={first}); search it with {search}.]")
+    else:
+        marker = f"[OMITTED{span}: no content id, the omitted part cannot be retrieved.]"
+    out = [head, marker, tail]
+    outline = [o for o in (d.get("outline") or []) if isinstance(o, Mapping) and o.get("heading")]
+    if outline:
+        lines = [f"- {_neutralise(str(o.get('heading')))} (page {o.get('page', '?')})"
+                 for o in outline]
+        out.append("[Outline of the whole result, with ledger_get pages:]\n" + "\n".join(lines))
+    return "\n".join(out)
+
+
 def render_step_dependencies(deps: List[Mapping[str, Any]]) -> str:
     """Render the manifest as an ``<upstream_results>`` evidence block ("" if none)."""
     if not deps:
@@ -84,7 +138,10 @@ def render_step_dependencies(deps: List[Mapping[str, Any]]) -> str:
             parts.append(f"<error>{_neutralise(str(d.get('error') or ''))}</error>")
         elif status == "completed":
             content = _neutralise(str(d.get("content") or ""))
-            if d.get("shortened"):
+            if d.get("shortened") and d.get("tail") is not None:
+                content = _render_head_tail(d, content)
+            elif d.get("shortened"):
+                # An older kernel: head only.
                 cid = d.get("cid") or ""
                 where = (f"re-open it with resolve_cid cid={cid!r}, or pass "
                          f"{{\"$cid\": \"{cid}\"}} in a tool argument"

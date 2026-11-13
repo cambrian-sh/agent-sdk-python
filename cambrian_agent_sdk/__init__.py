@@ -31,7 +31,7 @@ import json
 import logging
 import sys
 import threading
-from typing import Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from .types import (
     AgentResult,
@@ -49,6 +49,8 @@ from .types import (
     VerifyRequest,
     VerifyResponse,
     yield_subgoal,
+    capability_missing,
+    CAPABILITY_MISSING_RESULT_TYPE,
 )
 from .base import Agent, CognitiveAgent, DeterministicAgent, DaemonAgent
 from .ingress import IngressAgent, PermanentDeliveryError
@@ -71,6 +73,7 @@ from .clients import (
 from .helpers import extract_code_block, find_step_ref, build_prompt, build_prompt_parts, PromptParts
 from .errors import (
     BudgetExceededError,
+    ContextOverflow,
     GenerateError,
     GenerationResourceExhausted,
     InvalidRequest,
@@ -100,6 +103,8 @@ __all__ = [
     "AgentResult",
     "SubGoal",
     "yield_subgoal",
+    "capability_missing",
+    "CAPABILITY_MISSING_RESULT_TYPE",
     "tool",
     "capability",
     "ToolRegistry",
@@ -127,6 +132,7 @@ __all__ = [
     "SchemaValidationFailed",
     "GenerationResourceExhausted",
     "ModelUnavailable",
+    "ContextOverflow",
     "GenerateResult",
     "GenerateUsage",
     "ResponseSchema",
@@ -282,8 +288,8 @@ def _map_generate_error(exc, *, tools: bool):
     back to the prompt-encoded action protocol, deliberately distinct from every
     real failure so an outage never silently downgrades a run."""
     import grpc
-    from .errors import (GenerateError, GenerationResourceExhausted, InvalidRequest,
-                         ModelUnavailable, SchemaValidationFailed)
+    from .errors import (ContextOverflow, GenerateError, GenerationResourceExhausted,
+                         InvalidRequest, ModelUnavailable, SchemaValidationFailed)
     try:
         code = exc.code()
         details = exc.details() or ""
@@ -297,6 +303,8 @@ def _map_generate_error(exc, *, tools: bool):
         grpc.StatusCode.ABORTED: SchemaValidationFailed,
         grpc.StatusCode.RESOURCE_EXHAUSTED: GenerationResourceExhausted,
         grpc.StatusCode.UNAVAILABLE: ModelUnavailable,
+        # The prompt is over the model's context window (owner decision A4).
+        grpc.StatusCode.OUT_OF_RANGE: ContextOverflow,
     }.get(code, GenerateError)
     return cls(details, code=name)
 
@@ -780,6 +788,53 @@ class SubstrateClient:
             for t in resp.tools
         ]
 
+    def find_tools(
+        self, query: str, k: int = 0, full: bool = False, session_token_id: str = "",
+    ) -> Tuple[List[Dict], List[str]]:
+        """The find_tools pull: ``list_tools(query=...)`` plus the tools that match the
+        query within the person's access but are NOT in this step.
+
+        Under a composed step lease the kernel names those in the ListTools response
+        header ``x-tool-outside-step`` (comma-separated, ranked; cambrian-core
+        network.ToolOutsideStepHeader). They are never in the response body: the
+        worker cannot load or call them, only report them in its capability_missing
+        outcome (T-20261112-yield-sub-goal-on-a-composed-lease-runs-under). Returns
+        ``(tools, outside)``; degrades to ``([], [])`` on any RPC failure.
+        """
+        self._ensure()
+        from ._proto import cambrian_pb2
+
+        md = [("x-agent-id", self._agent_id)] if self._agent_id else []
+        if query:
+            md.append(("x-tool-query", _header_safe(query)))
+        if k > 0:
+            md.append(("x-tool-k", str(k)))
+        if full:
+            md.append(("x-tool-full", "true"))
+        if session_token_id:
+            md.append(("x-lease-id", session_token_id))
+        try:
+            resp, call = self._stub.ListTools.with_call(cambrian_pb2.ListToolsRequest(), metadata=md)
+        except Exception:  # noqa: BLE001 — degrade to an empty menu, never crash
+            return [], []
+        tools = [
+            {
+                "name": t.name,
+                "description": t.description,
+                "schema_json": t.schema_json,
+                "dangerous": t.dangerous,
+            }
+            for t in resp.tools
+        ]
+        outside: List[str] = []
+        try:
+            for key, value in call.initial_metadata() or ():
+                if key == "x-tool-outside-step":
+                    outside.extend(n.strip() for n in str(value).split(",") if n.strip())
+        except Exception:  # noqa: BLE001 — the header is advisory
+            outside = []
+        return tools, list(dict.fromkeys(outside))
+
     def list_skills(
         self, query: str = "", k: int = 0,
         names: Optional[List[str]] = None, full: bool = False,
@@ -1156,6 +1211,44 @@ class SubstrateClient:
         return {"accepted": resp.accepted, "detail": resp.detail, "candidate_id": resp.candidate_id,
                 "created": resp.created, "approval_id": resp.approval_id,
                 "approval_state": resp.approval_state}
+
+    def propose_ontology_change(
+        self,
+        session_token_id: str,
+        *,
+        change: object,
+        namespace: str = "",
+        reason: str = "",
+        client_ref: str = "",
+    ) -> Optional[Dict]:
+        """Draft a change to a namespace's kind/relation declarations
+        (Orchestrator/ProposeOntologyChange, ADR-0149 D2).
+
+        ``change`` is ``{"kinds": [KindSpec...], "relations": [RelationSpec...]}`` (a dict
+        or its JSON string): each spec is added, or replaces the namespace's spec of the
+        same name. The agent only DRAFTS: the kernel classifies it (a breaking, invalid
+        or empty change is refused with the reason), records it as drafted by this agent
+        (from the lease) and asks a person to approve it; the approver applies it.
+        Returns ``{"accepted", "detail", "draft_id", "created", "base_version", "class",
+        "changes", "state", "approval_id", "approval_state"}``; a refusal is
+        ``accepted=False`` with the reason. None when the kernel does not serve drafts.
+        """
+        self._ensure()
+        from ._proto import cambrian_pb2
+
+        change_json = change if isinstance(change, str) else json.dumps(change or {})
+        req = cambrian_pb2.ProposeOntologyChangeRequest(
+            lease_id=session_token_id, namespace=namespace or "", change_json=change_json,
+            reason=reason or "", client_ref=client_ref or "")
+        try:
+            resp = self._stub.ProposeOntologyChange(req, metadata=self._lease_md(session_token_id))
+        except Exception as exc:  # noqa: BLE001 — a refusal is data for the loop
+            return self._rpc_failure(exc)
+        return {"accepted": resp.accepted, "detail": resp.detail, "draft_id": resp.draft_id,
+                "created": resp.created, "base_version": resp.base_version, "class": getattr(resp, "class"),
+                "changes": [{"class": getattr(c, "class"), "subject": c.subject, "detail": c.detail}
+                            for c in resp.changes],
+                "state": resp.state, "approval_id": resp.approval_id, "approval_state": resp.approval_state}
 
     def list_scheduled_tasks(self, session_token_id: str) -> Optional[Dict]:
         """The scheduled tasks of the person this run is for: ``{"tasks": [...]}``."""

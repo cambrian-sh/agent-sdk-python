@@ -174,6 +174,11 @@ class OrchestratorStub:
                 request_serializer=cambrian__pb2.ProposeKnowledgeRequest.SerializeToString,
                 response_deserializer=cambrian__pb2.ProposeKnowledgeResponse.FromString,
                 _registered_method=True)
+        self.ProposeOntologyChange = channel.unary_unary(
+                '/cambrian.Orchestrator/ProposeOntologyChange',
+                request_serializer=cambrian__pb2.ProposeOntologyChangeRequest.SerializeToString,
+                response_deserializer=cambrian__pb2.ProposeOntologyChangeResponse.FromString,
+                _registered_method=True)
 
 
 class OrchestratorServicer:
@@ -360,6 +365,13 @@ class OrchestratorServicer:
         failed call to retry. The principal is the x-agent-id metadata plus the
         lease, as on ExecuteTool, never a body field.
 
+        DEPRECATED 2026-11-09 (ADR-0145 D14): the kernel no longer serves
+        SpawnSubagent and answers UNIMPLEMENTED, which a client already treats as
+        "this deployment has no such surface". A worker that needs more work done
+        hands it to the planner through Execute, as the chat agent delegates. The RPC
+        and its messages are kept so the contract stays wire-compatible; removal is
+        tracked as a ticket. Original description:
+
         ADR-0139 D12: spawn one in-agent subagent and wait for its result (unary:
         the parent awaits). The child is a SEPARATE kernel dispatch, so the
         ToolExecutor governs every child tool call and child spend counts against
@@ -463,6 +475,23 @@ class OrchestratorServicer:
         can never write a committed value or a confirmed link. Only kinds the deployment
         resolves by designated_actor accept proposals. A refusal is an OK response with
         accepted=false and a detail; UNIMPLEMENTED when the kernel has no knowledge bridge.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ProposeOntologyChange(self, request, context):
+        """Ontology drafts (ADR-0149 D2; T-20261113-agent-drafted-ontology-changes-have-no-approval;
+        additive within contract 0101). An agent DRAFTS a change to a namespace's kind and
+        relation declarations; it can never apply one. The kernel classifies the draft with
+        the operator apply's own classifier (a breaking, invalid or empty change is refused
+        at once, with the reason), records it append-only as drafted by the calling agent
+        (resolved from the lease, never a request field), and raises an ontology_change
+        approval routed by the approval policy. When a person approves, the kernel applies
+        the change AS THAT PERSON; if the namespace moved since the draft and the change no
+        longer classifies the same, nothing is applied and the draft is superseded. A
+        refusal is an OK response with accepted=false and a detail; UNIMPLEMENTED when the
+        kernel has no ontology drafts (no Postgres).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -610,6 +639,11 @@ def add_OrchestratorServicer_to_server(servicer, server):
                     servicer.ProposeKnowledge,
                     request_deserializer=cambrian__pb2.ProposeKnowledgeRequest.FromString,
                     response_serializer=cambrian__pb2.ProposeKnowledgeResponse.SerializeToString,
+            ),
+            'ProposeOntologyChange': grpc.unary_unary_rpc_method_handler(
+                    servicer.ProposeOntologyChange,
+                    request_deserializer=cambrian__pb2.ProposeOntologyChangeRequest.FromString,
+                    response_serializer=cambrian__pb2.ProposeOntologyChangeResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -1368,6 +1402,33 @@ class Orchestrator:
             '/cambrian.Orchestrator/ProposeKnowledge',
             cambrian__pb2.ProposeKnowledgeRequest.SerializeToString,
             cambrian__pb2.ProposeKnowledgeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ProposeOntologyChange(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cambrian.Orchestrator/ProposeOntologyChange',
+            cambrian__pb2.ProposeOntologyChangeRequest.SerializeToString,
+            cambrian__pb2.ProposeOntologyChangeResponse.FromString,
             options,
             channel_credentials,
             insecure,

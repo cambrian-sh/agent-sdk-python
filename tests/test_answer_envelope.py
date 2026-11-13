@@ -70,9 +70,11 @@ def test_inline_result_carries_its_ledger_reference():
     assert got == {"total": 5, "_ledger_ref": "led_x"}
     got = react._call_system_tool(_Agent({"result_json": "[1,2]", "result_cid": "led_y"}), "t", {})
     assert got["result"] == [1, 2] and got["_ledger_ref"] == "led_y"
-    # An offloaded result (no inline body) is still a cid to resolve.
-    assert react._call_system_tool(_Agent({"result_json": "", "result_cid": "led_z"}), "t", {}) == {
-        "cid": "led_z", "tool": "t"}
+    # An offloaded result from an older kernel (no description) is still a cid to
+    # resolve, and never a bare id: it carries how to read it (owner decision A2).
+    got = react._call_system_tool(_Agent({"result_json": "", "result_cid": "led_z"}), "t", {})
+    assert got["cid"] == "led_z" and got["tool"] == "t" and got["offloaded"] is True
+    assert "resolve_cid cid='led_z' page=1" in got["note"]
 
 
 def test_repair_turn_is_handed_its_earlier_calls_and_told_not_to_redo_them():

@@ -129,8 +129,18 @@ class CognitiveAgent(Agent):
     #: Knowledge proposals (Orchestrator/ProposeKnowledge): ``propose_knowledge``
     #: writes a CANDIDATE knowledge item or link asserted by this agent, optionally
     #: asking the person the run is for to commit it. Never a committed value. Off
-    #: unless an agent opts in; offered only when the substrate serves it.
+    #: unless an agent opts in; offered only when the substrate serves it. This flag
+    #: only OFFERS the verb to the model: the kernel enforces it — the agent needs an
+    #: operator grant of ``propose_knowledge`` or a profile ``tools:`` entry naming it
+    #: (or a kernel running tools_unrestricted), else PERMISSION_DENIED.
     allow_knowledge_proposals: bool = False
+    #: Ontology drafts (Orchestrator/ProposeOntologyChange, ADR-0149 D2):
+    #: ``propose_ontology_change`` DRAFTS a change to a namespace's kind/relation
+    #: declarations; a person approves it and the approver applies it. An agent never
+    #: applies one. Off unless an agent opts in; offered only when the substrate serves it.
+    #: The kernel enforces it like ``allow_knowledge_proposals``, under the verb
+    #: ``propose_ontology_change``.
+    allow_ontology_proposals: bool = False
 
     #: Opt-in heavy-result summarizer (ADR-0041 D3). A callable ``str -> str``
     #: applied to a tool result that exceeds the inline budget; ``None`` (default)

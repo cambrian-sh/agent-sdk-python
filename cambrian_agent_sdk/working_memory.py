@@ -164,7 +164,15 @@ class ToolCard:
         away. Otherwise the result is summarized inline (heuristic or opt-in LLM).
         """
         cid = result.get("cid") if isinstance(result, dict) else None
-        if cid:
+        if cid and result.get("preview"):
+            # The kernel described the offloaded result (owner decision A2,
+            # 2026-11-12): size, type, shape and a preview reach the text path too.
+            bits = [str(b) for b in (
+                f"{result.get('size_bytes')} bytes" if result.get("size_bytes") is not None else "",
+                result.get("content_type") or "", result.get("shape") or "") if b]
+            summary = (f"(large result offloaded: {', '.join(bits)}; preview: "
+                       f"{result.get('preview')} … {result.get('note') or ''})")
+        elif cid:
             summary = "(large result offloaded to content store; drill down by cid)"
         else:
             summary = _summarize(result, summarizer=summarizer)

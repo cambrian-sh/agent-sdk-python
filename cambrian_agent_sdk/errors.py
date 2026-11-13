@@ -110,3 +110,24 @@ class GenerationResourceExhausted(GenerateError):
 
 class ModelUnavailable(GenerateError):
     """``UNAVAILABLE``: every model on the step's fallback chain failed to serve."""
+
+
+class ContextOverflow(GenerateError):
+    """``OUT_OF_RANGE``: the prompt is larger than the serving model's context window
+    (the provider's "prompt is too long"). Deterministic for an unchanged request: the
+    kernel never retries it on another provider, and an agent that cannot shrink its
+    prompt ends the step with this status so the self-healer does not re-run it
+    (T-20261112-worker-resolve-cid-inline-has-no-size-cap-a, owner decision A4)."""
+
+
+def is_context_overflow(exc: BaseException) -> bool:
+    """True when ``exc`` or anything in its cause/context chain is a
+    :class:`ContextOverflow`."""
+    seen = set()
+    cur: "BaseException | None" = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, ContextOverflow):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return False

@@ -547,6 +547,18 @@ class ProfileScopedSubstrate:
                 return []
         return self._keep(self._inner.list_tools(*args, **kwargs))
 
+    def find_tools(self, query: str, k: int = 0, full: bool = False,
+                   session_token_id: str = "") -> Tuple[List[Dict], List[str]]:
+        """The find_tools pull, kept to the allowlist like :meth:`list_tools` (without
+        this, ``__getattr__`` would hand the loop the unfiltered inner method). The
+        ``outside`` names are passed through: names only, never callable."""
+        inner_find = getattr(self._inner, "find_tools", None)
+        if inner_find is None:
+            return self.list_tools(query=query, k=k, full=full,
+                                   session_token_id=session_token_id), []
+        tools, outside = inner_find(query, k=k, full=full, session_token_id=session_token_id)
+        return self._keep(tools), list(outside or [])
+
     #: Kernel access values (cambrian.proto SkillDescriptor.access). In the set:
     #: served with a body on use_skill. The rest carry no body and are passed through
     #: so the loop can tell the model why.

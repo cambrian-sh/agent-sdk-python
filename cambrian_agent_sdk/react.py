@@ -48,7 +48,8 @@ from .reflection import DEFAULT_MAX_REFLECTION_TOKENS, build_reflection_prompt
 from .errors import ToolCallingUnsupported
 from . import run_trace as _run_trace  # ADR-0145 D10: no-op unless CAMBRIAN_TRACE_DIR
 from .step_dependencies import covered_steps, parse_step_dependencies, render_step_dependencies
-from .types import AgentResult, AgentTask, yield_subgoal
+from .content_window import read_window
+from .types import AgentResult, AgentTask, capability_missing, yield_subgoal
 from .working_memory import (
     Step,
     ToolCard,
@@ -149,11 +150,15 @@ _MAX_UNKNOWN_ACTION_RETRIES = 2
 # ADR-0052: how many verbal reflections the loop will extract per run. Each costs one
 # small LLM call on a hard-veto; bounded so a thrashing run cannot reflect endlessly.
 _DEFAULT_MAX_REFLECTIONS = 3
-# resolve_cid (ADR-0048 residual): how many INLINE resolves per run. Inline
-# resolves put the full body in the prompt, so they cost N tokens. Offload
-# resolves are not capped (they just create a new cid; no token cost). The cap
-# prevents a runaway model from filling the context with full bodies.
+# resolve_cid (ADR-0048 residual) used to cap INLINE resolves at 3 per run because
+# each put a whole body in the prompt. Every inline resolve now returns ONE bounded
+# window (ContextConfig.resolve_page_chars; owner decision A3, 2026-11-12), so a
+# count cap protects nothing and only blocked reading a document page by page. The
+# run_think kwarg max_inline_resolves is still accepted and ignored (deprecated).
 _DEFAULT_MAX_INLINE_RESOLVES = 3
+# A kernel run-ledger id (domain.IsLedgerID): resolve_cid reads one through the
+# kernel's ledger_get, never through GetContextNode.
+_LEDGER_ID_PREFIX = "led_"
 
 
 # The ReAct prompt texts live in the SDK prompt library (ADR-0139 C4):
@@ -187,6 +192,7 @@ def build_output_schema(
     native_tools: bool = False,
     allow_memory: bool = True,
     kernel_verbs: Sequence[str] = (),
+    allow_capability_missing: bool = False,
 ) -> str:
     """Describe the closed action menu + the agent's tools for the LLM (v2).
 
@@ -247,6 +253,11 @@ def build_output_schema(
     answer = _ap("answer" + suffix)
     if allow_yield_subgoal:
         answer += "\n" + _ap("answer-yield" + suffix)
+    # T-20261112-yield-sub-goal-on-a-composed-lease-runs-under: a step that needs a
+    # tool it does not have ends as capability_missing and is re-planned; a sub-goal
+    # would run with the same tools. Off (the default) renders exactly v2's text.
+    if allow_capability_missing:
+        answer += "\n" + _ap("answer-capability-missing" + suffix)
     blocks = [
         _ap(f"opener-{variant}"),
         # Memory is advertised only when the agent may actually use it.
@@ -653,13 +664,42 @@ _MEMORY_TOOL_DEF = _control_def(
 _RESOLVE_TOOL_DEF = _control_def(
     "resolve_cid", {"cid": {"type": "string", "description": "the cid to re-open"},
                     "as": {"type": "string", "enum": ["inline", "offload"],
-                           "description": "inline: return the body; offload: return a fresh cid"}},
+                           "description": "inline: return one page of the body; offload: return a fresh cid"},
+                    "page": {"type": "integer", "minimum": 1,
+                             "description": "which page to read (1-based); a long body is read page by page"},
+                    "find": {"type": "string",
+                             "description": "search the body for this text; returns matches with their page numbers"}},
     ["cid"])
 _FINAL_ANSWER_TOOL_DEF = _control_def(
     "final_answer", {"answer": {"type": "string",
                                 "description": "the deliverable, in the required output format"},
-                     "type": {"type": "string", "description": "result type; normally text"}},
+                     "type": {"type": "string", "description": "result type; normally text"},
+                     "answer_ref": {"type": "string",
+                                    "description": ("optional: the ledger id (led_...) of one of YOUR tool "
+                                                    "results this step, when that result unchanged IS the "
+                                                    "deliverable; it is handed on whole and answer then only "
+                                                    "says what it is. Never copy a long tool output into answer.")}},
     ["answer"])
+# The JSON type of an envelope value follows its declared `type` (cambrian-core
+# domain.CheckValueType). An untyped value let small models send a list as a string
+# holding a JSON array (the kernel's NormaliseListValue still repairs that, logged as
+# coerced=list_from_json_string). Strict tool use / constrained decoding is not
+# available through the deployment's proxy, so the schema can only state the type,
+# not enforce it per kind: `type` is the union of the JSON types a value may take,
+# and the description maps each declared type to its JSON type. A conditional
+# (allOf of if/then per declared type) would be more precise, but whether every
+# provider path accepts it in a tool schema is unverified, and an opaque 400 there
+# would fail every envelope step (T-20261112-worker-final-answer-envelope-value-has-no-json).
+_ENVELOPE_VALUE_SCHEMA: Dict[str, Any] = {
+    "type": ["string", "number", "boolean", "array", "object"],
+    "description": (
+        "the value, exactly as the evidence states it, in the JSON type its type names: "
+        "list = a JSON array (never a string holding one); number = a JSON number; "
+        "money = a JSON number, or a string with its currency such as \"1,250.50 EUR\"; "
+        "bool = true or false; object = a JSON object; string, date (YYYY-MM-DD), id, "
+        "ref and citation = a string"),
+}
+
 # ADR-0145 D6: final_answer for a step that answers checklist items. Same verb,
 # with the fixed envelope's per-item results; offered INSTEAD of the plain one
 # when the kernel stamped _answer_items, so every other agent's menu is unchanged.
@@ -674,7 +714,7 @@ _FINAL_ANSWER_ENVELOPE_TOOL_DEF = _control_def(
                     "name": {"type": "string"},
                     "type": {"type": "string", "enum": ["string", "number", "money", "date", "id", "ref",
                                                         "citation", "bool", "list", "object"]},
-                    "value": {"description": "the value, exactly as the evidence states it"},
+                    "value": _ENVELOPE_VALUE_SCHEMA,
                     "evidence_ref": {"type": "string", "description": "the ledger id it was read from"}},
                     "required": ["name", "type", "value", "evidence_ref"]}},
                 "reason": {"type": "string"}},
@@ -687,6 +727,17 @@ _YIELD_TOOL_DEF = _control_def(
                       "capability_hint": {"type": "string",
                                           "description": "optional capability name"}},
     ["intent"])
+# T-20261112-yield-sub-goal-on-a-composed-lease-runs-under: the capability_missing
+# outcome (cambrian-core domain/step_recovery.go). Ends the step; the kernel sends it
+# to the re-planner, which re-plans the step with a worker composed for the need.
+_CAPABILITY_MISSING_TOOL_DEF = _control_def(
+    "report_capability_missing", {
+        "needed": {"type": "string",
+                   "description": "the action or effect this step needs that none of your tools can do"},
+        "tools": {"type": "array", "items": {"type": "string"},
+                  "description": "tools find_tools named as existing outside this step"},
+        "tried": {"type": "string", "description": "what you tried, briefly"}},
+    ["needed"])
 
 
 # ADR-0139 D14 / D13: the control verbs that call a kernel surface (ADR-0145 D14
@@ -742,9 +793,19 @@ _PROPOSE_KNOWLEDGE_TOOL_DEF = _kernel_verb_def("propose_knowledge", {
     "evidence_id": {"type": "string", "description": "the evidence the proposal rests on"},
     "reason": {"type": "string", "description": "why; shown to the approver"},
 }, [])
+_PROPOSE_ONTOLOGY_CHANGE_TOOL_DEF = _kernel_verb_def("propose_ontology_change", {
+    "change": {"type": "object", "description": "the declarations to add or replace by name: "
+               "{\"kinds\": [{\"kind\", \"predicates\": {name: {\"type\", \"enum\"?, \"required\"?}}}], "
+               "\"relations\": [{\"name\", \"family\"}]}",
+               "properties": {"kinds": {"type": "array", "items": {"type": "object"}},
+                              "relations": {"type": "array", "items": {"type": "object"}}}},
+    "namespace": {"type": "string", "description": "the namespace; empty = default"},
+    "reason": {"type": "string", "description": "why; shown to the person who approves it"},
+}, ["change"])
 _KERNEL_VERB_DEFS = {d["name"]: d for d in (_NOTE_TOOL_DEF, _PROPOSE_SKILL_TOOL_DEF,
                                             _SCHEDULE_TOOL_DEF, _MANAGE_SCHEDULES_TOOL_DEF,
-                                            _PROPOSE_KNOWLEDGE_TOOL_DEF)}
+                                            _PROPOSE_KNOWLEDGE_TOOL_DEF,
+                                            _PROPOSE_ONTOLOGY_CHANGE_TOOL_DEF)}
 _KERNEL_VERB_NAMES = tuple(_KERNEL_VERB_DEFS)
 
 # The loop's OWN vocabulary, as the model may emit it under native tool-calling.
@@ -770,6 +831,7 @@ _CONTROL_ACTION_NAMES = _DISCOVERY_TOOL_NAMES | {
     "use_skill",
     "find_skills",
     "yield_subgoal",
+    "report_capability_missing",
     "resolve_cid",
 } | set(_KERNEL_VERB_DEFS)
 
@@ -779,7 +841,9 @@ def build_tool_definitions(agent, system_tools, include_discovery: bool = True,
                            include_resolve: bool = False, include_final: bool = False,
                            include_yield: bool = False,
                            kernel_verbs: Sequence[str] = (),
-                           final_envelope: bool = False) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+                           final_envelope: bool = False,
+                           include_capability_missing: bool = False,
+                           ) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
     """Render the agent's tool menu as native tool definitions (ADR-0097 Phase B).
 
     Returns ``(definitions, name_map)`` where ``name_map`` is sanitized→original. The
@@ -811,6 +875,9 @@ def build_tool_definitions(agent, system_tools, include_discovery: bool = True,
     when the memory budget is non-zero, yield only when the agent may yield), so
     every control verb it advertises is a tool. They default off so a caller that
     builds a plain tool menu gets exactly what it asked for.
+
+    ``include_capability_missing`` adds ``report_capability_missing``
+    (T-20261112-yield-sub-goal-on-a-composed-lease-runs-under).
     """
     defs: List[Dict[str, Any]] = []
     name_map: Dict[str, str] = {}
@@ -821,7 +888,8 @@ def build_tool_definitions(agent, system_tools, include_discovery: bool = True,
         list(_SKILL_TOOL_DEFS) if include_skills else []) + (
         [_MEMORY_TOOL_DEF] if include_memory else []) + (
         [_RESOLVE_TOOL_DEF] if include_resolve else []) + (
-        [_YIELD_TOOL_DEF] if include_yield else []) + [
+        [_YIELD_TOOL_DEF] if include_yield else []) + (
+        [_CAPABILITY_MISSING_TOOL_DEF] if include_capability_missing else []) + [
         # ADR-0139 D14/D13: propose_memory_note, propose_skill, ..., only those the
         # loop offers this run.
         _KERNEL_VERB_DEFS[v] for v in kernel_verbs if v in _KERNEL_VERB_DEFS] + (
@@ -1007,6 +1075,7 @@ def run_think(
     seed_system_tools: bool = True,
     allow_find_tools: Optional[bool] = None,
     allow_yield_subgoal: bool = True,
+    allow_capability_missing: Optional[bool] = None,
     max_memory_queries: int = _DEFAULT_MAX_MEMORY_QUERIES,
     max_tool_rounds: int = _DEFAULT_MAX_TOOL_ROUNDS,
     max_tokens: int = 4096,  # #1: 1024 truncated substantive outputs (e.g. a tool_call
@@ -1028,6 +1097,7 @@ def run_think(
     allow_skill_proposals: Optional[bool] = None,
     allow_scheduled_tasks: Optional[bool] = None,
     allow_knowledge_proposals: Optional[bool] = None,
+    allow_ontology_proposals: Optional[bool] = None,
     evidence_reprompt: Optional[bool] = None,
     turn_evidence: Optional[bool] = None,
     delegation_tool: Optional[str] = None,
@@ -1043,6 +1113,12 @@ def run_think(
     pushing toward final_answer. ``turn_evidence`` lets a caller that seeds its own
     evidence outside the loop (the chat agent's recalled memory) say whether it did:
     True counts as evidence, False/None leave the decision to what the loop saw.
+
+    ``allow_capability_missing`` offers ``report_capability_missing`` (None = the
+    agent's ``allow_capability_missing`` attribute, else ``allow_yield_subgoal``: it is
+    offered wherever a plan-step yield is). It ends the step as the capability_missing
+    outcome, which the kernel sends to the re-planner
+    (T-20261112-yield-sub-goal-on-a-composed-lease-runs-under).
 
     ADR-0139 D14/D13 kernel-surface verbs: ``allow_memory_note_writes`` and
     ``allow_skill_proposals`` (None = the agent's attribute of the same name, False
@@ -1075,6 +1151,9 @@ def run_think(
     from . import assemble_context
 
     role = role or getattr(agent, "role", None) or agent.description
+    if allow_capability_missing is None:
+        attr = getattr(agent, "allow_capability_missing", None)
+        allow_capability_missing = allow_yield_subgoal if attr is None else bool(attr)
     # ADR-0041 D1/D2: typed working memory replaces the flat scratchpad. When the
     # substrate exposes the Embed RPC, entries are embedded for relevance-ranked,
     # bounded prompt assembly; otherwise assembly degrades to recency.
@@ -1111,7 +1190,7 @@ def run_think(
     kernel_verbs = _offered_kernel_verbs(
         agent, task, notes_served=notes_served, notes=allow_memory_note_writes,
         skills=allow_skill_proposals, schedules=allow_scheduled_tasks,
-        knowledge=allow_knowledge_proposals)
+        knowledge=allow_knowledge_proposals, ontology=allow_ontology_proposals)
     disabled_verbs: set = set()  # verbs the kernel answered UNIMPLEMENTED this run
     # Only the legacy engine ranks entries by cosine to the task; the default engine
     # budgets by tokens, so it does not spend an Embed RPC on the intent.
@@ -1120,6 +1199,9 @@ def run_think(
     mem_queries = 0
     tool_rounds = 0
     find_tools_calls = 0  # ADR-0044: cap the discovery pull to avoid loops
+    # Tools find_tools reported as existing outside this step (kernel header
+    # x-tool-outside-step): never callable, carried into report_capability_missing.
+    outside_seen: List[str] = []
     describe_calls = 0  # ADR-0045: cap the describe_tool Tier-2 fetch
     find_skills_calls = 0  # ADR-0046: cap the find_skills discovery pull
     skill_loads = 0  # ADR-0046: cap use_skill loads
@@ -1145,7 +1227,9 @@ def run_think(
     drafted_answer = ""  # the last inferred answer re-prompted; carried on ReActLoopError
     unknown_action_retries = 0  # unrecognised action kinds re-prompted (_MAX_UNKNOWN_ACTION_RETRIES)
     reflections: List[str] = []  # ADR-0052: verbal reflections extracted on hard-veto
-    inline_resolves: int = 0   # ADR-0048 residual: budget for resolve_cid as="inline"
+    # Owner decision B3 (2026-11-12): the ledger ids of THIS run's own tool results,
+    # the only ids a final_answer may name as answer_ref.
+    own_ledger_refs: set = set()
     # ADR-0145 D3: whether this run holds any evidence. Structural only: set by what
     # the loop seeded or executed, never by what the model wrote.
     evidence_on = _evidence_reprompt_default() if evidence_reprompt is None else bool(evidence_reprompt)
@@ -1300,7 +1384,8 @@ def run_think(
             agent, system_tools, include_discovery=find_tools_enabled,
             include_skills=bool(system_skills), include_memory=allow_memory,
             include_resolve=True, include_final=True, include_yield=allow_yield_subgoal,
-            kernel_verbs=kernel_verbs, final_envelope=bool(envelope_items))
+            kernel_verbs=kernel_verbs, final_envelope=bool(envelope_items),
+            include_capability_missing=allow_capability_missing)
 
     tool_defs, tool_name_map = _native_defs()
     # ADR-0097 D8: under native tool-calling the model's history is THIS list, not a
@@ -1356,6 +1441,7 @@ def run_think(
 
     action_protocol = _compose_action_protocol(agent, output_schema, system_tools, system_skills,
                                                 allow_yield_subgoal=allow_yield_subgoal,
+                                                allow_capability_missing=allow_capability_missing,
                                                 native_tools=bool(native_tools and tool_defs),
                                                 allow_memory=allow_memory,
                                                 kernel_verbs=kernel_verbs)
@@ -1501,7 +1587,8 @@ def run_think(
             system_tools = _merge_tools(system_tools, skill_tools)
             action_protocol = _compose_action_protocol(
                 agent, output_schema, system_tools, system_skills,
-                allow_yield_subgoal=allow_yield_subgoal, native_tools=False,
+                allow_yield_subgoal=allow_yield_subgoal,
+                allow_capability_missing=allow_capability_missing, native_tools=False,
                 allow_memory=allow_memory, kernel_verbs=kernel_verbs)
             continue
         if native_fn is not None and tool_defs:
@@ -1533,16 +1620,28 @@ def run_think(
             _log_llm_call("native", round_no + 1, native_system if not fold_system else [],
                           len(conversation))
             _trace_t0 = _run_trace.now_ns()
+            # Live view: the request is on the trace before the model answers.
+            _trace_sys = native_system if not fold_system else []
+            _trace_sid = _run_trace.model_call_start(
+                agent, task, path="native", round_no=round_no + 1, system=_trace_sys,
+                messages=conversation, tools=tool_defs, start_ns=_trace_t0)
             try:
-                n_res = native_fn(
-                    task.session_token_id,
-                    conversation,
-                    tool_defs,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    timeout_ms=0,
-                    **kw,
-                )
+                try:
+                    n_res = native_fn(
+                        task.session_token_id,
+                        conversation,
+                        tool_defs,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        timeout_ms=0,
+                        **kw,
+                    )
+                except Exception as _trace_exc:
+                    _run_trace.model_call(agent, task, path="native", round_no=round_no + 1,
+                                          system=_trace_sys, messages=conversation, tools=tool_defs,
+                                          start_ns=_trace_t0, span_id=_trace_sid,
+                                          error=f"{type(_trace_exc).__name__}: {_trace_exc}")
+                    raise
                 n_text, n_calls, n_stop = n_res
                 n_ignored = list(getattr(n_res, "ignored", None) or [])
                 if "system" in n_ignored and not fold_system:
@@ -1550,6 +1649,11 @@ def run_think(
                     # system blocks: the model saw no role, rules or menu. Discard the
                     # turn and resend with the system text folded into the first user
                     # turn, for the rest of the run.
+                    _run_trace.model_call(agent, task, path="native", round_no=round_no + 1,
+                                          system=_trace_sys, messages=conversation, tools=tool_defs,
+                                          text=n_text, tool_calls=n_calls, stop=n_stop, res=n_res,
+                                          start_ns=_trace_t0, span_id=_trace_sid,
+                                          error="system ignored: turn discarded, resent with the system folded")
                     fold_system = True
                     logger.warning("react_system_ignored_folding", extra={
                         "path": "native", "legacy_kernel": bool(getattr(n_res, "legacy_kernel", False))})
@@ -1560,9 +1664,10 @@ def run_think(
                     continue
                 _log_llm_result("native", n_res)
                 _run_trace.model_call(agent, task, path="native", round_no=round_no + 1,
-                                      system=native_system if not fold_system else [],
+                                      system=_trace_sys,
                                       messages=conversation, tools=tool_defs, text=n_text,
-                                      tool_calls=n_calls, stop=n_stop, res=n_res, start_ns=_trace_t0)
+                                      tool_calls=n_calls, stop=n_stop, res=n_res, start_ns=_trace_t0,
+                                      span_id=_trace_sid)
                 # Echo the assistant turn back VERBATIM, tool_calls included. This is
                 # what lets the model see that the call was its own.
                 assistant_turn: Dict[str, Any] = {"role": "assistant", "content": n_text or ""}
@@ -1615,6 +1720,7 @@ def run_think(
                 action_protocol = _compose_action_protocol(
                     agent, output_schema, system_tools, system_skills,
                     allow_yield_subgoal=allow_yield_subgoal,
+                    allow_capability_missing=allow_capability_missing,
                     native_tools=False, allow_memory=allow_memory,
                     kernel_verbs=kernel_verbs)
                 continue
@@ -1754,6 +1860,11 @@ def run_think(
                     continue
                 tool_rounds += 1
                 to_run.append((call_id, name, args))
+            _par_t0 = _run_trace.now_ns()
+            _par_sids = {call_id: _run_trace.tool_call_start(agent, task, name=name, args=args,
+                                                             call_id=call_id, round_no=round_no,
+                                                             start_ns=_par_t0)
+                         for call_id, name, args in to_run}
             outs = _run_parallel(agent, to_run, task)
             outs.update(served)
             engine = _base_engine(wm)
@@ -1761,8 +1872,12 @@ def run_think(
                 if call_id in outs:
                     _note_call(wm, call_id, name, args)
                     out = outs[call_id]
+                    own_ledger_refs.update(_ledger_refs_of(out))
                     _run_trace.tool_call(agent, task, name=name, args=args, result=out,
-                                         call_id=call_id, round_no=round_no)
+                                         call_id=call_id, round_no=round_no,
+                                         start_ns=_par_t0 if call_id in _par_sids else None,
+                                         span_id=_par_sids.get(call_id, ""),
+                                         executed_by="kernel" if call_id in _par_sids else "agent")
                     card = ToolCard.from_result(
                         name, args, out, summarizer=getattr(agent, "tool_summarizer", None))
                     full_body_str = out if isinstance(out, str) else json.dumps(out, default=str)
@@ -1888,6 +2003,11 @@ def run_think(
             # Local @tool → run in-process. Otherwise it is a kernel-owned system
             # tool (ADR-0039): the agent marshalled the args here; the kernel
             # authorizes and executes it in a confined process via ExecuteTool.
+            _tool_t0 = _run_trace.now_ns()
+            _tool_by = "agent" if served is not None else ""
+            _tool_sid = _run_trace.tool_call_start(agent, task, name=name, args=args,
+                                                   call_id=pending_tool_call_id, round_no=round_no,
+                                                   start_ns=_tool_t0, executed_by=_tool_by)
             if served is not None:
                 out = served
                 logger.info("react_compacted_reread_served",
@@ -1906,12 +2026,14 @@ def run_think(
                 # sandboxed evaluation (interview) session and auto-approve
                 # dangerous tools within it (ADR-0037/0039).
                 out = _call_system_tool(agent, name, args, task.session_token_id, task.task_id)
+                own_ledger_refs.update(_ledger_refs_of(out))
                 stop = _repeated_denial(denial_counts, name, args, out)
                 if stop:
                     logger.warning("react_repeated_denial_stop",
                                    extra={"round": round_no, "tool": name, "reason": stop[:300]})
                     _run_trace.tool_call(agent, task, name=name, args=args, result=out,
-                                         call_id=pending_tool_call_id, round_no=round_no)
+                                         call_id=pending_tool_call_id, round_no=round_no,
+                                         start_ns=_tool_t0, span_id=_tool_sid, executed_by=_tool_by)
                     return AgentResult.from_text(
                         f"Could not complete this part: the kernel refused {name!r} twice with the "
                         f"same reason, so it was not tried again. Reason: {stop}",
@@ -1924,7 +2046,8 @@ def run_think(
                 extra={"round": round_no, "tool": name, "tool_args": args},
             )
             _run_trace.tool_call(agent, task, name=name, args=args, result=out,
-                                 call_id=pending_tool_call_id, round_no=round_no)
+                                 call_id=pending_tool_call_id, round_no=round_no,
+                                 start_ns=_tool_t0, span_id=_tool_sid, executed_by=_tool_by)
             # ADR-0041 D1/D3: record an invocation card (tool + args + status +
             # summary). A heavy system-tool result the kernel offloaded keeps
             # {summary + cid}; otherwise it is summarized inline (heuristic by
@@ -1984,8 +2107,13 @@ def run_think(
                 _control_reply("<note>tool-discovery budget exhausted; use a tool already "
                                "in your menu, or answer/yield.</note>")
                 continue
-            found = _list_system_tools(agent, query=need, full=native_tools,
-                                       session_token_id=task.session_token_id)
+            found, outside = _find_system_tools(agent, query=need, full=native_tools,
+                                                session_token_id=task.session_token_id)
+            _found_names = {t.get("name") for t in found}
+            outside = [n for n in outside if n not in _found_names]
+            for n in outside:
+                if n not in outside_seen:
+                    outside_seen.append(n)
             seen = {t.get("name") for t in system_tools}
             added = [t for t in found if t.get("name") not in seen]
             system_tools = system_tools + added
@@ -1998,6 +2126,7 @@ def run_think(
                 tool_defs, tool_name_map = _native_defs()
             logger.info("react_find_tools", extra={"round": round_no, "need": need,
                                                    "added": [t.get("name") for t in added],
+                                                   "outside_step": outside,
                                                    "offered": len(tool_defs)})
             if added:
                 # One protocol per prompt (ADR-0139): natively the tool is just called.
@@ -2005,8 +2134,9 @@ def run_think(
                     need, ", ".join(t.get("name") for t in added),
                     "Call one." if native_tools else "Call one with tool_call."))
             else:
-                _control_reply(f"<note>No tool matched {need!r}. Proceed without it — "
-                               "answer from what you have, or yield_subgoal.</note>")
+                # T-20261112-yield-sub-goal-on-a-composed-lease-runs-under: name the
+                # re-plan outcome, never a sub-goal (it would run with these same tools).
+                _control_reply(_find_tools_miss_note(need, outside, allow_capability_missing))
             continue
 
         if kind == "find_skills":
@@ -2139,6 +2269,7 @@ def run_think(
                     action_protocol = _compose_action_protocol(
                         agent, output_schema, system_tools, system_skills,
                         allow_yield_subgoal=allow_yield_subgoal,
+                        allow_capability_missing=allow_capability_missing,
                         native_tools=False, allow_memory=allow_memory,
                         kernel_verbs=kernel_verbs)
                 logger.info("react_skill_tools_added",
@@ -2189,17 +2320,27 @@ def run_think(
             continue
 
         if kind == "resolve_cid":
-            # ADR-0048 residual: the agent asks the kernel to fetch a
-            # previously-offloaded body (a workspace seed, a tool result, a
-            # recalled fact). Two modes:
-            #   - "offload" (default): body is re-offloaded and a NEW cid is
-            #     returned. Net cost: 1 round-trip + 0 prompt tokens.
-            #   - "inline": body is inlined into the trajectory so the model
-            #     can read it. Net cost: 1 round-trip + N prompt tokens.
-            #     Per-run budget enforced here so a runaway model can't
-            #     fill the context.
+            # ADR-0048 residual, made bounded by owner decision A3 (2026-11-12,
+            # T-20261112-worker-resolve-cid-inline-has-no-size-cap-a): re-opening
+            # content returns ONE window of it (a page, or the matches of a search),
+            # with a note naming the total size, the part shown and the exact call for
+            # the next page. It used to inline the WHOLE body: a 300k-char base64 tool
+            # result overflowed a 200k-token prompt (p06), and a re-opened compacted
+            # output was re-compacted and re-opened round after round (p12).
+            #   - a led_ id is the kernel's ledger entry: read through ledger_get, the
+            #     ONE read pathway for the ledger (paged + searchable by the kernel);
+            #   - any other cid (a compacted output kept by the context engine, a
+            #     content-store cid) is paged here, in the same shape.
+            # as="offload" keeps its meaning for a non-ledger cid (a fresh cid for a
+            # later tool call); a led_ id already is such a reference.
             cid = (action.get("cid") or "").strip()
-            as_mode = (action.get("as") or "offload").strip()
+            as_given = str(action.get("as") or "").strip()
+            as_mode = as_given or "offload"
+            find_q = str(action.get("find") or "").strip()
+            try:
+                want_page = int(action.get("page") or 0) or None
+            except (TypeError, ValueError):
+                want_page = None
             if not cid:
                 _step_reply(
                     kind="note",
@@ -2212,12 +2353,39 @@ def run_think(
                     body=f"resolve_cid: 'as' must be 'offload' or 'inline', got {as_mode!r}.",
                 )
                 continue
-            # ADR-0139 D3: a cid the context engine compacted is resolved locally (the
-            # raw output is always kept) and re-opening it inline has NO per-run cap:
-            # compaction must never make evidence harder to get back than it was.
+            window_tid = pending_tool_call_id
+            if cid.startswith(_LEDGER_ID_PREFIX):
+                if as_given == "offload" and not (want_page or find_q):
+                    _step_reply(
+                        kind="note",
+                        body=(f"resolve_cid: {cid} is already a reference: pass "
+                              f'{{"$cid": "{cid}"}} as a tool argument, or read it page by '
+                              f"page with resolve_cid cid='{cid}' page=1 (or find='<text>')."),
+                    )
+                    continue
+                lg_args: Dict[str, Any] = {"id": cid}
+                if want_page:
+                    lg_args["page"] = want_page
+                if find_q:
+                    lg_args["find"] = find_q
+                got = _call_system_tool(agent, "ledger_get", lg_args,
+                                        task.session_token_id, task.task_id)
+                rendered, info = _render_ledger_window(cid, got)
+                if rendered is None:
+                    _step_reply(kind="note", body=f"resolve_cid: {info.get('error')}")
+                    continue
+                _step_reply(kind="resolve_cid", cid=cid, resolved_from=cid, mode="inline",
+                            body=rendered, summary=info.get("note") or "")
+                logger.info("react_resolve_cid_window",
+                            extra={"round": round_no, "cid": cid, "page": info.get("page"),
+                                   "pages": info.get("pages"), "chars": len(rendered),
+                                   "find": find_q, "source": "ledger"})
+                _note_resolve_window(wm, window_tid, cid, info)
+                continue
+            # A cid the context engine compacted is resolved locally (the raw output is
+            # always kept, ADR-0139 D3); anything else from the content store.
             sub = getattr(agent, "substrate", None)
             body: Optional[str] = _base_engine(wm).resolve_local(cid)
-            compacted = body is not None
             if body is None and sub is not None and hasattr(sub, "get_context_node"):
                 try:
                     node = sub.get_context_node(cid, session_token_id=task.session_token_id)
@@ -2236,33 +2404,20 @@ def run_think(
                     body=f"resolve_cid: cid {cid!r} not found in ContentStore (or fetch failed).",
                 )
                 continue
-            if as_mode == "inline":
-                # Per-run budget (mitigation for runaway context fill).
-                if not compacted and inline_resolves >= max_inline_resolves:
-                    _step_reply(
-                        kind="note",
-                        body=f"resolve_cid: inline budget exhausted ({max_inline_resolves}). "
-                             f"Use as='offload' instead — body stays out of your context; the next "
-                             f"tool_call can use the new cid.",
-                    )
-                    continue
-                if compacted:
-                    summary = f"{len(body)} chars inlined from a compacted output (no cap on these)."
-                else:
-                    inline_resolves += 1
-                    summary = (f"{len(body)} chars inlined; full body in your context (inline "
-                               f"resolve {inline_resolves}/{max_inline_resolves}).")
-                _step_reply(
-                    kind="resolve_cid", cid=cid, resolved_from=cid,
-                    mode="inline", body=body, summary=summary,
-                )
-                logger.info("react_resolve_cid_inline",
-                            extra={"round": round_no, "cid": cid, "chars": len(body),
-                                   "inline_count": inline_resolves, "max": max_inline_resolves})
+            if as_mode == "inline" or want_page or find_q:
+                info = read_window(cid, body, _resolve_page_chars(ctx_cfg), want_page, find_q)
+                rendered = _render_window_body(info)
+                _step_reply(kind="resolve_cid", cid=cid, resolved_from=cid, mode="inline",
+                            body=rendered, summary=info["note"])
+                logger.info("react_resolve_cid_window",
+                            extra={"round": round_no, "cid": cid, "page": info.get("page"),
+                                   "pages": info.get("pages"), "chars": len(rendered),
+                                   "find": find_q, "source": "local"})
+                _note_resolve_window(wm, window_tid, cid, info)
                 continue
             # as_mode == "offload": re-offload via the substrate so the body
-            # gets a fresh cid the next tool_call can use. Fall back to inline
-            # if the substrate has no put_context_node.
+            # gets a fresh cid the next tool_call can use. Without a write path the
+            # first page is returned instead (bounded, like inline).
             new_cid: Optional[str] = None
             if sub is not None and hasattr(sub, "put_context_node"):
                 try:
@@ -2272,17 +2427,16 @@ def run_think(
                                    extra={"cid": cid, "err": str(exc)})
                     new_cid = None
             if not new_cid:
-                # No write path — fall back to inline. This is the safe default;
-                # the model can still get the body, just with the inline cost.
-                _step_reply(
-                    kind="resolve_cid", cid=cid, resolved_from=cid,
-                    mode="inline", body=body,
-                    summary=f"{len(body)} chars; substrate has no put_context_node — "
-                             f"inlined as fallback (resolve {inline_resolves + 1}/{max_inline_resolves}).",
-                )
-                inline_resolves += 1
-                logger.info("react_resolve_cid_inline_fallback",
-                            extra={"round": round_no, "cid": cid, "chars": len(body)})
+                info = read_window(cid, body, _resolve_page_chars(ctx_cfg))
+                rendered = _render_window_body(info)
+                _step_reply(kind="resolve_cid", cid=cid, resolved_from=cid, mode="inline",
+                            body=rendered,
+                            summary="substrate has no put_context_node; first page shown. " + info["note"])
+                logger.info("react_resolve_cid_window",
+                            extra={"round": round_no, "cid": cid, "page": info.get("page"),
+                                   "pages": info.get("pages"), "chars": len(rendered),
+                                   "find": "", "source": "offload-fallback"})
+                _note_resolve_window(wm, window_tid, cid, info)
                 continue
             _step_reply(
                 kind="resolve_cid", cid=new_cid, resolved_from=cid,
@@ -2334,6 +2488,28 @@ def run_think(
                 continue
             logger.info("react_yield_subgoal", extra={"round": round_no, "intent": intent})
             return yield_subgoal(intent, capability_hint=(action.get("capability_hint") or None))
+
+        if kind == "report_capability_missing":
+            # T-20261112-yield-sub-goal-on-a-composed-lease-runs-under: end the step
+            # as capability_missing; the kernel re-plans it with a worker composed for
+            # the need (the worker never widens its own tools).
+            if not allow_capability_missing:
+                _control_reply("<note>report_capability_missing is not available to you. If no "
+                               "tool can do the task, say so in your final answer.</note>")
+                continue
+            needed = str(action.get("needed") or "").strip()
+            if not needed:
+                _control_reply("<note>report_capability_missing needs 'needed': the action this "
+                               "step needs that no tool here can do.</note>")
+                continue
+            named = action.get("tools") or []
+            if isinstance(named, str):
+                named = named.split(",")
+            reported = list(dict.fromkeys(
+                [str(n).strip() for n in named if str(n).strip()] + outside_seen))
+            logger.info("react_capability_missing", extra={"round": round_no, "needed": needed,
+                                                           "tools": reported})
+            return capability_missing(needed, tools=reported, tried=str(action.get("tried") or ""))
 
         # INVERTED DEFAULT (2026-07-28). "Finished" must be DECLARED, not inferred
         # from a parse failure.
@@ -2411,6 +2587,21 @@ def run_think(
             # ADR-0145 D6: the step answers checklist items, so its deliverable is the
             # fixed envelope; the kernel validates it against the ledger.
             return AgentResult.from_text(build_answer_envelope(answer, action), type="json")
+        answer_ref = str(action.get("answer_ref") or "").strip()
+        if answer_ref:
+            # Owner decision B3 (T-20261112-summarise-a-document-step-gets-only-the-first):
+            # the deliverable IS one of this step's tool results, handed on by its
+            # ledger id instead of re-typed (p12 step 0 re-typed 38 kB in 36.9 s). The
+            # kernel checks the id is a tool result of this run's step and replaces the
+            # step output with it; here only ids this run itself received are accepted.
+            if answer_ref not in own_ledger_refs:
+                logger.info("react_answer_ref_refused", extra={"round": round_no, "ref": answer_ref})
+                _control_reply(_answer_ref_refusal(answer_ref, own_ledger_refs))
+                continue
+            logger.info("react_answer_ref", extra={"round": round_no, "ref": answer_ref})
+            res = AgentResult.from_text(answer, type=result_type or action.get("type", "text"))
+            res.context[ANSWER_REF_KEY] = answer_ref
+            return res
         return AgentResult.from_text(answer, type=result_type or action.get("type", "text"))
 
 
@@ -2459,7 +2650,8 @@ def _compose_action_protocol(agent, domain_schema: str, system_tools: Optional[L
                              allow_yield_subgoal: bool = True,
                              native_tools: bool = False,
                              allow_memory: bool = True,
-                             kernel_verbs: Sequence[str] = ()) -> str:
+                             kernel_verbs: Sequence[str] = (),
+                             allow_capability_missing: bool = False) -> str:
     """The agent-loop action menu + behavioral rules (the <ActionProtocol> body),
     with the agent's domain final-answer format folded into the final_answer action
     so it is documented but not the recency-anchored closer (ADR-0048 D8)."""
@@ -2467,7 +2659,8 @@ def _compose_action_protocol(agent, domain_schema: str, system_tools: Optional[L
                                allow_yield_subgoal=allow_yield_subgoal,
                                native_tools=native_tools,
                                allow_memory=allow_memory,
-                               kernel_verbs=kernel_verbs)
+                               kernel_verbs=kernel_verbs,
+                               allow_capability_missing=allow_capability_missing)
     if domain_schema and domain_schema.strip():
         base += "\n\n" + _ap("final-format-native" if native_tools else "final-format",
                              format=domain_schema.strip())
@@ -2579,35 +2772,56 @@ def _generate_text_turn(agent, task, parts, *, structured: bool, cache_ttl: str,
     if req_fn is not None:
         _log_llm_call("text", round_no, parts.system, len(parts.messages))
         _trace_t0 = _run_trace.now_ns()
+        _trace_sid = _run_trace.model_call_start(agent, task, path="text", round_no=round_no,
+                                                 system=parts.system, messages=parts.messages,
+                                                 start_ns=_trace_t0)
         try:
             res = req_fn(task.session_token_id, system=parts.system, messages=parts.messages,
                          cache_ttl=cache_ttl, max_tokens=max_tokens, temperature=temperature,
                          timeout_ms=0)
-        except InvalidRequest as exc:
+        except Exception as exc:
+            _run_trace.model_call(agent, task, path="text", round_no=round_no, system=parts.system,
+                                  messages=parts.messages, start_ns=_trace_t0, span_id=_trace_sid,
+                                  error=f"{type(exc).__name__}: {exc}")
+            if not isinstance(exc, InvalidRequest):
+                raise
             logger.warning("react_structured_refused_legacy_prompt", extra={"reason": str(exc)})
             structured = False
         else:
             if "system" in (res.ignored or []):
                 logger.warning("react_system_ignored_legacy_prompt",
                                extra={"path": "text", "model": res.model})
+                _run_trace.model_call(agent, task, path="text", round_no=round_no, system=parts.system,
+                                      messages=parts.messages, text=res.text, res=res, start_ns=_trace_t0,
+                                      span_id=_trace_sid,
+                                      error="system ignored: turn discarded, resent as the legacy prompt")
                 structured = False
             else:
                 _log_llm_result("text", res)
                 _run_trace.model_call(agent, task, path="text", round_no=round_no, system=parts.system,
-                                      messages=parts.messages, text=res.text, res=res, start_ns=_trace_t0)
+                                      messages=parts.messages, text=res.text, res=res, start_ns=_trace_t0,
+                                      span_id=_trace_sid)
                 return res.text, True
     _log_llm_call("text-legacy", round_no, [], 1)
     _trace_t0 = _run_trace.now_ns()
-    raw = sub.generate(
-        task.session_token_id,
-        parts.legacy_prompt(),
-        max_tokens=max_tokens,
-        temperature=temperature,
-        timeout_ms=0,
-    )
+    _trace_sid = _run_trace.model_call_start(agent, task, path="text-legacy", round_no=round_no,
+                                             prompt=parts.legacy_prompt(), start_ns=_trace_t0)
+    try:
+        raw = sub.generate(
+            task.session_token_id,
+            parts.legacy_prompt(),
+            max_tokens=max_tokens,
+            temperature=temperature,
+            timeout_ms=0,
+        )
+    except Exception as exc:
+        _run_trace.model_call(agent, task, path="text-legacy", round_no=round_no,
+                              prompt=parts.legacy_prompt(), start_ns=_trace_t0, span_id=_trace_sid,
+                              error=f"{type(exc).__name__}: {exc}")
+        raise
     _run_trace.model_call(agent, task, path="text-legacy", round_no=round_no,
                           prompt=parts.legacy_prompt(), text=raw if isinstance(raw, str) else str(raw),
-                          start_ns=_trace_t0)
+                          start_ns=_trace_t0, span_id=_trace_sid)
     return raw, structured and req_fn is not None
 
 
@@ -2639,6 +2853,106 @@ def _note_call(wm, tool_call_id: str, name: str, args: Any) -> None:
     fn = getattr(_base_engine(wm), "note_tool_call", None)
     if fn is not None and tool_call_id:
         fn(tool_call_id, name, args)
+
+
+# ── Bounded re-opening (owner decision A3, 2026-11-12) ────────────────────────
+# T-20261112-worker-resolve-cid-inline-has-no-size-cap-a: resolve_cid returns ONE
+# window of a body (a page, or the matches of a search) with a note on how to read
+# more, never the whole body.
+
+def _resolve_page_chars(cfg: Any) -> int:
+    """One resolve window, in characters: ContextConfig.resolve_page_chars, kept
+    below tool_output_max_chars so the engine never re-compacts a window as an
+    oversize output (which would hand back a new cid and restart the loop)."""
+    page = int(getattr(cfg, "resolve_page_chars", 0) or 16000)
+    cap = int(getattr(cfg, "tool_output_max_chars", 0) or 0)
+    if cap > 0:
+        page = min(page, max(cap - 1000, 1000))
+    return max(page, 1)
+
+
+def _render_window_body(info: Dict[str, Any]) -> str:
+    """The model-facing body of one window: the page text, or the search matches."""
+    if "matches" in info:
+        lines = [f"[page {m.get('page')}, offset {m.get('offset')}] {m.get('snippet', '')}"
+                 for m in info.get("matches") or []]
+        return "\n".join(lines) if lines else "(no matches)"
+    return str(info.get("text") or "")
+
+
+def _render_ledger_window(cid: str, got: Any) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Render a ledger_get answer as a resolve window. Returns ``(body, info)``;
+    ``body`` is None when the read failed or found nothing (``info["error"]`` says
+    why). A small JSON entry comes back whole as ``value`` (no paging needed)."""
+    if not isinstance(got, dict):
+        return None, {"error": f"ledger_get returned no readable answer for {cid}"}
+    if got.get("error"):
+        return None, {"error": f"{cid}: {got.get('error')}"}
+    if got.get("found") is False:
+        return None, {"error": f"{cid} is not a ledger entry you can read (absent or not yours)."}
+    info: Dict[str, Any] = {k: got.get(k) for k in ("page", "pages", "total_chars", "note")
+                            if got.get(k) is not None}
+    if "matches" in got:
+        info["matches"] = got.get("matches") or []
+        body = _render_window_body(info)
+    elif "text" in got:
+        body = str(got.get("text") or "")
+    elif "value" in got:
+        try:
+            body = json.dumps(got.get("value"), ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            body = str(got.get("value"))
+        info.setdefault("note", f"{len(body)} chars: the whole entry")
+    else:
+        body = json.dumps(got, ensure_ascii=False, default=str)
+    if not info.get("note"):
+        # An older kernel's ledger_get (no note): say what is known.
+        if info.get("pages"):
+            k, pages = info.get("page") or 1, info.get("pages")
+            nxt = (f"; next: resolve_cid cid='{cid}' page={int(k) + 1}"
+                   if int(k) < int(pages) else "; this is the last page")
+            info["note"] = f"page {k} of {pages}{nxt}"
+        else:
+            info["note"] = f"{len(body)} chars"
+    return body, info
+
+
+#: Handoff metadata key carrying a final answer's ledger reference (kernel
+#: domain.HandoffKeyAnswerRef; owner decision B3, 2026-11-12).
+ANSWER_REF_KEY = "_answer_ref"
+
+
+def _ledger_refs_of(out: Any) -> List[str]:
+    """The ledger ids a tool result carries: its reference (``_ledger_ref``, an inline
+    result recorded by the kernel) or an offloaded result's id (``cid``)."""
+    if not isinstance(out, dict):
+        return []
+    refs = []
+    for key in ("_ledger_ref", "cid"):
+        v = out.get(key)
+        if isinstance(v, str) and v.startswith(_LEDGER_ID_PREFIX):
+            refs.append(v)
+    return refs
+
+
+def _answer_ref_refusal(ref: str, known: set) -> str:
+    if known:
+        listed = ", ".join(sorted(known)[:10])
+        return (f"<note>answer_ref {ref!r} is not one of your own tool results in this step "
+                f"(yours: {listed}). Use one of those ids, or write the answer in "
+                f"answer.</note>")
+    return (f"<note>answer_ref {ref!r} is not one of your own tool results in this step: none of "
+            f"your tool calls returned a ledger id. Write the answer in answer.</note>")
+
+
+def _note_resolve_window(wm, tool_call_id: str, cid: str, info: Dict[str, Any]) -> None:
+    """Tell the engine a native tool turn is a window of ``cid`` (page k), so that
+    compacting it later points back at the ORIGINAL cid and page instead of minting a
+    new cid the model would re-open — the p12 compaction/resolve ping-pong."""
+    fn = getattr(_base_engine(wm), "note_resolve_window", None)
+    if fn is not None and tool_call_id:
+        fn(tool_call_id, cid, int(info.get("page") or 1), int(info.get("pages") or 1),
+           int(info.get("total_chars") or 0))
 
 
 # ── ADR-0139 D3 helpers: the context engine, parallel read-only calls, D14 ────
@@ -2803,7 +3117,8 @@ def _flag(explicit: Optional[bool], agent, attr: str) -> bool:
 
 def _offered_kernel_verbs(agent, task, *, notes_served: bool, notes: Optional[bool],
                           skills: Optional[bool], schedules: Optional[bool] = None,
-                          knowledge: Optional[bool] = None) -> List[str]:
+                          knowledge: Optional[bool] = None,
+                          ontology: Optional[bool] = None) -> List[str]:
     """The kernel-surface verbs this run offers (ADR-0139 D14/D13), fixed for the
     run so the tool definitions stay a stable, cacheable prefix.
 
@@ -2815,6 +3130,12 @@ def _offered_kernel_verbs(agent, task, *, notes_served: bool, notes: Optional[bo
       kernel takes the owner from it.
     - propose_knowledge: allowed (``allow_knowledge_proposals``), the method exists and
       the run has a lease.
+    - propose_ontology_change: allowed (``allow_ontology_proposals``), the method exists
+      and the run has a lease. It only drafts; a person applies it by approving.
+
+    Offering is the client side only: the kernel refuses either proposal RPC
+    (PERMISSION_DENIED) unless the agent holds a grant of the verb or a profile
+    ``tools:`` entry naming it, or the kernel runs tools_unrestricted.
 
     ADR-0145 D14 removed spawn_subagent, and with it the subagent-child toolset
     narrowing these verbs used to honour.
@@ -2835,6 +3156,8 @@ def _offered_kernel_verbs(agent, task, *, notes_served: bool, notes: Optional[bo
             out.append("manage_schedules")
     if _flag(knowledge, agent, "allow_knowledge_proposals") and has("propose_knowledge") and lease:
         out.append("propose_knowledge")
+    if _flag(ontology, agent, "allow_ontology_proposals") and has("propose_ontology_change") and lease:
+        out.append("propose_ontology_change")
     return out
 
 
@@ -2887,7 +3210,7 @@ def _run_kernel_verb(agent, task, kind: str, action: Dict[str, Any],
         if res is None:
             return None
         logger.info("react_schedule_task", extra={
-            "round": round_no, "created": res.get("created"), "rejection": res.get("rejection", "")})
+            "round": round_no, "task_created": res.get("created"), "rejection": res.get("rejection", "")})
         return _render_verb_observation("schedule_task", res)
     if kind == "manage_schedules":
         # "op", not "action": in the text protocol "action" names the verb itself.
@@ -2922,6 +3245,16 @@ def _run_kernel_verb(agent, task, kind: str, action: Dict[str, Any],
         if res is None:
             return None
         return _render_verb_observation("propose_knowledge", res)
+    if kind == "propose_ontology_change":
+        change = action.get("change")
+        if not isinstance(change, (dict, str)) or not change:
+            return "<note>propose_ontology_change needs a change: {\"kinds\": [...], \"relations\": [...]}.</note>"
+        res = sub.propose_ontology_change(
+            lease, change=change, namespace=str(action.get("namespace") or ""),
+            reason=str(action.get("reason") or ""))
+        if res is None:
+            return None
+        return _render_verb_observation("propose_ontology_change", res)
     return "<note>unknown verb.</note>"
 
 
@@ -3060,6 +3393,9 @@ def _call_system_tool(agent, name: str, args: dict, session_token_id: str = "", 
         return {"error": resp["error"], "tool": name}
     rj = resp.get("result_json") or ""
     if resp.get("result_cid") and rj:
+        offloaded = _offloaded_result(rj, resp["result_cid"], name)
+        if offloaded is not None:
+            return offloaded
         # ADR-0145 D6: an inline result with its ledger reference (the kernel sets
         # both when steps answer requirement items), so the model can cite it.
         try:
@@ -3070,11 +3406,41 @@ def _call_system_tool(agent, name: str, args: dict, session_token_id: str = "", 
             return {**parsed, "_ledger_ref": resp["result_cid"]}
         return {"result": parsed, "_ledger_ref": resp["result_cid"], "tool": name}
     if resp.get("result_cid"):
-        return {"cid": resp["result_cid"], "tool": name}
+        # An older kernel offloads with no description: still never a bare id.
+        cid = resp["result_cid"]
+        return {"cid": cid, "tool": name, "offloaded": True,
+                "note": f"the result was too large to show and was not described; read it "
+                        f"with resolve_cid cid='{cid}' page=1, or search it with find='<text>'."}
     try:
         return json.loads(rj) if rj else {}
     except (ValueError, TypeError):
         return {"result": rj, "tool": name}
+
+
+def _offloaded_result(rj: str, ref: str, name: str) -> Optional[Dict[str, Any]]:
+    """The kernel's description of an offloaded result (owner decision A2, 2026-11-12):
+    ``{"_offloaded": {ref, tool, size_bytes, content_type, shape, preview, pages,
+    read}}`` with the ledger id in result_cid. Rendered as preview + size + type +
+    shape + how to read more, never a bare ``{cid, tool}`` (a bare id made the p06
+    worker re-open a 300k-char body whole). None when ``rj`` is not that shape."""
+    try:
+        parsed = json.loads(rj)
+    except (ValueError, TypeError):
+        return None
+    if not (isinstance(parsed, dict) and set(parsed) == {"_offloaded"}
+            and isinstance(parsed["_offloaded"], dict)):
+        return None
+    inner = dict(parsed["_offloaded"])
+    cid = str(inner.pop("ref", "") or ref)
+    size = inner.get("size_bytes")
+    pages = inner.get("pages")
+    page_hint = f" ({pages} pages)" if pages else ""
+    note = (f"{size if size is not None else 'many'} bytes not shown; the preview is the "
+            f"beginning. Read more with resolve_cid cid='{cid}' page=1{page_hint} or search with "
+            f"find='<text>'; to hand it on unchanged, pass {{\"$cid\": \"{cid}\"}} as a tool "
+            f"argument.")
+    return {"offloaded": True, "cid": cid, **inner, "tool": inner.get("tool") or name,
+            "note": note}
 
 
 def _list_system_tools(agent, query: str = "", full: bool = False,
@@ -3118,6 +3484,52 @@ def _list_system_tools(agent, query: str = "", full: bool = False,
             return []
     except Exception:  # noqa: BLE001 — degrade to no system tools, never crash
         return []
+
+
+def _find_system_tools(agent, query: str, full: bool = False,
+                       session_token_id: str = "") -> Tuple[List[Dict], List[str]]:
+    """The find_tools pull: ``(tools, outside)``. ``outside`` names the tools that
+    match ``query`` within the person's access but are not in this step (the kernel's
+    ListTools header x-tool-outside-step, read by ``substrate.find_tools``); they are
+    never added to the menu. A substrate without ``find_tools`` gives
+    ``(_list_system_tools(...), [])``. Never raises into the loop."""
+    substrate = getattr(agent, "substrate", None)
+    finder = getattr(substrate, "find_tools", None) if substrate is not None else None
+    if finder is None or not callable(finder):
+        return _list_system_tools(agent, query=query, full=full,
+                                  session_token_id=session_token_id), []
+    try:
+        tools, outside = finder(query, k=_DEFAULT_TOOL_MENU_K, full=full,
+                                session_token_id=session_token_id)
+        return list(tools or []), [str(n) for n in (outside or []) if n]
+    except Exception:  # noqa: BLE001 — degrade to the plain pull
+        return _list_system_tools(agent, query=query, full=full,
+                                  session_token_id=session_token_id), []
+
+
+def _find_tools_miss_note(need: str, outside: Sequence[str], can_report: bool) -> str:
+    """The find_tools reply when nothing was added to the menu
+    (T-20261112-yield-sub-goal-on-a-composed-lease-runs-under: it names the re-plan
+    outcome, never a sub-goal, which would run with the same tools)."""
+    if outside:
+        names = ", ".join(outside)
+        verb = "exists" if len(outside) == 1 else "exist"
+        if can_report:
+            return (f"<note>No tool in this step matches {need!r}. {names} {verb} within the "
+                    "person's access but not in this step: you cannot load or call them. If "
+                    "the step cannot be done without one, call report_capability_missing with "
+                    f"needed={need!r} and tools={list(outside)!r}; the planner re-plans the "
+                    "step with a worker that has it. Otherwise answer from what you have.</note>")
+        return (f"<note>No tool in this step matches {need!r}. {names} {verb} within the "
+                "person's access but not in this step: you cannot load or call them. Answer "
+                "from what you have, and say which action you could not perform and which "
+                "tool it needs.</note>")
+    if can_report:
+        return (f"<note>No tool matched {need!r}, in this step or elsewhere in the person's "
+                "access. If the step cannot be done without it, call report_capability_missing "
+                f"with needed={need!r}; otherwise answer from what you have.</note>")
+    return (f"<note>No tool matched {need!r}. Answer from what you have, and say which "
+            "action you could not perform and which tool it needs.</note>")
 
 
 def _describe_tool(agent, name: str, session_token_id: str = "") -> Optional[Dict]:

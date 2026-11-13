@@ -43,6 +43,23 @@ a tool call refused as final is not retried in another form).
 (T-20261107-asked-to-draft-messages-the-agent-writes-the,
 T-20261107-answers-grounded-in-rule-or-regulation,
 T-20261107-public-disclosure-drafts-name-private-persons).
+
+T-20261112-yield-sub-goal-on-a-composed-lease-runs-under (2026-11-12) is the next:
+react-anti-patterns v3 rewords the end of the NATIVE no-substitute rule (a missing tool
+is reported with report_capability_missing; yield_subgoal only without that verb),
+``golden/react_prompts_v6.json`` is the regenerated golden, and
+``test_v6_differs_from_v5_only_by_the_capability_missing_rule`` pins the delta. The same
+change adds react-action-protocol v3 and react-tools v2, which only ADD sections for the
+report_capability_missing verb: with the verb off every render is v2's/v1's, so the
+protocol and tool goldens are unchanged, and
+``test_capability_missing_renders_add_only_their_section`` pins the verb-on renders.
+
+Owner decisions A3/B3 (2026-11-12, T-20261112-worker-resolve-cid-inline-has-no-size-cap-a,
+T-20261112-summarise-a-document-step-gets-only-the-first) are the next:
+react-action-protocol v4 rewrites only the NATIVE resolution section (resolve_cid reads
+one page or searches, no inline cap, answer_ref) and react-tools v3 only the resolve_cid
+description. ``golden/react_prompts_v7.json`` is the regenerated golden and
+``test_v7_differs_from_v6_only_by_bounded_resolve`` pins the delta.
 """
 import itertools
 import json
@@ -62,7 +79,11 @@ GOLDEN_V3 = json.loads((Path(__file__).parent / "golden" / "react_prompts_v3.jso
                        .read_text(encoding="utf-8"))
 GOLDEN_V4 = json.loads((Path(__file__).parent / "golden" / "react_prompts_v4.json")
                        .read_text(encoding="utf-8"))
-GOLDEN = json.loads((Path(__file__).parent / "golden" / "react_prompts_v5.json")
+GOLDEN_V5 = json.loads((Path(__file__).parent / "golden" / "react_prompts_v5.json")
+                       .read_text(encoding="utf-8"))
+GOLDEN_V6 = json.loads((Path(__file__).parent / "golden" / "react_prompts_v6.json")
+                       .read_text(encoding="utf-8"))
+GOLDEN = json.loads((Path(__file__).parent / "golden" / "react_prompts_v7.json")
                     .read_text(encoding="utf-8"))
 
 EVIDENCE_RULE = (
@@ -79,6 +100,14 @@ NO_SUBSTITUTE_RULE = (
     "not return. If find_tools offers no tool that performs the step, call yield_subgoal with "
     "the step and a capability_hint for an agent that can do it; when you cannot yield, give a "
     "final answer that says which action you could not perform and which tool it needs.")
+
+# react-anti-patterns v3 (T-20261112-yield-sub-goal-on-a-composed-lease-runs-under).
+CAPABILITY_MISSING_RULE = NO_SUBSTITUTE_RULE.replace(
+    "If find_tools offers no tool that performs the step, call yield_subgoal with the step and a "
+    "capability_hint for an agent that can do it; when you cannot yield, give a final answer",
+    "If find_tools offers no tool in this step that performs it, call report_capability_missing "
+    "with the action the step needs (without that verb, yield_subgoal with the step and a "
+    "capability_hint); when you can do neither, give a final answer")
 
 
 class Plain(CognitiveAgent):
@@ -196,11 +225,79 @@ def test_v5_differs_from_v4_only_by_the_deliverable_rules():
     render is v4's golden."""
     for key, want in GOLDEN_V4["constraints"].items():
         if key.startswith("True|"):
-            assert GOLDEN["constraints"][key] == want + DELIVERABLE_RULES, key
+            assert GOLDEN_V5["constraints"][key] == want + DELIVERABLE_RULES, key
         else:
-            assert GOLDEN["constraints"][key] == want, key
+            assert GOLDEN_V5["constraints"][key] == want, key
     for part in ("protocol", "anti_patterns", "turn", "nudges", "tools"):
-        assert GOLDEN[part] == GOLDEN_V4[part], part
+        assert GOLDEN_V5[part] == GOLDEN_V4[part], part
+
+
+def test_v6_differs_from_v5_only_by_the_capability_missing_rule():
+    """react-anti-patterns v3 rewords one native line; every other render is v5's."""
+    assert CAPABILITY_MISSING_RULE != NO_SUBSTITUTE_RULE
+    for key, want in GOLDEN_V5["anti_patterns"].items():
+        if key.startswith("True|"):
+            assert GOLDEN["anti_patterns"][key] == [
+                CAPABILITY_MISSING_RULE if ln == NO_SUBSTITUTE_RULE else ln for ln in want], key
+        else:
+            assert GOLDEN["anti_patterns"][key] == want, key
+    for part in ("protocol", "constraints", "turn", "nudges", "tools"):
+        assert GOLDEN_V6[part] == GOLDEN_V5[part], part
+
+
+def test_v7_differs_from_v6_only_by_bounded_resolve():
+    """react-action-protocol v4 swaps the native resolution section; react-tools v3
+    rewrites the resolve_cid description; every other render is v6's."""
+    old_sec = pl.fragment("react-action-protocol", "resolution-native", version=3).render()
+    new_sec = pl.fragment("react-action-protocol", "resolution-native").render()
+    assert "capped at 3" in old_sec and "capped" not in new_sec
+    assert "answer_ref" in new_sec and "find" in new_sec
+    for key, want in GOLDEN_V6["protocol"].items():
+        if key.split("|")[1] == "True":
+            assert GOLDEN["protocol"][key] == want.replace(old_sec, new_sec, 1), key
+            assert GOLDEN["protocol"][key] != want, key
+        else:
+            assert GOLDEN["protocol"][key] == want, key
+    assert {k for k in GOLDEN["tools"] if GOLDEN["tools"][k] != GOLDEN_V6["tools"][k]} == {"resolve_cid"}
+    for part in ("constraints", "anti_patterns", "turn", "nudges"):
+        assert GOLDEN[part] == GOLDEN_V6[part], part
+    for name in pl.sections(pl.get_version("react-action-protocol", 3)):
+        if name != "resolution-native":
+            assert (pl.fragment("react-action-protocol", name, version=3).body
+                    == pl.fragment("react-action-protocol", name).body), name
+    for name in pl.sections(pl.get_version("react-tools", 2)):
+        if name != "resolve-cid":
+            assert (pl.fragment("react-tools", name, version=2).body
+                    == pl.fragment("react-tools", name).body), name
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_capability_missing_renders_add_only_their_section(native):
+    """react-action-protocol v3: the verb on adds exactly its section after the answer
+    block; off renders v2's text (the goldens above)."""
+    agent = Plain(agent_id="a")
+    off = react._compose_action_protocol(agent, "", SYS_TOOLS, [], allow_yield_subgoal=True,
+                                         native_tools=native)
+    on = react._compose_action_protocol(agent, "", SYS_TOOLS, [], allow_yield_subgoal=True,
+                                        native_tools=native, allow_capability_missing=True)
+    section = pl.fragment("react-action-protocol",
+                          "answer-capability-missing" + ("-native" if native else "")).render()
+    yield_sec = pl.fragment("react-action-protocol",
+                            "answer-yield" + ("-native" if native else "")).render()
+    assert on == off.replace(yield_sec, yield_sec + "\n" + section, 1)
+    assert "report_capability_missing" in on and "report_capability_missing" not in off
+    # v4 (react-action-protocol) and v3 (react-tools) rewrite only the bounded-resolve
+    # sections (test_v7_differs_from_v6_only_by_bounded_resolve).
+    for name in pl.sections(pl.get_version("react-action-protocol", 2)):
+        if name == "resolution-native":
+            continue
+        assert (pl.fragment("react-action-protocol", name, version=2).body
+                == pl.fragment("react-action-protocol", name).body), name
+    for name in pl.sections(pl.get_version("react-tools", 1)):
+        if name == "resolve-cid":
+            continue
+        assert (pl.fragment("react-tools", name, version=1).body
+                == pl.fragment("react-tools", name).body), name
 
 
 def test_native_agents_get_the_deliverable_rules_and_v3_is_unchanged():
@@ -216,10 +313,12 @@ def test_native_agents_get_the_deliverable_rules_and_v3_is_unchanged():
 
 
 def test_native_agents_are_told_to_yield_not_substitute():
-    """The rule is in what a native agent's system prompt carries, and v1 (released)
-    is unchanged."""
-    assert pl.get("react-anti-patterns").version == 2
-    assert NO_SUBSTITUTE_RULE in helpers.default_anti_patterns(native_tools=True)
+    """The rule is in what a native agent's system prompt carries (v3: reworded to name
+    report_capability_missing first), and v1/v2 (released) are unchanged."""
+    assert pl.get("react-anti-patterns").version == 3
+    assert CAPABILITY_MISSING_RULE in helpers.default_anti_patterns(native_tools=True)
+    v2_native = pl.fragment("react-anti-patterns", "native", version=2).render({"chunk": "c"})
+    assert NO_SUBSTITUTE_RULE in v2_native and CAPABILITY_MISSING_RULE not in v2_native
     v1_native = pl.fragment("react-anti-patterns", "native", version=1).render(
         {"chunk": "c"})
     assert "stand in a different action" not in v1_native

@@ -65,6 +65,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
+from ._logging import safe_extra
 from .helpers import _esc
 from .prompt_library import fragment
 from .working_memory import (
@@ -141,6 +142,14 @@ class ContextConfig:
     # tail (its head stays as a preview): one output must not blow the budget alone.
     tool_output_max_chars: int = 24000
     tool_output_preview_chars: int = 600
+    # One window of a re-opened body (resolve_cid on a compacted or content-store
+    # cid): a longer body is read page by page or searched, never inlined whole
+    # (owner decision A3, T-20261112-worker-resolve-cid-inline-has-no-size-cap-a).
+    # The kernel serves this, tool_output_max_chars, tool_output_preview_chars and
+    # budget_tokens from execution.content as CAMBRIAN_CONTEXT_* env vars on every
+    # agent it spawns, so the kernel's limits and the SDK's agree (A5); a led_ id is
+    # paged by the kernel's ledger_get at the same size.
+    resolve_page_chars: int = 16000
     # Protected tail: the last N history steps (text) / assistant-led turn groups
     # (native) are never compacted.
     protect_tail: int = 3
@@ -332,8 +341,15 @@ class DefaultContextEngine:
         self._summarised_turns = 0
         self._next_n = 1
         self._local: Dict[str, str] = {}      # cid -> raw body (every compacted output)
+        self._cid_by_digest: Dict[str, str] = {}  # sha256(body) -> its cid (stable re-compaction)
         self._pinned_ids: set = set()         # native tool_call ids that carry a skill
         self._compacted_ids: set = set()      # native tool_call ids already placeholdered
+        # Native tool turns that are a resolve_cid WINDOW of a cid: tool_call id ->
+        # (cid, page, pages, total chars). Compacting one points back at that cid and
+        # page; storing it under a new cid made the model re-open the new cid, which
+        # was compacted again on the next round (the p12 ping-pong,
+        # T-20261112-worker-resolve-cid-inline-has-no-size-cap-a).
+        self._window_by_tid: Dict[str, Tuple[str, int, int, int]] = {}
         # A call whose output was compacted may legitimately be re-issued: the model
         # needs the content back and re-calls the tool instead of resolve_cid. The
         # loop serves such a re-read from here (no re-execution) instead of letting
@@ -451,6 +467,12 @@ class DefaultContextEngine:
 
     def resolve_local(self, cid: str) -> Optional[str]:
         return self._local.get(cid)
+
+    def note_resolve_window(self, tool_call_id: str, cid: str, page: int, pages: int,
+                            total_chars: int) -> None:
+        """Mark a native tool turn as page ``page`` of ``cid`` (see _window_by_tid)."""
+        if tool_call_id and cid:
+            self._window_by_tid[tool_call_id] = (cid, page, pages, total_chars)
 
     def is_compaction_cid(self, cid: str) -> bool:
         return cid in self._local
@@ -578,7 +600,13 @@ class DefaultContextEngine:
     def _store(self, body: str) -> str:
         """Keep a compacted body retrievable; returns its cid. The kernel content
         store when an offloader is wired (the cid then also works as a ``$cid`` tool
-        argument), else a deterministic local id. Raw text is ALWAYS kept locally."""
+        argument), else a deterministic local id. Raw text is ALWAYS kept locally.
+        The same body always gets the same cid: compacting it again (after it was
+        re-opened) must not hand the model a new id to re-open."""
+        digest = hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()
+        known = self._cid_by_digest.get(digest)
+        if known is not None:
+            return known
         cid = None
         if self._offload_fn is not None:
             try:
@@ -586,15 +614,16 @@ class DefaultContextEngine:
             except Exception:  # noqa: BLE001 — degrade to a local cid
                 cid = None
         if not cid:
-            cid = "ctx-" + hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()[:16]
+            cid = "ctx-" + digest[:16]
         self._local[cid] = body
+        self._cid_by_digest[digest] = cid
         return cid
 
     def _event(self, **ev) -> None:
         self.events.append(ev)
         level = logging.ERROR if ev.get("event") == "compaction_failed" else logging.INFO
-        logger.log(level, "context_" + ev.get("event", "compaction"), extra={
-            k: v for k, v in ev.items() if k != "event"})
+        logger.log(level, "context_" + ev.get("event", "compaction"), extra=safe_extra(
+            {k: v for k, v in ev.items() if k != "event"}))
 
     def _summarise(self, turns_text: str, path: str) -> Optional[str]:
         """Phase 2 with the guard. Returns the summary, or None after a LOUD failure."""
@@ -724,6 +753,17 @@ class DefaultContextEngine:
                 body = m.get("content") or ""
                 if (m.get("role") != "tool" or tid in self._pinned_ids or tid in self._compacted_ids
                         or len(body) <= self.config.tool_output_compact_chars):
+                    continue
+                window = self._window_by_tid.get(tid)
+                if window is not None:
+                    # A resolve window: point back at the original cid and page; no
+                    # new cid, so nothing new to re-open.
+                    cid, page, pages, total = window
+                    m["content"] = _cp("placeholder-window", cid=cid, page=page, pages=pages,
+                                       chars=total or len(body))
+                    self._compacted_ids.add(tid)
+                    saved += estimate_tokens(body) - estimate_tokens(m["content"])
+                    cids.append(cid)
                     continue
                 cid = self._store(body)
                 m["content"] = _cp("placeholder", tool=names.get(tid) or "the tool",
