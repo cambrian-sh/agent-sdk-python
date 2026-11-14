@@ -60,6 +60,14 @@ react-action-protocol v4 rewrites only the NATIVE resolution section (resolve_ci
 one page or searches, no inline cap, answer_ref) and react-tools v3 only the resolve_cid
 description. ``golden/react_prompts_v7.json`` is the regenerated golden and
 ``test_v7_differs_from_v6_only_by_bounded_resolve`` pins the delta.
+
+T-20261105-native-react-rules-section-still-says-call (2026-11-13) is the next:
+react-action-protocol v5 only ADDS rules-native-nomemory, the native rules without
+"Ground first: call memory_query", rendered when the agent has no memory access (the
+memory section already says there is none). ``golden/react_prompts_v8.json`` is the
+regenerated golden and ``test_v8_differs_from_v7_only_by_memoryless_native_rules``
+pins the delta: only native renders with memory off change. The text protocol keeps
+its rules (the frozen fallback).
 """
 import itertools
 import json
@@ -83,7 +91,9 @@ GOLDEN_V5 = json.loads((Path(__file__).parent / "golden" / "react_prompts_v5.jso
                        .read_text(encoding="utf-8"))
 GOLDEN_V6 = json.loads((Path(__file__).parent / "golden" / "react_prompts_v6.json")
                        .read_text(encoding="utf-8"))
-GOLDEN = json.loads((Path(__file__).parent / "golden" / "react_prompts_v7.json")
+GOLDEN_V7 = json.loads((Path(__file__).parent / "golden" / "react_prompts_v7.json")
+                       .read_text(encoding="utf-8"))
+GOLDEN = json.loads((Path(__file__).parent / "golden" / "react_prompts_v8.json")
                     .read_text(encoding="utf-8"))
 
 EVIDENCE_RULE = (
@@ -254,13 +264,13 @@ def test_v7_differs_from_v6_only_by_bounded_resolve():
     assert "answer_ref" in new_sec and "find" in new_sec
     for key, want in GOLDEN_V6["protocol"].items():
         if key.split("|")[1] == "True":
-            assert GOLDEN["protocol"][key] == want.replace(old_sec, new_sec, 1), key
-            assert GOLDEN["protocol"][key] != want, key
+            assert GOLDEN_V7["protocol"][key] == want.replace(old_sec, new_sec, 1), key
+            assert GOLDEN_V7["protocol"][key] != want, key
         else:
-            assert GOLDEN["protocol"][key] == want, key
-    assert {k for k in GOLDEN["tools"] if GOLDEN["tools"][k] != GOLDEN_V6["tools"][k]} == {"resolve_cid"}
+            assert GOLDEN_V7["protocol"][key] == want, key
+    assert {k for k in GOLDEN_V7["tools"] if GOLDEN_V7["tools"][k] != GOLDEN_V6["tools"][k]} == {"resolve_cid"}
     for part in ("constraints", "anti_patterns", "turn", "nudges"):
-        assert GOLDEN[part] == GOLDEN_V6[part], part
+        assert GOLDEN_V7[part] == GOLDEN_V6[part], part
     for name in pl.sections(pl.get_version("react-action-protocol", 3)):
         if name != "resolution-native":
             assert (pl.fragment("react-action-protocol", name, version=3).body
@@ -269,6 +279,31 @@ def test_v7_differs_from_v6_only_by_bounded_resolve():
         if name != "resolve-cid":
             assert (pl.fragment("react-tools", name, version=2).body
                     == pl.fragment("react-tools", name).body), name
+
+
+GROUND_FIRST_NATIVE = ("- Ground first: call memory_query at least once before answering, "
+                       "unless the task is trivial.\n")
+
+
+def test_v8_differs_from_v7_only_by_memoryless_native_rules():
+    """react-action-protocol v5: a native render with memory off drops the ground-first
+    line (it named a verb the agent does not have); every other render is v7's."""
+    rules = pl.fragment("react-action-protocol", "rules-native").render()
+    nomem = pl.fragment("react-action-protocol", "rules-native-nomemory").render()
+    assert rules.replace(GROUND_FIRST_NATIVE, "", 1) == nomem
+    assert "memory_query" not in nomem
+    for key, want in GOLDEN_V7["protocol"].items():
+        native, mem = key.split("|")[1:3]
+        if native == "True" and mem == "False":
+            assert GOLDEN["protocol"][key] == want.replace(rules, nomem, 1), key
+            assert "Ground first" not in GOLDEN["protocol"][key], key
+        else:
+            assert GOLDEN["protocol"][key] == want, key
+    for part in ("constraints", "anti_patterns", "turn", "nudges", "tools"):
+        assert GOLDEN[part] == GOLDEN_V7[part], part
+    for name in pl.sections(pl.get_version("react-action-protocol", 4)):
+        assert (pl.fragment("react-action-protocol", name, version=4).body
+                == pl.fragment("react-action-protocol", name).body), name
 
 
 @pytest.mark.parametrize("native", [False, True])

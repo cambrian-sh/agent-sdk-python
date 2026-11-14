@@ -1,28 +1,34 @@
 """Cambrian Agent SDK — build Cambrian agents in Python with zero boilerplate.
 
-Minimal usage::
+Minimal usage — subclass a trait class and override ``run(task)``::
 
-    from cambrian_agent_sdk import Agent, Capability
+    from cambrian_agent_sdk import AgentTask, CognitiveAgent
 
-    agent = Agent(
-        agent_id="my-agent",
-        capabilities=[Capability(name="text_generation", latency_p50_ms=3000)],
-    )
+    AGENT_DESCRIPTION = "Echoes the task text back."
+    AGENT_MANIFEST = '''
+    {"version": "1.0.0", "trait": "cognitive", "capabilities": ["echo"]}
+    '''
 
-    @agent.capability("text_generation")
-    def generate(request):
-        text = request.payload.text
-        return {"data": f"Echo: {text}".encode()}
+    class EchoAgent(CognitiveAgent):
+        def run(self, task: AgentTask) -> str:
+            return f"Echo: {task.text}"
+
+    agent = EchoAgent(agent_id="echo_agent", version="1.0.0", description=AGENT_DESCRIPTION)
 
     if __name__ == "__main__":
         agent.serve()
 
-The agent file must be named ``*agent.py`` and live in the ``agents/`` directory
-configured in ``config.json``. The Substrate auto-discovers it on startup.
+``CognitiveAgent``'s default ``run()`` drives the ``think()`` ReAct loop over the
+agent's ``@tool`` methods, so an LLM agent usually overrides nothing but ``role``
+(see ``examples/tool_tutorial_agent.py``). ``run()`` may return an
+:class:`AgentResult`, a ``dict``, ``str`` or ``bytes``.
 
-AGENT_DESCRIPTION and AGENT_MANIFEST must be module-level literals — the
-Substrate parses them with regex before the Python process boots. Use
-``cambrian manifest ./my_agent.py`` to generate or update the manifest block.
+The agent file must be named ``*agent.py`` and live in the agents directory the
+kernel is configured with; the kernel discovers it on startup.
+
+AGENT_DESCRIPTION and AGENT_MANIFEST must be module-level literals — the kernel
+parses them with a regex before the Python process boots, so write them by hand
+(there is no generator command).
 """
 
 from __future__ import annotations
@@ -1415,7 +1421,6 @@ def assemble_context(
         if not chunk:
             break
 
-        label = r.type or "context"
         # REQ-AGENT-CTX-2: structured XML fact blocks with precision attribute.
         # When the ref is offloaded (has a cid), the rendered chunk is only the head of
         # the full body — surface the cid so the agent can pass it BY REFERENCE

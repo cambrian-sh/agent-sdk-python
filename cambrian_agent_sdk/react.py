@@ -283,7 +283,12 @@ def build_output_schema(
           for v in kernel_verbs if v in _KERNEL_VERB_NAMES],
         # ADR-0048 residual.
         _ap(f"resolution-{variant}"),
-        _ap(f"rules-{variant}"),
+        # The native rules open with "Ground first: call memory_query", which an agent
+        # with no memory access cannot do (memory-none above says so): the same
+        # advertise-what-you-refuse contradiction as the memory section
+        # (T-20261105-native-react-rules-section-still-says-call, v5). The text rules
+        # keep the line: the text protocol is the frozen fallback (owner decision Q4).
+        _ap("rules-native-nomemory") if native_tools and not allow_memory else _ap(f"rules-{variant}"),
         _ap("toollist-native") if native_tools else _ap("toollist-text", tools=tools_block),
         (_ap("skillmenu-native", skills=skills_block) if native_skills
          else ("" if native_tools else _ap("skillmenu-text", skills=skills_block))),

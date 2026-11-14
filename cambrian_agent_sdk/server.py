@@ -14,8 +14,12 @@ import logging
 import signal
 import sys
 import time
+from typing import TYPE_CHECKING
 
 import grpc
+
+if TYPE_CHECKING:  # annotation only; base imports this module at run time
+    from .base import Agent
 
 logger = logging.getLogger("cambrian.server")
 
