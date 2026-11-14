@@ -8,8 +8,6 @@ the tests vary what the loop saw, never the words of the reply.
 """
 import json
 
-import pytest
-
 from cambrian_agent_sdk import AgentTask, CognitiveAgent, tool
 from cambrian_agent_sdk.react import EVIDENCE_REPROMPT_ENV, run_think
 

@@ -1,13 +1,10 @@
 """Tests for the resolve_cid action (ADR-0048 residual)."""
 import json
 
-from cambrian_agent_sdk import AgentResult, AgentTask, CognitiveAgent
+from cambrian_agent_sdk import AgentTask, CognitiveAgent
 from cambrian_agent_sdk.react import run_think
 from cambrian_agent_sdk.working_memory import (
     Step,
-    TextEntry,
-    WorkingMemory,
-    render_entry_xml,
     render_step_xml,
 )
 
@@ -96,7 +93,7 @@ def test_action_protocol_documents_resolve_cid():
 
 
 def test_anti_patterns_warn_against_unnecessary_resolve_cid():
-    from cambrian_agent_sdk.helpers import build_prompt, DEFAULT_ANTI_PATTERNS
+    from cambrian_agent_sdk.helpers import build_prompt
     p = build_prompt("r", "t")
     # The new anti-pattern is in <AntiPatterns>.
     assert "resolve_cid" in p.lower()

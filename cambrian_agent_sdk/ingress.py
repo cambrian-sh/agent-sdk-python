@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from .base import Agent
 from .types import AgentResult, AgentTask
@@ -263,7 +263,7 @@ def _decode(task: AgentTask) -> dict:
 
 def _ack(status: str, permanent: bool = False, error: str = "") -> AgentResult:
     """Build the acknowledgement the kernel's delivery path expects."""
-    body = {"status": status}
+    body: Dict[str, Any] = {"status": status}
     if status != "sent":
         body["permanent"] = permanent
         if error:

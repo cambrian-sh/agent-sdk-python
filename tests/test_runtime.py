@@ -116,7 +116,7 @@ def test_execute_author_exception_becomes_internal_not_crash():
             raise RuntimeError("author bug")
 
     ctx = _FakeCtx()
-    resp = TraitServicer(Boom(agent_id="b")).Execute(cambrian_pb2.Handoff(id="h"), ctx)
+    TraitServicer(Boom(agent_id="b")).Execute(cambrian_pb2.Handoff(id="h"), ctx)
     assert ctx.code == grpc.StatusCode.INTERNAL
 
 

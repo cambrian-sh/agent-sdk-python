@@ -37,33 +37,8 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-# build_prompt stays importable from here for callers that used react.build_prompt;
-# the loop itself sends build_prompt_parts (system + messages, ADR-0139 D2).
-from .helpers import (_esc, build_prompt, build_prompt_parts, default_anti_patterns,  # noqa: F401
-                      default_constraints, prompt_versions)
-from .prompt_library import fragment
-from .host import host_block
-from .recurrence import count_failed_duplicates, count_successful_duplicates
-from .reflection import DEFAULT_MAX_REFLECTION_TOKENS, build_reflection_prompt
-from .errors import ToolCallingUnsupported
 from . import run_trace as _run_trace  # ADR-0145 D10: no-op unless CAMBRIAN_TRACE_DIR
-from .step_dependencies import covered_steps, parse_step_dependencies, render_step_dependencies
 from .content_window import read_window
-from .types import AgentResult, AgentTask, capability_missing, yield_subgoal
-from .stopping import (ASK_PERSON_TOOL, EXIT_CAP, EXIT_STUCK, EXIT_WALL, LaneClock, LaneLimits,
-                       StuckDetector, ask_person_result_data, forced_summary, is_subtask,
-                       partial_metadata)
-from .working_memory import (
-    Step,
-    ToolCard,
-    WorkingMemory,
-    action_text,
-    memory_provenance_attrs,
-    render_entry_xml,
-    render_memory_query_reply,
-    render_step_xml,
-    _render_memory_results,
-)
 from .context_engine import (
     CHARS_PER_TOKEN,
     ContextConfig,
@@ -71,6 +46,39 @@ from .context_engine import (
     make_engine,
     memory_notes_text,
     neutralise_closing_tags,
+)
+from .errors import ToolCallingUnsupported
+
+# build_prompt stays importable from here for callers that used react.build_prompt;
+# the loop itself sends build_prompt_parts (system + messages, ADR-0139 D2).
+from .helpers import _esc, build_prompt, build_prompt_parts, default_anti_patterns, default_constraints, prompt_versions  # noqa: F401
+from .host import host_block
+from .prompt_library import fragment
+from .recurrence import count_failed_duplicates, count_successful_duplicates
+from .reflection import DEFAULT_MAX_REFLECTION_TOKENS, build_reflection_prompt
+from .step_dependencies import covered_steps, parse_step_dependencies, render_step_dependencies
+from .stopping import (
+    ASK_PERSON_TOOL,
+    EXIT_CAP,
+    EXIT_STUCK,
+    EXIT_WALL,
+    LaneClock,
+    LaneLimits,
+    StuckDetector,
+    ask_person_result_data,
+    forced_summary,
+    is_subtask,
+    partial_metadata,
+)
+from .types import AgentResult, AgentTask, capability_missing, yield_subgoal
+from .working_memory import (
+    Step,
+    ToolCard,
+    _render_memory_results,
+    action_text,
+    memory_provenance_attrs,
+    render_memory_query_reply,
+    render_step_xml,
 )
 
 logger = logging.getLogger("cambrian.react")
@@ -459,7 +467,8 @@ def _no_evidence_note(delegation_tool: Optional[str], system_tools: Any, agent: 
     that would be refused."""
     registry = getattr(agent, "tools", None)
     try:
-        local = set(registry.names()) if hasattr(registry, "names") else set(registry or ())
+        local = (set(registry.names()) if registry is not None and hasattr(registry, "names")
+                 else set(registry or ()))
     except Exception:  # noqa: BLE001 — a malformed registry offers no local tool
         local = set()
     names = {t.get("name") for t in system_tools or [] if isinstance(t, dict)}
@@ -528,7 +537,7 @@ def normalize_tool_parameters(params: Any) -> Dict[str, Any]:
 
 
 class _ConversationMirror:
-    """Wraps WorkingMemory so its writes ALSO land in the provider conversation.
+    """Wraps the context engine so its writes ALSO land in the provider conversation.
 
     Under native tool-calling the model's history is the message list, not the prompt —
     the prompt is built once and never rebuilt. Everything the loop would otherwise
@@ -1161,7 +1170,8 @@ def run_think(
     ADR-0139 D3: what reaches the model is owned by a context engine
     (``context_engine``: an engine, a factory, ``"default"`` or ``"legacy"``; else
     the agent's ``context_engine`` attribute, else ``CAMBRIAN_CONTEXT_ENGINE``). Its
-    budgets are ``context_config`` (a :class:`ContextConfig` or a dict) > the agent's
+    budgets are the kernel's ``_context_*`` handoff keys (execution.lane.context) >
+    ``context_config`` (a :class:`ContextConfig` or a dict) > the agent's
     ``context_config`` > ``CAMBRIAN_CONTEXT_*`` env > defaults. ``expected_output``
     and ``acceptance`` complete the Task region (else ``task.context`` keys of the
     same names).
@@ -1186,9 +1196,9 @@ def run_think(
     if _substrate is not None and hasattr(_substrate, "put_context_node"):
         _offload_fn = lambda text: _substrate.put_context_node(text, session_token_id=task.session_token_id)  # noqa: E731
     run_cache_ttl = _resolve_cache_ttl(agent, cache_ttl)
-    # ADR-0139 D3: the context engine replaces the entry-count working memory. The
-    # legacy WorkingMemory stays reachable for one release (context_engine="legacy").
-    ctx_cfg = ContextConfig.resolve(agent, context_config)
+    # ADR-0139 D3: the context engine (the entry-count working memory it replaced
+    # was deleted 2026-11-15; context_engine="legacy" now warns and runs this one).
+    ctx_cfg = ContextConfig.resolve(agent, context_config, task=task)
     wm = make_engine(
         context_engine if context_engine is not None else getattr(agent, "context_engine", None),
         config=ctx_cfg, embed_fn=embed_fn, offload_fn=_offload_fn,
@@ -1253,10 +1263,6 @@ def run_think(
         return None
 
     disabled_verbs: set = set()  # verbs the kernel answered UNIMPLEMENTED this run
-    # Only the legacy engine ranks entries by cosine to the task; the default engine
-    # budgets by tokens, so it does not spend an Embed RPC on the intent.
-    intent_vec = (embed_fn(task.text) if (embed_fn and task.text.strip() and _is_legacy_engine(wm))
-                  else None)
     mem_queries = 0
     tool_rounds = 0
     find_tools_calls = 0  # ADR-0044: cap the discovery pull to avoid loops
@@ -1549,7 +1555,7 @@ def run_think(
     round_no = 0
     while True:
         if lane_clock is not None and lane_clock.expired():
-            return _lane_stop(EXIT_WALL, f"the run reached its wall-time cap ({lane.max_wall_seconds} s)")
+            return _lane_stop(EXIT_WALL, f"the run reached its wall-time cap ({lane_clock.max_wall_seconds} s)")
         extra = list(constraints or [])
         if host_constraint:
             extra.append(host_constraint)
@@ -1560,19 +1566,14 @@ def run_think(
         # composed action_protocol) and states the budgets this loop enforces.
         native_prompt = bool(native_tools and tool_defs)
         engine = _base_engine(wm)
-        # ADR-0139 D3: the default context engine renders the whole volatile user
-        # turn (memory notes, instructions, evidence, history, then the task); the
-        # legacy engine returns None and keeps the Task + Trajectory layout.
+        # ADR-0139 D3: the context engine renders the whole volatile user turn
+        # (memory notes, instructions, evidence, history, then the task).
         user_content = engine.render_user_turn(
             task_text=task_prompt_text, step_no=round_no + 1, notes=notes,
             expected_output=expected_output, acceptance=acceptance)
         parts = build_prompt_parts(
             role=role,
             task=task_prompt_text,
-            # #3 trajectory reframe: number the bounded buffer as an ordered loop
-            # history and stamp the current step, so the model reads its own progress
-            # ("you are at step N; here is what you did") instead of a flat tag pile.
-            context_str=wm.assemble(intent_vec, numbered=True) if user_content is None else "",
             user_content=user_content,
             step_no=round_no + 1,
             # ADR-0048 D8: the action menu + behavioral rules go in <ActionProtocol>;
@@ -2208,7 +2209,7 @@ def run_think(
             if added:
                 # One protocol per prompt (ADR-0139): natively the tool is just called.
                 _control_reply("<note>Found tools for {!r}: {}. {}</note>".format(
-                    need, ", ".join(t.get("name") for t in added),
+                    need, ", ".join(str(t.get("name")) for t in added),
                     "Call one." if native_tools else "Call one with tool_call."))
             else:
                 # T-20261112-yield-sub-goal-on-a-composed-lease-runs-under: name the
@@ -2249,13 +2250,13 @@ def run_think(
                                  for sk in sks)
 
             if usable or requestable:
-                parts = []
+                skill_notes: List[str] = []
                 if usable:
-                    parts.append("<note>Found skills for {!r}: {}. Load one with use_skill.</note>".format(
+                    skill_notes.append("<note>Found skills for {!r}: {}. Load one with use_skill.</note>".format(
                         need, _skill_lines(usable)))
                 if requestable:
-                    parts.append(_nudge("skills-requestable", skills=_skill_lines(requestable)))
-                _control_reply("\n".join(parts))
+                    skill_notes.append(_nudge("skills-requestable", skills=_skill_lines(requestable)))
+                _control_reply("\n".join(skill_notes))
             else:
                 _control_reply(f"<note>No skill matched {need!r}. Proceed without it.</note>")
             continue
@@ -2462,8 +2463,8 @@ def run_think(
             # A cid the context engine compacted is resolved locally (the raw output is
             # always kept, ADR-0139 D3); anything else from the content store.
             sub = getattr(agent, "substrate", None)
-            body: Optional[str] = _base_engine(wm).resolve_local(cid)
-            if body is None and sub is not None and hasattr(sub, "get_context_node"):
+            cid_body: Optional[str] = _base_engine(wm).resolve_local(cid)
+            if cid_body is None and sub is not None and hasattr(sub, "get_context_node"):
                 try:
                     node = sub.get_context_node(cid, session_token_id=task.session_token_id)
                 except Exception as exc:  # noqa: BLE001 — degrade, never crash
@@ -2473,16 +2474,16 @@ def run_think(
                 if node is not None:
                     data = getattr(node, "data", None)
                     if data is not None:
-                        body = (data.decode("utf-8", "replace")
+                        cid_body = (data.decode("utf-8", "replace")
                                 if isinstance(data, (bytes, bytearray)) else str(data))
-            if body is None:
+            if cid_body is None:
                 _step_reply(
                     kind="note",
                     body=f"resolve_cid: cid {cid!r} not found in ContentStore (or fetch failed).",
                 )
                 continue
             if as_mode == "inline" or want_page or find_q:
-                info = read_window(cid, body, _resolve_page_chars(ctx_cfg), want_page, find_q)
+                info = read_window(cid, cid_body, _resolve_page_chars(ctx_cfg), want_page, find_q)
                 rendered = _render_window_body(info)
                 _step_reply(kind="resolve_cid", cid=cid, resolved_from=cid, mode="inline",
                             body=rendered, summary=info["note"])
@@ -2498,13 +2499,13 @@ def run_think(
             new_cid: Optional[str] = None
             if sub is not None and hasattr(sub, "put_context_node"):
                 try:
-                    new_cid = sub.put_context_node(body, session_token_id=task.session_token_id)
+                    new_cid = sub.put_context_node(cid_body, session_token_id=task.session_token_id)
                 except Exception as exc:  # noqa: BLE001 — degrade, never crash
                     logger.warning("react_resolve_cid_put_failed",
                                    extra={"cid": cid, "err": str(exc)})
                     new_cid = None
             if not new_cid:
-                info = read_window(cid, body, _resolve_page_chars(ctx_cfg))
+                info = read_window(cid, cid_body, _resolve_page_chars(ctx_cfg))
                 rendered = _render_window_body(info)
                 _step_reply(kind="resolve_cid", cid=cid, resolved_from=cid, mode="inline",
                             body=rendered,
@@ -2517,12 +2518,12 @@ def run_think(
                 continue
             _step_reply(
                 kind="resolve_cid", cid=new_cid, resolved_from=cid,
-                mode="offload", chars=len(body),
-                summary=f"re-offloaded as new cid ({len(body)} chars; body is NOT in your context).",
+                mode="offload", chars=len(cid_body),
+                summary=f"re-offloaded as new cid ({len(cid_body)} chars; body is NOT in your context).",
             )
             logger.info("react_resolve_cid_offload",
                         extra={"round": round_no, "from_cid": cid, "to_cid": new_cid,
-                               "chars": len(body)})
+                               "chars": len(cid_body)})
             continue
 
         if kind == ASK_PERSON_TOOL and ASK_PERSON_TOOL in kernel_verbs:
@@ -2540,12 +2541,12 @@ def run_think(
             # ADR-0139 D14/D13: a verb that calls a kernel surface. Its outcome,
             # refusals included, is an observation for the model, never a crash.
             if kind not in kernel_verbs or kind in disabled_verbs:
-                _control_reply(_kernel_verb_unavailable(kind))
+                _control_reply(_kernel_verb_unavailable(str(kind)))
                 continue
             rendered = _run_kernel_verb(agent, task, kind, action, round_no)
             if rendered is None:
                 disabled_verbs.add(kind)
-                _control_reply(_kernel_verb_unavailable(kind))
+                _control_reply(_kernel_verb_unavailable(str(kind)))
                 continue
             if not _answer_native_turn(rendered):
                 wm.add_text(rendered)
@@ -2764,8 +2765,8 @@ _DEFAULT_RUN_CACHE_TTL = "short"
 def _resolve_cache_ttl(agent, explicit: Optional[str]) -> str:
     """run_think argument > agent ``cache_ttl`` attribute > env > ``"short"``.
     An unrecognised value is logged and replaced by the default, never sent."""
-    from .llm import coerce_cache_ttl
     from .errors import InvalidRequest
+    from .llm import coerce_cache_ttl
     for value in (explicit, getattr(agent, "cache_ttl", None), os.getenv(_CACHE_TTL_ENV)):
         if value is None or value == "":
             continue
@@ -2913,12 +2914,12 @@ def _generate_text_turn(agent, task, parts, *, structured: bool, cache_ttl: str,
     return raw, structured and req_fn is not None
 
 
-def _best_effort(wm: WorkingMemory) -> str:
+def _best_effort(wm: Any) -> str:
     """A degraded final answer synthesized from whatever the loop gathered. The
-    default engine excludes its instructions region (pinned skills are not a
-    deliverable); the legacy engine keeps its old assemble()."""
+    engine excludes its instructions region (pinned skills are not a deliverable);
+    an engine without best_effort_text contributes nothing."""
     fn = getattr(_base_engine(wm), "best_effort_text", None)
-    return fn() if fn is not None else wm.assemble()
+    return fn() if fn is not None else ""
 
 
 def _take_compacted(wm, name: str, args: Any) -> Any:
@@ -2995,8 +2996,9 @@ def _render_ledger_window(cid: str, got: Any) -> Tuple[Optional[str], Dict[str, 
         body = json.dumps(got, ensure_ascii=False, default=str)
     if not info.get("note"):
         # An older kernel's ledger_get (no note): say what is known.
-        if info.get("pages"):
-            k, pages = info.get("page") or 1, info.get("pages")
+        pages = info.get("pages")
+        if pages:
+            k = info.get("page") or 1
             nxt = (f"; next: resolve_cid cid='{cid}' page={int(k) + 1}"
                    if int(k) < int(pages) else "; this is the last page")
             info["note"] = f"page {k} of {pages}{nxt}"
@@ -3054,11 +3056,6 @@ _READ_ONLY_EFFECTS = frozenset(("read", "read_only", "readonly", "none"))
 def _base_engine(wm):
     """The context engine under the native conversation mirror (or ``wm`` itself)."""
     return wm._wm if isinstance(wm, _ConversationMirror) else wm
-
-
-def _is_legacy_engine(wm) -> bool:
-    from .context_engine import LegacyWorkingMemoryEngine
-    return isinstance(_base_engine(wm), (LegacyWorkingMemoryEngine, WorkingMemory))
 
 
 def _fixed_native_tokens(system: List[Dict[str, Any]], tool_defs: List[Dict[str, Any]]) -> int:
@@ -3411,7 +3408,7 @@ def _repeated_denial(counts: Dict[Tuple[str, str, str], int], name: str, args: A
     return reason if counts[key] >= 2 else ""
 
 
-def _latest_failure_summary(wm: WorkingMemory, tool: str) -> str:
+def _latest_failure_summary(wm: Any, tool: str) -> str:
     """The summary of the most recent FAILED card for ``tool`` (ADR-0052) — the
     concrete failure the verbal reflection should explain. ``''`` when none found."""
     for c in reversed(wm.cards):
@@ -3474,7 +3471,25 @@ def _call_system_tool(agent, name: str, args: dict, session_token_id: str = "", 
         )
     except Exception as exc:  # noqa: BLE001 — degrade, never crash the loop
         return {"error": f"system tool {name!r} failed: {exc}", "tool": name}
-    # Interpret the raw kernel response into a result the loop can reason about.
+    return _with_hook_notes(_interpret_tool_response(resp, name), resp.get("annotations"))
+
+
+def _with_hook_notes(result: Any, notes: Any) -> Any:
+    """Attach the kernel's pre_tool / post_tool hook annotations (ADR-0139 D11,
+    contract 0104) to the observation the model sees, under ``_hook_notes``. The
+    kernel carries them BESIDE the tool result so its ledger record stays
+    byte-identical; here they are context for the model, after the result. No notes,
+    no key."""
+    if not notes:
+        return result
+    notes = [str(n) for n in notes]
+    if isinstance(result, dict):
+        return {**result, "_hook_notes": notes}
+    return {"result": result, "_hook_notes": notes}
+
+
+def _interpret_tool_response(resp: Dict[str, Any], name: str) -> Any:
+    """Interpret the raw kernel response into a result the loop can reason about."""
     if resp.get("denied"):
         return {"error": f"denied: {resp.get('deny_reason', '')}", "tool": name}
     if resp.get("error"):
@@ -3948,7 +3963,7 @@ def _format_memory(results) -> str:
 
 # v2 typed-Step renderer for memory_query — surfaces the query as an XML attribute
 # (issue #1 in the trajectory critique: "memory queries don't show what was
-# queried"). Used by the loop via WorkingMemory.add_step(kind="memory_query", ...).
+# queried"). Used by the loop via the context engine's add_step(kind="memory_query", ...).
 def _render_memory_step(query: str, status: str, results) -> str:
     """Build a typed Step for a memory_query round (v2 trajectory).
 
@@ -3965,7 +3980,7 @@ def _render_memory_step(query: str, status: str, results) -> str:
 def _render_memory_children(results) -> str:
     """Render a memory_query's results as ``<memory>`` children with provenance +
     freshness attributes (ADR-0048 A1: source/author/session/written/age/freshness/
-    content_cid). Attribute assembly is shared with the WorkingMemory renderer via
+    content_cid). Attribute assembly is shared with the working_memory renderers via
     :func:`memory_provenance_attrs` so every recall surface tags facts identically."""
     if not results:
         return "  <note>no relevant memory found</note>"

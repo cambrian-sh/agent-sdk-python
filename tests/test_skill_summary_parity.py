@@ -12,8 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from cambrian_agent_sdk import CognitiveAgent
-from cambrian_agent_sdk import react
+from cambrian_agent_sdk import CognitiveAgent, react
 
 _FIXTURE = (Path(__file__).resolve().parents[2] / "cambrian-core" / "internal" / "skill"
             / "discovery" / "testdata" / "summary_cases.json")

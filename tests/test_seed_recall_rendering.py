@@ -20,7 +20,6 @@ import json
 from cambrian_agent_sdk import AgentTask, CognitiveAgent
 from cambrian_agent_sdk.context_engine import (
     DefaultContextEngine,
-    LegacyWorkingMemoryEngine,
 )
 from cambrian_agent_sdk.react import run_think
 from cambrian_agent_sdk.working_memory import (
@@ -98,9 +97,10 @@ def test_a_run_gets_its_seed_recall_and_notes():
 
 
 def test_an_empty_seed_recall_adds_no_evidence_document():
-    for engine in (DefaultContextEngine(), LegacyWorkingMemoryEngine()):
-        engine.add_seed_recall(E41_OBJECTIVE, [])
-        assert len(engine) == 0, type(engine).__name__
+    engine = DefaultContextEngine()
+    engine.add_seed_recall(E41_OBJECTIVE, [])
+    assert len(engine) == 0
+
 
 
 def test_a_seed_recall_with_hits_does_not_echo_the_query():

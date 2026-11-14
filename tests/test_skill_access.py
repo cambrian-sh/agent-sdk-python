@@ -8,8 +8,7 @@ body loads in the same run), pending or denied (no body — the loop says why, o
 
 import json
 
-from cambrian_agent_sdk import AgentTask, CognitiveAgent
-from cambrian_agent_sdk import react
+from cambrian_agent_sdk import AgentTask, CognitiveAgent, react
 
 
 class _Bot(CognitiveAgent):

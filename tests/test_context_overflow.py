@@ -8,8 +8,7 @@ INTERNAL) so the kernel's self-healer never re-runs the step into the same overf
 
 import grpc
 
-from cambrian_agent_sdk import CognitiveAgent, ContextOverflow, GenerateError
-from cambrian_agent_sdk import _map_generate_error
+from cambrian_agent_sdk import CognitiveAgent, ContextOverflow, GenerateError, _map_generate_error
 from cambrian_agent_sdk._proto import cambrian_pb2
 from cambrian_agent_sdk.errors import is_context_overflow
 from cambrian_agent_sdk.runtime import TraitServicer

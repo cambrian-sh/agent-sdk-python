@@ -8,8 +8,6 @@ AgentService). A crashing daemon_loop() restarts with exponential backoff capped
 import contextlib
 import time
 
-import pytest
-
 from cambrian_agent_sdk import DaemonAgent
 from cambrian_agent_sdk.daemon import run_supervised
 
@@ -114,7 +112,7 @@ def test_daemon_uses_signalstream_not_agentservice():
     assert DaemonAgent.trait == "daemon"
 
 
-def test_start_daemon_off_main_thread_does_not_raise_on_signals():
+def test_start_daemon_off_main_thread_does_not_raise_on_signals(monkeypatch):
     """Regression: an ingress runs the daemon loop on a background thread.
 
     `signal.signal` only works on the main thread, so installing handlers
@@ -126,6 +124,21 @@ def test_start_daemon_off_main_thread_does_not_raise_on_signals():
     import threading
 
     from cambrian_agent_sdk import daemon as daemon_mod
+
+    # ENG-555: end the daemon instead of leaving it behind. The dial to
+    # 127.0.0.1:1 fails, and the reconnect loop's backoff sleep then raises, so
+    # start_daemon returns and this thread ends inside the test; the supervised
+    # author loop is not under test and is not started. Before, both threads
+    # outlived the test (reconnecting forever), and one of them later raised into
+    # a different test as PytestUnhandledThreadExceptionWarning.
+    class _StopDaemon(Exception):
+        pass
+
+    def _stop_on_backoff(_seconds):
+        raise _StopDaemon()
+
+    monkeypatch.setattr(daemon_mod.time, "sleep", _stop_on_backoff)
+    monkeypatch.setattr(daemon_mod, "run_supervised", lambda *a, **k: None)
 
     outcome = {}
 
@@ -145,6 +158,7 @@ def test_start_daemon_off_main_thread_does_not_raise_on_signals():
     t.start()
     t.join(timeout=15)
 
+    assert not t.is_alive(), "the daemon thread outlived the test"
     assert "err" not in outcome, outcome["err"]
 
 

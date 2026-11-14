@@ -37,6 +37,11 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "grpcio-tools>=1.66.0",
+    # Lint and type gates named in AGENTS.md "Build & verify" (ENG-1450).
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "types-protobuf>=5.27",
+    "grpc-stubs>=1.53",
 ]
 
 [project.urls]
@@ -61,3 +66,26 @@ exclude = ["**/__pycache__", "**/*.pyc"]
 # (T-20261031-sdk-test-suite-does-not-pass-from-a-clean).
 pythonpath = ["example-agents", "examples"]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+# The vendored gRPC/protobuf gencode is generated, never hand-edited (AGENTS.md §3.6).
+extend-exclude = ["cambrian_agent_sdk/_proto"]
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "I"]
+# Line length is a formatting concern and the SDK has not adopted a formatter;
+# long prompt/f-string lines are kept as written rather than reflowed.
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+packages = ["cambrian_agent_sdk"]
+exclude = ["cambrian_agent_sdk/_proto/"]
+
+[[tool.mypy.overrides]]
+# Generated gencode and grpc's untyped corners: checked as imports only.
+module = ["cambrian_agent_sdk._proto.*", "grpc.*", "grpc_health.*"]
+ignore_missing_imports = true
+follow_imports = "skip"

@@ -1,13 +1,14 @@
 """ADR-0036 issue 0036-01: trait-aligned base classes.
 
 Trait contracts are enforced by class STRUCTURE, not documentation:
-a DeterministicAgent literally has no think(); a DaemonAgent is a sibling
+a DaemonAgent is a sibling
 (different gRPC contract), not a mixin.
 """
 
 import pytest
 
-from cambrian_agent_sdk import Agent, CognitiveAgent, DeterministicAgent, DaemonAgent
+import cambrian_agent_sdk
+from cambrian_agent_sdk import Agent, CognitiveAgent, DaemonAgent
 
 
 def test_abstract_agent_cannot_be_instantiated():
@@ -17,13 +18,15 @@ def test_abstract_agent_cannot_be_instantiated():
 
 
 def test_three_trait_classes_share_the_abstract_base():
-    for cls in (CognitiveAgent, DeterministicAgent, DaemonAgent):
+    for cls in (CognitiveAgent, DaemonAgent):
         assert issubclass(cls, Agent)
 
 
-def test_deterministic_agent_has_no_think():
-    """Structural trait enforcement: a scripted cell literally cannot reason."""
-    assert not hasattr(DeterministicAgent, "think")
+def test_deterministic_agent_and_tool_trait_are_deleted():
+    """ENG-1351 (owner decision 2026-11-14): DeterministicAgent and the "tool" trait
+    are gone; a scripted capability is a CognitiveAgent overriding run()."""
+    assert not hasattr(cambrian_agent_sdk, "DeterministicAgent")
+    assert "DeterministicAgent" not in cambrian_agent_sdk.__all__
 
 
 def test_cognitive_agent_has_think():
@@ -34,7 +37,6 @@ def test_daemon_is_a_sibling_not_a_mixin():
     """DaemonAgent extends the abstract base directly — it is NOT a CognitiveAgent,
     and has no task-responder run()/think() (it serves a different gRPC contract)."""
     assert not issubclass(DaemonAgent, CognitiveAgent)
-    assert not issubclass(DaemonAgent, DeterministicAgent)
     assert not hasattr(DaemonAgent, "run")
     assert not hasattr(DaemonAgent, "think")
 
@@ -54,19 +56,6 @@ def test_subclassing_requires_no_proto_import():
     e = Echo(agent_id="echo")
     assert e.run(None) == "ok"
     assert e.trait == "cognitive"
-
-
-def test_deterministic_subclass_runs_without_reasoning_surface():
-    with pytest.deprecated_call():  # DeterministicAgent is deprecated (2026-10-31)
-
-        class Doubler(DeterministicAgent):
-            def run(self, task):
-                return "42"
-
-    d = Doubler(agent_id="doubler")
-    assert d.run(None) == "42"
-    assert d.trait == "tool"
-    assert not hasattr(d, "think")
 
 
 def test_manifest_carries_the_trait():

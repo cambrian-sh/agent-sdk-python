@@ -15,6 +15,8 @@ Error surfaces: a coined hint → :class:`InvalidTagError`; a scope-denied read 
 from __future__ import annotations
 
 import warnings
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Sequence, Tuple
 
@@ -117,6 +119,30 @@ def _lease_metadata(lease_id: str) -> list:
     return [("x-lease-id", lease_id), ("x-session-id", lease_id)]
 
 
+#: The lease of the task this thread/context is running (ADR-0130 / ENG-518). Set by
+#: the runtime around ``agent.run(task)`` (:func:`task_lease`), read by the memory
+#: reads when the caller passed no ``session_token_id``. A kernel on an authenticated
+#: deployment refuses a lease-less agent-plane memory read (``no_lease``, owner
+#: decision 2026-11-14), and an author's ``self.memory.recall(q)`` passes none — so
+#: the SDK presents the lease the kernel dispatched this task under. Never a value an
+#: author or the model chooses: it is the lease the kernel handed in with the task.
+_current_lease: "ContextVar[str]" = ContextVar("cambrian_current_lease", default="")
+
+
+@contextmanager
+def task_lease(lease_id: str):
+    """Run a block with ``lease_id`` as the current task's lease (see _current_lease)."""
+    token = _current_lease.set(lease_id or "")
+    try:
+        yield
+    finally:
+        _current_lease.reset(token)
+
+
+def _lease_or_current(session_token_id: str) -> str:
+    return session_token_id or _current_lease.get()
+
+
 def _is_invalid_argument(exc) -> bool:
     import grpc
 
@@ -170,7 +196,7 @@ class MemoryClient:
         if event_after is not None and event_before is not None and event_after >= event_before:
             raise ValueError("event_after must be earlier than event_before (the window is [after, before))")
         md = self._identity_metadata()
-        md = md + _lease_metadata(session_token_id)
+        md = md + _lease_metadata(_lease_or_current(session_token_id))
         resp = self._stub.QueryMemory(req, timeout=_secs(timeout_ms), metadata=md)
         return [_result_dict(r) for r in resp.results]
 
@@ -184,7 +210,7 @@ class MemoryClient:
 
         req = cambrian_pb2.MemoryRequest(query=query, top_k=top_k)
         md = self._identity_metadata() + [("x-lane", "actions")]
-        md = md + _lease_metadata(session_token_id)
+        md = md + _lease_metadata(_lease_or_current(session_token_id))
         resp = self._stub.QueryMemory(req, timeout=_secs(timeout_ms), metadata=md)
         return [_result_dict(r) for r in resp.results]
 
@@ -215,7 +241,7 @@ class MemoryClient:
         )
         req = cambrian_pb2.MemoryRequest(query=kind_id, top_k=1)
         md = self._identity_metadata() + [("x-lane", "entity")]
-        md = md + _lease_metadata(session_token_id)
+        md = md + _lease_metadata(_lease_or_current(session_token_id))
         resp = self._stub.QueryMemory(req, timeout=_secs(timeout_ms), metadata=md)
         return [_result_dict(r) for r in resp.results]
 

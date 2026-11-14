@@ -40,7 +40,7 @@ never close from commit messages.
 **Default execution lane (ADR-0150, owner decision 2026-11-13).** A request runs in the
 **single-agent lane** by default: one agent holds the person's tools and answers itself, fanning
 out read-only work through the kernel-run `run_subtasks` tool (`execution.lane.default:
-single_agent`, `cambrian-core/internal/config/lane.go`). The ADR-0145 **planner lane** (planner →
+single_agent`, `cambrian-core/internal/config/lane.go`). The ADR-0145 **multi-agent research lane** (planner →
 Gatekeeper → Dispatcher → DAG, coverage, verifier) runs only under `execution.lane.default:
 planner` and is kept for research — so plan views, dispatch events and Gatekeeper scoring appear
 only in that lane. See [`decisions/default-lane-single-agent-with-fan-out.md`](../cambrian-knowledge/decisions/default-lane-single-agent-with-fan-out.md).
@@ -54,8 +54,8 @@ literals before the Python process boots.
 
 The SDK builds Cambrian agents in Python with zero boilerplate. Authors import
 `CognitiveAgent` or `DaemonAgent` from `cambrian_agent_sdk` (`DeterministicAgent`
-still exists but is deprecated since 2026-10-31 and warns on subclassing; new agents
-use `CognitiveAgent` with an overridden `run()`), override `run()` (or `think()` for
+was deleted 2026-11-14; a scripted capability is a `CognitiveAgent` with an overridden
+`run()`), override `run()` (or `think()` for
 the cognitive trait), and call `agent.serve()`. On PyPI, the package is `cambrian-agent-sdk` on its
 own version line (currently `0.1.5`) under the Apache License 2.0 (ADR-0057 D10,
 amended 2026-10-31).
@@ -81,7 +81,7 @@ kernel.
 | Path | Role |
 | --- | --- |
 | `cambrian_agent_sdk/` | The SDK package; load-bearing files: |
-| | `base.py` (agent loop bases: `Agent` abstract + `CognitiveAgent` / `DeterministicAgent` (deprecated) / `DaemonAgent` traits; the ReAct pattern wires through `react.run_think`, ADR-0036 D1) |
+| | `base.py` (agent loop bases: `Agent` abstract + `CognitiveAgent` / `DaemonAgent` traits (`DeterministicAgent` deleted 2026-11-14); the ReAct pattern wires through `react.run_think`, ADR-0036 D1) |
 | | `runtime.py` (trait-agent `AgentService` servicer and `serve()` boot) · `server.py` (gRPC server lifecycle) · `daemon.py` (`DaemonAgent` runtime: the `SignalStream` side) |
 | | `channel.py` (the one way the SDK dials the kernel) · `react.py` (the `think()` ReAct loop) · `context_engine.py` (what one run puts in front of the model, ADR-0139 D3) · `working_memory.py` (LRW buffers, ADR-0041 D1) |
 | | `tools.py` (in-process `@tool` registration and `ToolRegistry`) |
@@ -95,15 +95,14 @@ kernel.
 ## Build & verify
 
 ```sh
-uv sync            # or: pip install -e .
-pytest             # the only configured gate (pyproject dev extras: pytest, grpcio-tools)
+uv sync --extra dev   # or: pip install -e ".[dev]"
+pytest                # tests
+ruff check            # lint: E, F, B, I (E501 ignored; _proto/ excluded) — [tool.ruff] in pyproject.toml
+mypy                  # types: the cambrian_agent_sdk package, _proto/ excluded — [tool.mypy]
 ```
 
-`ruff` and `mypy` are **not** configured here: neither is a dev dependency and `pyproject.toml` has
-no `[tool.ruff]` / `[tool.mypy]` section, so nothing runs them and an ad-hoc run reports real errors
-(F821 in `server.py`, ~70 mypy errors) despite the package shipping `py.typed`. Adding them (or
-deciding not to) is `T-20261113-sdk-agents-md-prescribes-ruff-check-and-mypy`; until then, do not
-claim a lint or type gate passed.
+All three pass on a clean tree (ENG-1450, 2026-11-14). No CI workflow runs them yet, so run them
+yourself before claiming a change is clean.
 
 ## Change discipline
 

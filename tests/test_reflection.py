@@ -11,7 +11,6 @@ import json
 from cambrian_agent_sdk import AgentResult, AgentTask, CognitiveAgent
 from cambrian_agent_sdk.react import run_think
 from cambrian_agent_sdk.reflection import build_reflection_prompt
-from cambrian_agent_sdk.working_memory import WorkingMemory
 
 
 class Bot(CognitiveAgent):
@@ -87,27 +86,8 @@ def test_reflection_prompt_condenses_huge_args():
 # ── pinned working-memory channel ──────────────────────────────────────────────
 
 
-def test_reflection_entry_is_pinned_and_survives_bounding():
-    """A reflection is kept by assembly even when the buffer overflows its cap —
-    an ordinary note would be bounded out; the lesson must persist across attempts.
-
-    v2: the reflection renders as a <reflection n="..."> block (the new format)."""
-    wm = WorkingMemory(cap=3)
-    wm.add_reflection("the lesson: try a different tool")
-    for i in range(10):  # flood well past the cap with ordinary notes
-        wm.add_text(f"filler note {i}")
-    assembled = wm.assemble()
-    # The lesson text is preserved in the reflection block; the exact form is the
-    # v2 typed form (``<reflection n="N">lesson</reflection>``).
-    assert "the lesson: try a different tool" in assembled
-    assert "<reflection" in assembled
-    assert "</reflection>" in assembled
 
 
-def test_empty_reflection_is_ignored():
-    wm = WorkingMemory()
-    wm.add_reflection("   ")
-    assert len(wm) == 0
 
 
 # ── loop integration ───────────────────────────────────────────────────────────

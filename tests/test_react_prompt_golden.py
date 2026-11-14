@@ -75,8 +75,7 @@ from pathlib import Path
 
 import pytest
 
-from cambrian_agent_sdk import CognitiveAgent, tool
-from cambrian_agent_sdk import helpers, react
+from cambrian_agent_sdk import CognitiveAgent, helpers, react, tool
 from cambrian_agent_sdk import prompt_library as pl
 
 GOLDEN_V1 = json.loads((Path(__file__).parent / "golden" / "react_prompts_v1.json")

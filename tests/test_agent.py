@@ -3,18 +3,14 @@
 import pytest
 
 from cambrian_agent_sdk import (
-    CognitiveAgent,
-    DeterministicAgent,
-    Capability,
     AgentResult,
     AgentTask,
+    CognitiveAgent,
     SubstrateClient,
-    configure_logging,
 )
-from cambrian_agent_sdk.types import Capability
-from cambrian_agent_sdk.runtime import _coerce_agent_result, dispatch_run
 from cambrian_agent_sdk.errors import BudgetExceededError
-
+from cambrian_agent_sdk.runtime import _coerce_agent_result, dispatch_run
+from cambrian_agent_sdk.types import Capability
 
 # ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -129,31 +125,6 @@ def test_cognitive_agent_react_loop_error_caught():
     assert result.confidence == 0.0
 
 
-# ── DeterministicAgent ──────────────────────────────────────────────────────
-
-
-# DeterministicAgent is deprecated; subclassing warns (see tests/test_deterministic.py).
-with pytest.deprecated_call():
-
-    class _AddTool(DeterministicAgent):
-        def run(self, task):
-            return AgentResult(data=str(int(task.text) + 1).encode())
-
-
-def test_deterministic_static_bid():
-    agent = _AddTool(agent_id="add")
-    bid = agent.propose(None)
-    assert bid.confidence == 1.0
-    assert bid.estimated_latency_ms == 5
-
-
-def test_deterministic_run():
-    agent = _AddTool(agent_id="add")
-    task = AgentTask(text="5", data=b"5")
-    result = agent.run(task)
-    assert result.data == b"6"
-
-
 # ── dispatch_run budget handling ─────────────────────────────────────────────
 
 
@@ -196,20 +167,11 @@ def test_manifest_json_valid():
     assert parsed["trait"] == "cognitive"
 
 
-def test_deterministic_manifest_trait():
-    agent = _AddTool(agent_id="tool", version="0.0.1")
-    import json
-    parsed = json.loads(agent.manifest_json())
-    assert parsed["trait"] == "tool"
-
-
 # ── P3: generate_stream ───────────────────────────────────────────────────────
 
 
 def test_substrate_client_generate_delegates_to_stream():
     client = SubstrateClient("localhost:99999")
-    chunks_seen = []
-
     def _fake_stream(*args, **kwargs):
         yield from ["hello ", "world"]
 

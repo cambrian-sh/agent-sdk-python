@@ -1,8 +1,6 @@
 """Tests for cambrian_agent_sdk.helpers — ADR-0023 Issue #0023-05."""
-import pytest
-from cambrian_agent_sdk.helpers import extract_code_block, find_step_ref, build_prompt
+from cambrian_agent_sdk.helpers import build_prompt, extract_code_block, find_step_ref
 from cambrian_agent_sdk.types import ContextRef
-
 
 # ── extract_code_block ────────────────────────────────────────────────────────
 

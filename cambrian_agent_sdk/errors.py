@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 
 class BudgetExceededError(Exception):
     """Raised by an agent's ``run()`` when a task's estimated cost exceeds budget.
@@ -59,11 +61,14 @@ class ToolCallingUnsupported(Exception):
 # parsing gRPC details. Each also subclasses grpc.RpcError (when grpc is importable,
 # which it always is in a real install) so code written against the raw RpcError
 # keeps catching them.
-try:  # pragma: no cover - grpc is a hard dependency; the fallback is for stripped envs
-    import grpc as _grpc
-    _RpcBase = _grpc.RpcError
-except Exception:  # noqa: BLE001
-    _RpcBase = Exception
+if TYPE_CHECKING:
+    from grpc import RpcError as _RpcBase
+else:
+    try:  # pragma: no cover - grpc is a hard dependency; the fallback is for stripped envs
+        import grpc as _grpc
+        _RpcBase = _grpc.RpcError
+    except Exception:  # noqa: BLE001
+        _RpcBase = Exception
 
 
 class GenerateError(_RpcBase):

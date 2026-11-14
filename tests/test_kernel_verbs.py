@@ -26,7 +26,6 @@ from cambrian_agent_sdk.react import (
     run_think,
 )
 
-
 # ── client ─────────────────────────────────────────────────────────────
 
 

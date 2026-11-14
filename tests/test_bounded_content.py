@@ -14,9 +14,8 @@ import json
 
 import pytest
 
-from cambrian_agent_sdk import AgentTask, CognitiveAgent
+from cambrian_agent_sdk import AgentTask, CognitiveAgent, react
 from cambrian_agent_sdk import context_engine as ce
-from cambrian_agent_sdk import react
 from cambrian_agent_sdk.content_window import read_window
 from cambrian_agent_sdk.react import run_think
 from cambrian_agent_sdk.step_dependencies import render_step_dependencies
@@ -241,6 +240,43 @@ def test_context_config_resolve_page_chars_env(monkeypatch):
     cfg = ce.ContextConfig.resolve()
     assert (cfg.resolve_page_chars, cfg.tool_output_max_chars, cfg.tool_output_preview_chars,
             cfg.budget_tokens) == (8000, 30000, 700, 40000)
+
+
+# ENG-595 (owner decision 2026-11-14): execution.lane.context reaches the agent as
+# kernel-stamped ``_context_*`` handoff keys, which win over every other layer.
+def test_context_config_handoff_keys_win(monkeypatch):
+    monkeypatch.setenv("CAMBRIAN_CONTEXT_BUDGET_TOKENS", "40000")
+    monkeypatch.setenv("CAMBRIAN_CONTEXT_PROTECT_TAIL", "2")
+    task = AgentTask(text="t", context={"_context_budget_tokens": "48000",
+                                        "_context_protect_tail": "5",
+                                        "_context_tool_output_compact_chars": "nope"})
+    agent = type("A", (), {"context_config": {"budget_tokens": 1000, "keep_recent_tool_results": 7}})()
+    cfg = ce.ContextConfig.resolve(agent, {"protect_tail": 9}, task=task)
+    assert cfg.budget_tokens == 48000           # handoff > agent config > env
+    assert cfg.protect_tail == 5                # handoff > explicit > env
+    assert cfg.keep_recent_tool_results == 7    # not stamped: the lower layers stand
+    assert cfg.tool_output_compact_chars == 1200  # a bad value is skipped, default stands
+    # Without a task (or without the keys) nothing changes.
+    assert ce.ContextConfig.resolve(task=AgentTask(text="t")).budget_tokens == 40000
+
+
+def test_run_think_builds_its_engine_from_the_handoff_context():
+    seen = {}
+
+    def factory(config, embed_fn, offload_fn, summariser):
+        seen["cfg"] = config
+        return ce.DefaultContextEngine(config, offload_fn=offload_fn, summariser=summariser,
+                                       embed_fn=embed_fn)
+
+    sub = NativeSub([[("final_answer", {"answer": "ok"})]])
+    bot = Bot(agent_id="b")
+    bot.substrate = sub
+    res = run_think(bot, AgentTask(text="t", context={"_context_budget_tokens": "12345",
+                                                      "_context_keep_recent_tool_results": "4"}),
+                    seed_recall=False, context_engine=factory)
+    assert res.data == b"ok"
+    assert seen["cfg"].budget_tokens == 12345
+    assert seen["cfg"].keep_recent_tool_results == 4
 
 
 # ── B2: head + omission marker + tail + outline ───────────────────────────────

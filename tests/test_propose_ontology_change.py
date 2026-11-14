@@ -12,8 +12,12 @@ import grpc
 
 from cambrian_agent_sdk import AgentTask, CognitiveAgent, SubstrateClient
 from cambrian_agent_sdk._proto import cambrian_pb2
-from cambrian_agent_sdk.react import (_offered_kernel_verbs, _run_kernel_verb, build_output_schema,
-                                      build_tool_definitions)
+from cambrian_agent_sdk.react import (
+    _offered_kernel_verbs,
+    _run_kernel_verb,
+    build_output_schema,
+    build_tool_definitions,
+)
 
 
 class _RpcError(grpc.RpcError):

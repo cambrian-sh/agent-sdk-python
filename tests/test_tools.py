@@ -6,9 +6,7 @@ call — distinct from, and orthogonal to, @capability (inter-agent auction rout
 
 from typing import Optional
 
-import pytest
-
-from cambrian_agent_sdk import CognitiveAgent, tool
+from cambrian_agent_sdk import CognitiveAgent, capability, tool
 
 
 class Bot(CognitiveAgent):
@@ -18,9 +16,6 @@ class Bot(CognitiveAgent):
 
     def run(self, task):
         return "x"
-
-
-from cambrian_agent_sdk import capability
 
 
 def test_tool_auto_derives_schema_from_type_hints():
@@ -101,8 +96,9 @@ def test_in_tool_exception_degrades_to_structured_error():
 
 def test_no_exec_or_eval_in_the_tool_path():
     """Closed-menu invocation must never route author/LLM input through exec/eval."""
-    import cambrian_agent_sdk.tools as tools_mod
     import inspect as _inspect
+
+    import cambrian_agent_sdk.tools as tools_mod
 
     src = _inspect.getsource(tools_mod)
     assert "exec(" not in src

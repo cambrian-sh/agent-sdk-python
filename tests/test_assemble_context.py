@@ -1,10 +1,8 @@
 """Tests for assemble_context() and ContextRef (ADR-0022 Phase 3 Python SDK)."""
 
-import pytest
 
 from cambrian_agent_sdk import assemble_context
 from cambrian_agent_sdk.types import ContextRef, ExecuteRequest
-
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -44,7 +42,6 @@ def test_assemble_context_sort_activation_times_precision():
     # All above min_precision=0.4 default; snippet-only mode (fetch_fn=None)
     result = assemble_context(refs, min_precision=0.4)
     # B should appear first (0.81), then C (0.42), then A (0.25)
-    b_pos = result.index("[step_result]") if "[step_result]" in result else result.find("B")
     assert result.index("B") < result.index("C") < result.index("A"), \
         f"Expected B > C > A order, got: {result!r}"
 

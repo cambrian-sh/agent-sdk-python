@@ -112,6 +112,9 @@ _GENERATOR_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _MCP_GLOB = re.compile(r"^mcp:([a-z0-9][a-z0-9._-]*)/([A-Za-z0-9_.*?-]+)$")
 # A kernel-native tool name (tools/ process tools): no namespace, optional glob chars.
 _NATIVE_GLOB = re.compile(r"^[a-z][a-z0-9_.*?-]*$")
+# Contributed tools (ADR-0127): local:<machine id or *>/<tool glob>; "local:*" is
+# every machine and tool. Port of internal/agentprofile reLocalGlob.
+_LOCAL_GLOB = re.compile(r"^local:(\*|[A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9_.*?-]+)$")
 
 _MAX_TOOL_ROUNDS = (1, 64)
 _MAX_TOKENS = (256, 131072)
@@ -139,9 +142,18 @@ def _check_glob(pattern: Any) -> str:
                 f"tool pattern {pattern!r} must be mcp:<server id>/<tool glob> with a literal "
                 "server id (no wildcard before the '/')")
         return pattern  # mcp:<server>/* (every tool of one named server) is allowed
+    if pattern.startswith("local:"):
+        # Owner decision 2026-11-15: a profile may opt into contributed tools. The
+        # pattern only widens the profile's ceiling; the local:* fleet grant is still
+        # the operator's, and the fleet is the run beneficiary's own machines.
+        if pattern != "local:*" and not _LOCAL_GLOB.match(pattern):
+            raise InvalidProfile(
+                f"tool pattern {pattern!r} must be local:* or local:<machine id or *>/<tool glob>")
+        return pattern
     if ":" in pattern or "/" in pattern:
         raise InvalidProfile(
-            f"tool pattern {pattern!r}: unknown namespace (use mcp:<server>/<tool> or a native tool name)")
+            f"tool pattern {pattern!r}: unknown namespace (use mcp:<server>/<tool>, "
+            "local:<machine>/<tool> or a native tool name)")
     if not _NATIVE_GLOB.match(pattern) or set(pattern) <= {"*", "?"}:
         raise InvalidProfile(
             f"tool pattern {pattern!r} is not a native tool name; a bare wildcard would allow every tool")
@@ -528,7 +540,8 @@ class ProfileScopedSubstrate:
         return getattr(self._inner, name)
 
     def _keep(self, tools: Optional[Sequence[Dict]]) -> List[Dict]:
-        kept, dropped = [], []
+        kept: List[Dict] = []
+        dropped: List[Dict] = []
         for t in tools or []:
             (kept if self._allow.allows(t.get("name", "")) else dropped).append(t)
         if dropped:

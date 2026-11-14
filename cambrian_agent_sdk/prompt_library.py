@@ -255,7 +255,10 @@ def _parse_file(root: _Root, prompt_id: str, name: str) -> Prompt:
             raise fail(f"frontmatter field {key!r} is required")
     if fm["id"] != prompt_id:
         raise fail(f"id {fm['id']!r} does not match its directory {prompt_id!r}")
-    file_version = int(_VERSION_FILE.match(name).group(1))
+    version_match = _VERSION_FILE.match(name)
+    if version_match is None:
+        raise fail("file name is not v<N>.md")
+    file_version = int(version_match.group(1))
     if not isinstance(fm["version"], int) or fm["version"] != file_version:
         raise fail(f"version {fm['version']!r} does not match the file name")
     if fm["tier"] not in TIERS:

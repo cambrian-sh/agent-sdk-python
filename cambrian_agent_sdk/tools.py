@@ -15,9 +15,9 @@ properties:
 from __future__ import annotations
 
 import inspect
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, get_args, get_origin, get_type_hints
 import typing
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterable, List, Optional, get_args, get_origin, get_type_hints
 
 
 @dataclass

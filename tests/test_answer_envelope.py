@@ -5,7 +5,6 @@ import json
 
 from cambrian_agent_sdk import react
 
-
 ITEMS = json.dumps([{"id": "R1", "type": "figure", "text": "State the total", "quote": "how much"}])
 
 

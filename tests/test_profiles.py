@@ -97,8 +97,8 @@ def test_crlf_profile_loads(tmp_path, skills):
 
 
 def test_optional_fields_default(skills):
-    text = "\n".join(l for l in _VALID.splitlines()
-                     if not l.startswith(("model", "max_", "version")))
+    text = "\n".join(line for line in _VALID.splitlines()
+                     if not line.startswith(("model", "max_", "version")))
     p = parse_profile(text, skills_dir=skills)
     assert (p.model, p.max_tool_rounds, p.max_tokens, p.version) == ("", None, None, "1.0.0")
 

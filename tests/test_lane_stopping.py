@@ -2,10 +2,9 @@
 and the context engine's age trigger with ledger-id placeholders."""
 import json
 
-from cambrian_agent_sdk import AgentTask, CognitiveAgent, tool
+from cambrian_agent_sdk import AgentTask, CognitiveAgent, stopping, tool
 from cambrian_agent_sdk.context_engine import ContextConfig, DefaultContextEngine, ledger_ref_of
 from cambrian_agent_sdk.react import run_think
-from cambrian_agent_sdk import stopping
 from cambrian_agent_sdk.stopping import LaneClock, LaneLimits, StuckDetector
 
 

@@ -6,6 +6,7 @@ narrow-only hint. A coined hint surfaces InvalidTagError; a scope-denied read su
 ArtifactNotFound.
 """
 
+import grpc
 import pytest
 
 from cambrian_agent_sdk._proto import cambrian_pb2 as pb
@@ -16,9 +17,6 @@ from cambrian_agent_sdk.clients import (
     MemoryClient,
     WorkingMemory,
 )
-
-
-import grpc
 
 
 class _FakeRpcError(grpc.RpcError):
@@ -321,7 +319,7 @@ def test_execute_charges_subplan_tokens_to_parent_step():
 
 
 def test_execute_refuses_self_delegation():
-    from cambrian_agent_sdk import SubstrateClient, SelfDelegationError
+    from cambrian_agent_sdk import SelfDelegationError, SubstrateClient
 
     sub = SubstrateClient(stub=_FakeStub(), agent_id="me")
     with pytest.raises(SelfDelegationError):

@@ -10,10 +10,9 @@ import json
 from pathlib import Path
 
 import pytest
+import test_prompt_lint as lint
 
 from cambrian_agent_sdk import prompt_library as pl
-
-import test_prompt_lint as lint
 
 _CORE_PROMPTS = Path(__file__).resolve().parents[2] / "cambrian-core" / "prompts"
 _FIXTURE = _CORE_PROMPTS / "testdata" / "hash_cases.json"

@@ -67,9 +67,9 @@ def start_daemon(agent, substrate_addr: Optional[str] = None) -> None:
 
     import grpc
 
+    from ._proto import cambrian_pb2, cambrian_pb2_grpc
     from .channel import build_channel
     from .server import _parse_daemon_cli, agent_id_override
-    from ._proto import cambrian_pb2, cambrian_pb2_grpc
 
     stream_id, parsed_addr, params = _parse_daemon_cli()
     agent.stream_id = stream_id

@@ -1,10 +1,9 @@
 """Tests for BudgetExceededError dispatch path — ADR-0023 Issue #0023-06."""
 import pytest
 
-from cambrian_agent_sdk import CognitiveAgent, Capability, AgentTask, AgentResult
-from cambrian_agent_sdk.runtime import dispatch_run
+from cambrian_agent_sdk import AgentTask, CognitiveAgent
 from cambrian_agent_sdk.errors import BudgetExceededError
-
+from cambrian_agent_sdk.runtime import dispatch_run
 
 # ── BudgetExceededError construction ─────────────────────────────────────────
 

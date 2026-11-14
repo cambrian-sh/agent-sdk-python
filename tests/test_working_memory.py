@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 
 from cambrian_agent_sdk.working_memory import (
     ToolCard,
-    WorkingMemory,
     _condense_dict,
     _status_of,
     _summarize,
@@ -134,14 +133,6 @@ def test_summary_truncates_large_results_without_llm():
     assert "chars total" in s          # length marker on truncation
 
 
-def test_assemble_joins_text_and_cards():
-    wm = WorkingMemory()
-    wm.add_text("<memory>fact</memory>")
-    wm.add_tool_card(ToolCard.from_result("add", {"a": 1}, 2))
-    out = wm.assemble()
-    assert "fact" in out
-    assert "add" in out and "status='ok'" in out
-    assert len(wm.cards) == 1          # episodic buffer exposes the cards
 
 
 def test_non_dict_args_are_wrapped():
@@ -214,73 +205,16 @@ def _kw_embed(text):
     return [1.0 if "alpha" in text else 0.0, 1.0 if "beta" in text else 0.0]
 
 
-def test_under_cap_keeps_all_entries_in_order():
-    wm = WorkingMemory(embed_fn=None, cap=10)
-    wm.add_text("a")
-    wm.add_text("b")
-    assert wm.assemble() == "a\nb"          # behavior-preserving below cap
 
 
-def test_assemble_bounds_and_ranks_by_relevance():
-    wm = WorkingMemory(embed_fn=_kw_embed, cap=2)
-    wm.add_tool_card(ToolCard.from_result("beta0", {}, "beta result 0"))
-    wm.add_tool_card(ToolCard.from_result("alpha0", {}, "alpha result 0"))
-    wm.add_tool_card(ToolCard.from_result("alpha1", {}, "alpha result 1"))  # last → pinned
-    out = wm.assemble(intent_vec=[1.0, 0.0])  # intent ~ alpha
-    assert out.count("<step") == 2            # bounded to cap
-    assert "alpha1" in out                    # the pinned most-recent
-    assert "alpha0" in out                    # the relevant one kept over beta
-    assert "beta" not in out                  # the irrelevant one evicted
 
 
-def test_assemble_numbered_renders_ordered_trajectory():
-    # v2: numbered mode prefixes kept entries with ordinals (oldest first) so the
-    # assembly reads as a sequence, not a flat pile. Default mode stays unnumbered
-    # (each <step> carries its own ``n`` attribute in the new rich XML).
-    wm = WorkingMemory(embed_fn=None, cap=10)
-    wm.add_text("<memory>recalled fact</memory>")
-    wm.add_tool_card(ToolCard.from_result("write_file", {"path": "a.txt"}, {"written": "a.txt"}))
-
-    plain = wm.assemble()
-    assert not plain.lstrip().startswith("1. ")     # default unchanged
-
-    numbered = wm.assemble(numbered=True)
-    assert numbered.startswith("1. ")                # oldest entry is item 1
-    # The action is item 2; the v2 rich XML uses ``<step n=0 type="tool_call" tool='write_file' ...>``.
-    assert "2. <step" in numbered
-    assert "type=\"tool_call\"" in numbered
-    assert "tool='write_file'" in numbered
 
 
-def test_pinned_failure_retained_even_at_low_relevance():
-    wm = WorkingMemory(embed_fn=_kw_embed, cap=2)
-    # A FAILED card irrelevant to the 'alpha' intent — must survive as a pin so the
-    # recurrence gate (0041-04) keeps its evidence.
-    wm.add_tool_card(ToolCard.from_result("execute_command", {"command": "gamma"},
-                                          {"error": "boom"}))
-    wm.add_tool_card(ToolCard.from_result("alpha0", {}, "alpha 0"))
-    wm.add_tool_card(ToolCard.from_result("alpha1", {}, "alpha 1"))
-    out = wm.assemble(intent_vec=[1.0, 0.0])
-    assert "status='error'" in out            # pinned despite ~zero relevance to alpha
 
 
-def test_recency_fallback_without_embedder():
-    wm = WorkingMemory(embed_fn=None, cap=2)
-    for i in range(5):
-        wm.add_text(f"entry{i}")
-    out = wm.assemble()                        # no embedder, no intent
-    assert "entry4" in out and "entry3" in out  # most recent kept
-    assert "entry0" not in out
-    assert out.count("entry") == 2
 
 
-def test_token_bound_many_cards_stay_capped():
-    """Regression for O(N²): assembled prompt stays ≤ cap regardless of N rounds."""
-    wm = WorkingMemory(embed_fn=None, cap=10)
-    for i in range(50):
-        wm.add_tool_card(ToolCard.from_result(f"t{i}", {}, f"r{i}"))
-    out = wm.assemble()
-    assert out.count("<step") <= 10
 
 
 # ── #2: content-aware ToolCard summarization (errors, listings) ──────────────────
@@ -312,69 +246,16 @@ def test_condense_returns_none_for_unrecognized_shape():
 
 # ── #3: assemble() dedups the seed/recall/step-result triplication ───────────────
 
-def test_assemble_dedups_near_identical_text_blocks():
-    payload = (
-        "Observations: the task requires a comprehensive explanation of LLMs, agents "
-        "and tools, and their interconnection in a modern AI stack. Reasoning: define "
-        "the core technology, the orchestration paradigm, and the interface layer. "
-        "Conclusion: LLMs are transformer networks, agents loop over them, tools extend them."
-    )
-    wm = WorkingMemory(embed_fn=None, cap=10)
-    wm.add_text(f"<workspace>{payload}</workspace>")                  # seed A
-    wm.add_text(f"<memory>step_0: {payload} | Step 0 result: {payload}</memory>")  # recall (reordered)
-    wm.add_text(f"<memory>Step 0 result: {payload}</memory>")        # later memory_query (same)
-    wm.add_text("<note>distinct short note that must survive</note>")  # distinct → kept
-
-    out = wm.assemble()
-    # The big payload appears once, not three times.
-    assert out.count("comprehensive explanation of LLMs") == 1
-    # The distinct note is never deduped.
-    assert "distinct short note that must survive" in out
 
 
-def test_assemble_does_not_dedup_distinct_small_notes():
-    wm = WorkingMemory(embed_fn=None, cap=10)
-    wm.add_text("<note>first finding</note>")
-    wm.add_text("<note>second finding</note>")
-    out = wm.assemble()
-    assert "first finding" in out and "second finding" in out
 
 
 # ── R7: content-offload for large text entries (pointer + drill-down) ─────────────
 
-def test_large_text_offloaded_to_pointer_when_offloader_wired():
-    store = {}
-
-    def offload(text):
-        store["txtcid"] = text.encode()
-        return "txtcid"
-
-    wm = WorkingMemory(embed_fn=None, offload_fn=offload, text_inline_cap=50)
-    big = "Observations: " + ("LLMs are transformer networks. " * 50)
-    wm.add_text(big)
-
-    out = wm.assemble()
-    assert "<offloaded" in out and "cid='txtcid'" in out
-    assert big not in out                 # the full payload is NOT carried in the prompt
-    assert "Observations" in out          # but the gist locates it for the agent
-    # Drill-down recovers the full text by cid (the agent can still fetch it).
-    assert resolve_content(wm._entries[0], _FakeSubstrateCAS(store)) == big
 
 
-def test_large_text_verbatim_without_offloader_is_safe_default():
-    # No offloader (no ContentStore write path) ⇒ never collapse, so a later step
-    # that needs the full text (e.g. write_file) is never starved.
-    wm = WorkingMemory(embed_fn=None, offload_fn=None, text_inline_cap=50)
-    big = "x" * 500
-    wm.add_text(big)
-    assert big in wm.assemble()
 
 
-def test_small_text_never_offloaded():
-    wm = WorkingMemory(embed_fn=None, offload_fn=lambda t: "c", text_inline_cap=1000)
-    wm.add_text("<note>tiny note</note>")
-    out = wm.assemble()
-    assert "tiny note" in out and "<offloaded" not in out
 
 
 def test_offloaded_tool_call_carries_cid_hint():
@@ -436,6 +317,7 @@ def test_tool_call_step_inlines_small_body_in_full():
     'model re-reads 4 times' gap (a 3475-char HTML was being truncated
     to 400 chars; the model kept re-reading)."""
     import html as _html
+
     from cambrian_agent_sdk.working_memory import Step, render_step_xml
     body = "<!DOCTYPE html>... 3475 chars ...</html>"
     s = Step(
@@ -493,53 +375,13 @@ def test_tool_call_step_kernel_offloaded_branch_unchanged():
     assert "<body_preview>" not in xml
 
 
-def test_offload_fn_failure_degrades_to_verbatim():
-    def boom(_):
-        raise RuntimeError("offload down")
-
-    wm = WorkingMemory(embed_fn=None, offload_fn=boom, text_inline_cap=10)
-    big = "y" * 200
-    wm.add_text(big)
-    assert big in wm.assemble()           # degraded to verbatim, never crashed
 
 
 # ── D7: supersession-collapse (consumed specs, superseded failures) ───────────────
 
-def test_collapse_consumed_tool_spec_immediately():
-    wm = WorkingMemory(embed_fn=None, cap=10)
-    wm.add_text("<tool_spec name='firecrawl_agent'>\n  <description>long async polling prose...</description>\n</tool_spec>")
-    wm.add_tool_card(ToolCard.from_result("firecrawl_agent", {"prompt": "x"}, {"job": "123"}))
-    out = wm.assemble()
-    assert "spec for 'firecrawl_agent' consumed" in out
-    assert "async polling prose" not in out          # the full spec is collapsed
 
 
-def test_collapse_superseded_failure_after_hysteresis():
-    wm = WorkingMemory(embed_fn=None, cap=10)
-    wm.add_tool_card(ToolCard.from_result("write_file", {"path": "a.txt"},
-                                          {"error": "ENOENT", "tool": "write_file"}))   # fail
-    wm.add_tool_card(ToolCard.from_result("write_file", {"path": "a.txt"}, {"written": "a.txt"}))  # success
-    wm.add_text("<note>a later note</note>")          # success is no longer most-recent
-    out = wm.assemble()
-    assert "'write_file' failed, then succeeded" in out
-    assert "status='error'" not in out               # the failed card collapsed to the note
 
 
-def test_failure_kept_while_success_is_most_recent():
-    wm = WorkingMemory(embed_fn=None, cap=10)
-    wm.add_tool_card(ToolCard.from_result("write_file", {"path": "a.txt"},
-                                          {"error": "ENOENT", "tool": "write_file"}))
-    wm.add_tool_card(ToolCard.from_result("write_file", {"path": "a.txt"}, {"written": "a.txt"}))  # most-recent
-    out = wm.assemble()
-    assert "failed, then succeeded" not in out        # hysteresis: kept this turn
-    assert "status='error'" in out                    # failed card still rendered
 
 
-def test_collapse_is_non_destructive():
-    wm = WorkingMemory(embed_fn=None, cap=10)
-    wm.add_text("<tool_spec name='x'>spec</tool_spec>")
-    wm.add_tool_card(ToolCard.from_result("x", {}, {"ok": 1}))
-    wm.add_text("<note>note</note>")
-    _ = wm.assemble()
-    assert len(wm.cards) == 1                          # episodic buffer intact
-    assert len(wm._entries) == 3                       # nothing removed from the buffer

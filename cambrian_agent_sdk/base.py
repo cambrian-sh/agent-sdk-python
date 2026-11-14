@@ -1,25 +1,24 @@
 """Trait-aligned agent base classes (ADR-0036 D1).
 
-Three sibling classes mapped 1:1 to the ADR-0001/0033 trait taxonomy, sharing an
+Two sibling classes mapped to the ADR-0058/0033 trait taxonomy, sharing an
 abstract :class:`Agent`. Trait contracts are enforced by **class structure**:
 
-- :class:`CognitiveAgent` — LLM reasoning (``think()``), memory, ``@tool`` actions.
-- :class:`DeterministicAgent` — a scripted cell; **no** ``think()`` / memory surface.
-  *Deprecated* (2026-10-31): subclassing it emits a ``DeprecationWarning``; see the class.
+- :class:`CognitiveAgent` — LLM reasoning (``think()``), memory, ``@tool`` actions. A
+  scripted capability subclasses it and overrides ``run()``. (``DeterministicAgent`` and
+  the ``"tool"`` trait were deleted 2026-11-14, ENG-1351; see CHANGELOG.)
 - :class:`DaemonAgent` — a persistent signal producer on a *different* gRPC contract
   (``SignalStream``, not ``AgentService``); it is a **sibling, not a mixin**, because it
   cannot be both a task-responder and a signal-producer in one lifecycle.
 
-Authors subclass a trait and override ``run()`` (cognitive/deterministic) or
+Authors subclass a trait and override ``run()`` (cognitive) or
 ``daemon_loop()`` (daemon) — never importing ``Handoff`` / ``Payload`` / any proto type.
 """
 
 from __future__ import annotations
 
 import json
-import warnings
 from abc import ABC, abstractmethod
-from typing import Optional, Union
+from typing import Any, Dict, Optional, Union
 
 from .types import AgentResult, AgentTask, Capability  # noqa: F401  (re-exported vocabulary)
 
@@ -33,7 +32,7 @@ class Agent(ABC):
     ``Agent`` non-instantiable: authors must pick a trait.
     """
 
-    #: The ADR-0001/0033 trait tag stamped into the manifest. Set by each subclass.
+    #: The ADR-0058/0033 trait tag stamped into the manifest. Set by each subclass.
     trait: str = ""
 
     def __init__(
@@ -193,7 +192,7 @@ class CognitiveAgent(Agent):
             max_tool_rounds = _DEFAULT_MAX_TOOL_ROUNDS
         # max_tokens=None: omit it so run_think's own default applies (see the
         # class attribute's comment).
-        gen_kwargs = {} if self.max_tokens is None else {"max_tokens": self.max_tokens}
+        gen_kwargs: Dict[str, Any] = {} if self.max_tokens is None else {"max_tokens": self.max_tokens}
 
         return run_think(
             self,
@@ -224,10 +223,10 @@ class CognitiveAgent(Agent):
 
     def serve(self, address: Optional[str] = None) -> None:
         """Bind clients to the Substrate, then boot the single-threaded server (D2)."""
+        from ._proto import cambrian_pb2_grpc
         from .channel import build_channel
         from .runtime import start_agent_server
         from .server import _parse_listen_address, _parse_substrate_addr
-        from ._proto import cambrian_pb2_grpc
 
         # ADR-0130 D4: the one channel builder — TLS root and agent credential
         # from the environment, plaintext (warned once) on a loopback kernel.
@@ -261,99 +260,6 @@ class CognitiveAgent(Agent):
                     seen.add(attr_name)
                     out.append(cap)
         return sorted(out)
-
-
-#: Message for the DeterministicAgent deprecation. Module-level so tests can match it.
-_DETERMINISTIC_AGENT_DEPRECATION = (
-    "{name} subclasses DeterministicAgent, which is deprecated and will be removed once "
-    "the kernel drops trait \"tool\" (deprecated there by ADR-0039 A1.3). The kernel no "
-    "longer selects agents by static bid: default dispatch matches the capabilities an "
-    "agent's manifest declares (ADR-0100) and solicits no bids. Subclass CognitiveAgent "
-    "and override run() with the scripted logic, or implement the capability as a "
-    "kernel-owned tool invoked via ExecuteTool."
-)
-
-
-class DeterministicAgent(Agent):
-    """A scripted cell: typed ``run()`` only — no reasoning, memory, or tools.
-
-    Has no ``think()`` by construction (structural trait enforcement).
-
-    What ``trait = "tool"`` means to the kernel today: the agent skips the LLM
-    capability interview (its ``AGENT_DESCRIPTION`` is embedded directly) and is
-    never drafted as a verifier. It does NOT win the auction by bidding statically:
-    the kernel's Confidence=1.0 static-bid bypass was removed (ADR-0023), the kernel
-    marks ``"tool"`` deprecated in favour of kernel-owned tools invoked via
-    ExecuteTool (ADR-0039 A1.3), and default capability-typed dispatch solicits no
-    bids at all (ADR-0100). :meth:`propose` only answers if a caller still asks.
-    For a deterministic capability, prefer a kernel tool.
-
-    .. deprecated:: unreleased (after 0.1.5)
-        Owner decision 2026-10-31 (ticket
-        T-20261031-sdk-deterministicagent-still-advertises-trait). Defining a
-        subclass emits a :class:`DeprecationWarning` once per subclass (from
-        :meth:`__init_subclass__`, so instantiating does not repeat it). Use instead:
-
-        - :class:`CognitiveAgent` with ``run()`` overridden to hold the scripted
-          logic — the kernel's default dispatch picks agents by the capabilities their
-          manifest declares (ADR-0100), not by trait or bid. Note the trait change
-          does matter in two places: a ``"cognitive"`` agent goes through the kernel's
-          LLM capability interview and can be drafted as a verifier, which a
-          ``"tool"`` agent is not (kernel system agents are interview-exempt either
-          way). This is how ``example-agents/terminal_agent.py`` was migrated.
-        - a kernel-owned tool, invoked via ``ExecuteTool`` (ADR-0039 A1.3), when the
-          capability is a deterministic kernel function rather than an agent.
-
-        Behaviour is unchanged while deprecated: ``trait`` stays ``"tool"`` (the kernel
-        still parses it, skips the interview and excludes it from verifier pools) and
-        :meth:`propose` still returns the static bid. The class will be removed once the
-        kernel drops ``TraitTool`` (cambrian-core ``domain/agent.go``).
-    """
-
-    def __init_subclass__(cls, **kwargs) -> None:
-        super().__init_subclass__(**kwargs)
-        # stacklevel=3 attributes the warning to the module running the ``class``
-        # statement: frame 1 is this hook, frame 2 is ``ABCMeta.__new__`` (Agent is an
-        # ABC, and abc's metaclass __new__ is a Python frame), frame 3 is the author's
-        # module. That module is what Python's default filter checks: an agent run as
-        # ``python agent.py`` defines its class in __main__ and sees the warning;
-        # library imports do not unless warnings are enabled (pytest, -W default).
-        # tests/test_deterministic.py pins the attributed filename.
-        warnings.warn(
-            _DETERMINISTIC_AGENT_DEPRECATION.format(name=cls.__qualname__),
-            DeprecationWarning,
-            stacklevel=3,
-        )
-
-    trait = "tool"
-
-    #: The bid :meth:`propose` returns if a bid is solicited (issue 0036-07). The
-    #: kernel gives it no special weight; see the class docstring.
-    STATIC_CONFIDENCE = 1.0
-    STATIC_LATENCY_MS = 5
-
-    @abstractmethod
-    def run(self, task: "AgentTask") -> Union["AgentResult", dict, str, bytes]:
-        """Handle one task deterministically. Return a plain result."""
-        raise NotImplementedError
-
-    def propose(self, task: "AgentTask" = None):
-        """The fixed bid (Confidence=1.0, Latency=5ms) if one is solicited; the default
-        capability-typed dispatch (ADR-0100) does not solicit bids."""
-        from .types import ProposalResponse
-
-        return ProposalResponse(
-            confidence=self.STATIC_CONFIDENCE,
-            rationale="deterministic tool — static bid",
-            estimated_latency_ms=self.STATIC_LATENCY_MS,
-        )
-
-    def serve(self, address: Optional[str] = None) -> None:
-        """Boot the single-threaded AgentService server and block (D2)."""
-        from .runtime import start_agent_server
-        from .server import _parse_listen_address
-
-        start_agent_server(self, address or _parse_listen_address())
 
 
 class DaemonAgent(Agent):

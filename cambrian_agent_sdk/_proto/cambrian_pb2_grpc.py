@@ -49,11 +49,6 @@ class OrchestratorStub:
                 request_serializer=cambrian__pb2.MemoryRequest.SerializeToString,
                 response_deserializer=cambrian__pb2.MemoryResponse.FromString,
                 _registered_method=True)
-        self.ChatStream = channel.stream_stream(
-                '/cambrian.Orchestrator/ChatStream',
-                request_serializer=cambrian__pb2.Handoff.SerializeToString,
-                response_deserializer=cambrian__pb2.SymbiosisEvent.FromString,
-                _registered_method=True)
         self.SignalStream = channel.stream_stream(
                 '/cambrian.Orchestrator/SignalStream',
                 request_serializer=cambrian__pb2.Handoff.SerializeToString,
@@ -202,14 +197,6 @@ class OrchestratorServicer:
 
     def QueryMemory(self, request, context):
         """Shared LTM semantic query — proxied through Substrate with ACL enforcement
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def ChatStream(self, request_iterator, context):
-        """Bi-directional TUI shell stream. Upstream: user commands (Handoff).
-        Downstream: real-time telemetry envelope (SymbiosisEvent).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -515,11 +502,6 @@ def add_OrchestratorServicer_to_server(servicer, server):
                     request_deserializer=cambrian__pb2.MemoryRequest.FromString,
                     response_serializer=cambrian__pb2.MemoryResponse.SerializeToString,
             ),
-            'ChatStream': grpc.stream_stream_rpc_method_handler(
-                    servicer.ChatStream,
-                    request_deserializer=cambrian__pb2.Handoff.FromString,
-                    response_serializer=cambrian__pb2.SymbiosisEvent.SerializeToString,
-            ),
             'SignalStream': grpc.stream_stream_rpc_method_handler(
                     servicer.SignalStream,
                     request_deserializer=cambrian__pb2.Handoff.FromString,
@@ -727,33 +709,6 @@ class Orchestrator:
             '/cambrian.Orchestrator/QueryMemory',
             cambrian__pb2.MemoryRequest.SerializeToString,
             cambrian__pb2.MemoryResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def ChatStream(request_iterator,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.stream_stream(
-            request_iterator,
-            target,
-            '/cambrian.Orchestrator/ChatStream',
-            cambrian__pb2.Handoff.SerializeToString,
-            cambrian__pb2.SymbiosisEvent.FromString,
             options,
             channel_credentials,
             insecure,

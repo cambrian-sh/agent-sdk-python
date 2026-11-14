@@ -13,7 +13,7 @@ interview-prompts.md §1-2) and the behaviours it adds:
 - native final_answer ends the run with exactly its argument (no narration);
 - read-only system tools of one native turn run in parallel; a dangerous one does not;
 - the D14 memory-notes slot is a no-op without the RPC and frozen when present;
-- the legacy engine stays reachable behind the flag.
+- the retired legacy engine name warns and runs the default engine.
 """
 import json
 import logging
@@ -92,15 +92,15 @@ def test_each_tool_call_is_rendered_once():
     assert "<evidence source='tool:fetch' status='ok'>" in last
 
 
-def test_legacy_engine_is_reachable_behind_the_flag(monkeypatch):
+def test_removed_legacy_engine_warns_and_runs_the_default(monkeypatch, caplog):
+    # ENG-640 (owner decision 2026-11-15): the legacy WorkingMemory engine is deleted;
+    # an operator still setting the flag gets the default engine and a warning.
     monkeypatch.setenv("CAMBRIAN_CONTEXT_ENGINE", "legacy")
-    bot = Bot(agent_id="b")
-    bot.substrate = TextSub(_fetches(1) + [_act(action="final_answer", answer="ok")])
-    run_think(bot, AgentTask(text="t"))
-    last = bot.substrate.prompts[-1]
-    # The old layout: Task first, and the call rendered as a card AND a step.
-    assert last.startswith("<Task>")
-    assert last.count("tool='fetch'") == 2
+    with caplog.at_level(logging.WARNING, logger="cambrian.context"):
+        engine = ce.make_engine(None, config=ce.ContextConfig())
+    assert isinstance(engine, ce.DefaultContextEngine)
+    assert any("context_legacy_engine_removed" in r.getMessage() for r in caplog.records)
+    assert not hasattr(ce, "LegacyWorkingMemoryEngine")
 
 
 def test_task_comes_last_and_evidence_is_data():

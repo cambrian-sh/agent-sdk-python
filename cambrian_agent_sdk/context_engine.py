@@ -1,6 +1,6 @@
 """The context engine (ADR-0139 D3): what one agent run puts in front of the model.
 
-It replaces the entry-count, cosine-evicted :class:`working_memory.WorkingMemory`,
+It replaced the entry-count, cosine-evicted ``WorkingMemory`` (deleted 2026-11-15),
 which treated instructions like evidence: a loaded skill was cut to 240 chars and
 evicted after ~4 tool calls, while every tool call was rendered twice (a ToolCard
 and a Step). The engine is a pluggable interface (:class:`ContextEngine`); the
@@ -50,9 +50,9 @@ Every budget and threshold is a :class:`ContextConfig` field, resolved per run a
 ``run_think(context_config=...)`` > the agent's ``context_config`` attribute >
 ``CAMBRIAN_CONTEXT_<FIELD>`` env vars > the defaults below.
 
-The previous working memory stays reachable for one release behind
-``CAMBRIAN_CONTEXT_ENGINE=legacy`` (or ``agent.context_engine = "legacy"``), via
-:class:`LegacyWorkingMemoryEngine`.
+The previous entry-count working memory (``CAMBRIAN_CONTEXT_ENGINE=legacy``) was
+deleted on 2026-11-15 (owner decision); ``"legacy"`` now logs a warning and runs
+this engine.
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ import hashlib
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 from ._logging import safe_extra
@@ -72,7 +72,6 @@ from .working_memory import (
     EMPTY_RECALL_NOTE,
     Step,
     ToolCard,
-    WorkingMemory,
     _condense_args,
     _render_call_xml,
     _render_memory_results,
@@ -86,7 +85,8 @@ CHARS_PER_TOKEN = 4
 
 ENGINE_ENV = "CAMBRIAN_CONTEXT_ENGINE"
 ENGINE_DEFAULT = "default"
-ENGINE_LEGACY = "legacy"
+# ENGINE_REMOVED_LEGACY is the retired engine name: accepted, warned, ignored.
+ENGINE_REMOVED_LEGACY = "legacy"
 
 
 def estimate_tokens(text: Any) -> int:
@@ -120,6 +120,8 @@ def neutralise_closing_tags(text: str) -> str:
 # ──────────────────────────────────────────────────────────────────────
 
 _BOOL_FIELDS = frozenset({"phase2_enabled"})
+# The kernel-stamped handoff key prefix (domain.HandoffKeyContext*, ADR-0150 D10).
+_HANDOFF_PREFIX = "_context_"
 
 
 @dataclass
@@ -184,9 +186,38 @@ class ContextConfig:
         return cfg
 
     @classmethod
-    def resolve(cls, agent: Any = None, explicit: Any = None) -> "ContextConfig":
-        """``explicit`` > ``agent.context_config`` > env > defaults. Either source may
-        be a :class:`ContextConfig` or a dict of field overrides."""
+    def from_handoff(cls, context: Any, base: "ContextConfig") -> "ContextConfig":
+        """Apply the kernel-stamped ``_context_<field>`` handoff keys over ``base``.
+
+        ADR-0150 D10 / owner decision 2026-11-14
+        (T-20261105-context-engine-budgets-cannot-be-tuned-for): the kernel stamps
+        ``execution.lane.context`` on every handoff to an agent it spawns
+        (agentplane.Transport). Only integer fields are taken; a bad value is
+        logged and skipped, never fatal."""
+        cfg = dataclasses.replace(base)
+        ctx = dict(context or {})
+        for f in dataclasses.fields(cls):
+            raw = ctx.get(f"{_HANDOFF_PREFIX}{f.name}")
+            if raw is None or raw == "" or f.name in _BOOL_FIELDS:
+                continue
+            try:
+                setattr(cfg, f.name, int(raw))
+            except (TypeError, ValueError):
+                logger.warning("context_bad_handoff_key", extra={"field": f.name, "value": raw})
+        return cfg
+
+    @classmethod
+    def resolve(cls, agent: Any = None, explicit: Any = None, task: Any = None) -> "ContextConfig":
+        """The kernel's handoff (``task.context`` ``_context_*`` keys, from
+        ``execution.lane.context``) > ``explicit`` > ``agent.context_config`` > env >
+        defaults. ``explicit`` / ``agent.context_config`` may be a
+        :class:`ContextConfig` or a dict of field overrides.
+
+        The handoff wins because it is the operator's deployment config, as the lane's
+        tool-round cap replaces an agent's own default. The kernel serves the SAME
+        effective values as ``CAMBRIAN_CONTEXT_*`` env (execution.content with the lane
+        block's overrides), so env and handoff never disagree; the handoff carries
+        only the keys the lane block sets."""
         cfg = cls.from_env()
         for src in (getattr(agent, "context_config", None), explicit):
             if src is None:
@@ -201,6 +232,8 @@ class ContextConfig:
                         setattr(cfg, k, v)
                     else:
                         logger.warning("context_unknown_config_key", extra={"key": k})
+        if task is not None:
+            cfg = cls.from_handoff(getattr(task, "context", None), cfg)
         return cfg
 
 
@@ -237,7 +270,7 @@ class ContextEngine(Protocol):
 
     # read side
     def render_user_turn(self, *, task_text: str, step_no: int, notes: List[str],
-                         expected_output: str = "", acceptance: str = "") -> Optional[str]: ...
+                         expected_output: str = "", acceptance: str = "") -> str: ...
     def assemble(self, intent_vec: Optional[List[float]] = None, numbered: bool = False) -> str: ...
 
     # compaction
@@ -245,57 +278,6 @@ class ContextEngine(Protocol):
     def compact_conversation(self, conversation: List[Dict[str, Any]], fixed_tokens: int) -> bool: ...
     def pin_tool_call(self, tool_call_id: str) -> None: ...
     def resolve_local(self, cid: str) -> Optional[str]: ...
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Legacy adapter (one release, behind CAMBRIAN_CONTEXT_ENGINE=legacy)
-# ──────────────────────────────────────────────────────────────────────
-
-class LegacyWorkingMemoryEngine(WorkingMemory):
-    """The pre-D3 working memory behind the :class:`ContextEngine` interface.
-
-    Behaviour is unchanged: the 10-entry cosine cap, the R7 offloader, a ToolCard
-    plus a Step per tool call, no compaction, no memory-notes slot.
-    ``render_user_turn`` returns None, which tells ``build_prompt_parts`` to keep
-    the old Task + Trajectory layout.
-    """
-
-    def add_evidence(self, content: str, source: str = "") -> None:
-        self.add_text(content)
-
-    def add_seed_recall(self, query: str, results: list) -> None:
-        # Same rule as the default engine: an empty seed recall adds nothing, and
-        # the step's query attribute is capped by render_step_xml (short_query).
-        if not results:
-            return
-        self.add_step(kind="memory_query", query=query, status="ok", results=results)
-
-    def record_tool_call(self, card: ToolCard, body: str) -> None:
-        self.add_tool_card(card)
-        self.add_step(kind="tool_call", tool=card.tool, args=card.args, status=card.status,
-                      summary=card.summary, body=body, cid=card.cid or "", chars=len(body))
-
-    def set_memory_notes(self, text: str) -> None:
-        return None  # the legacy engine has no D14 slot
-
-    def instructions_tokens(self) -> int:
-        return sum(estimate_tokens(e.body) for e in self._entries
-                   if isinstance(e, Step) and e.kind == "use_skill")
-
-    def render_user_turn(self, **_kw) -> Optional[str]:
-        return None
-
-    def compact_prompt(self, prompt_tokens: int) -> bool:
-        return False
-
-    def compact_conversation(self, conversation, fixed_tokens: int) -> bool:
-        return False
-
-    def pin_tool_call(self, tool_call_id: str) -> None:
-        return None
-
-    def resolve_local(self, cid: str) -> Optional[str]:
-        return None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -717,7 +699,8 @@ class DefaultContextEngine:
         calls = [it for it in self._history if it.step is not None and it.step.kind == "tool_call"]
         cids = []
         for it in calls[:max(len(calls) - keep, 0)]:
-            if it.compacted_cid or it.step.cid or len(it.tool_body()) <= self.config.tool_output_compact_chars:
+            if (it.compacted_cid or (it.step is not None and it.step.cid)
+                    or len(it.tool_body()) <= self.config.tool_output_compact_chars):
                 continue
             self._compact_item(it)
             cids.append(it.compacted_cid)
@@ -902,14 +885,15 @@ def make_engine(kind: Any, *, config: ContextConfig, embed_fn=None, offload_fn=N
                 summariser: Optional[Summariser] = None):
     """Build the engine a run uses. ``kind`` is an engine instance, a factory
     ``(config, embed_fn, offload_fn, summariser) -> engine``, ``"default"`` or
-    ``"legacy"``; ``None`` reads ``CAMBRIAN_CONTEXT_ENGINE`` (default ``"default"``)."""
+    ``None`` reads ``CAMBRIAN_CONTEXT_ENGINE`` (default ``"default"``). The retired
+    ``"legacy"`` engine is gone: asking for it logs a warning and runs the default."""
     if kind is None:
         kind = os.getenv(ENGINE_ENV) or ENGINE_DEFAULT
     if isinstance(kind, str):
         k = kind.strip().lower()
-        if k == ENGINE_LEGACY:
-            return LegacyWorkingMemoryEngine(embed_fn=embed_fn, offload_fn=offload_fn)
-        if k not in (ENGINE_DEFAULT, ""):
+        if k == ENGINE_REMOVED_LEGACY:
+            logger.warning("context_legacy_engine_removed", extra={"engine": kind})
+        elif k not in (ENGINE_DEFAULT, ""):
             logger.warning("context_unknown_engine", extra={"engine": kind})
         return DefaultContextEngine(config, offload_fn=offload_fn, summariser=summariser,
                                     embed_fn=embed_fn)
@@ -967,7 +951,7 @@ def memory_notes_text(value: Any) -> str:
 
 __all__ = [
     "CHARS_PER_TOKEN", "ContextConfig", "ContextEngine", "DefaultContextEngine",
-    "LegacyWorkingMemoryEngine", "estimate_tokens", "make_engine", "memory_notes_text",
+    "estimate_tokens", "make_engine", "memory_notes_text",
     "neutralise_closing_tags",
 ]
 

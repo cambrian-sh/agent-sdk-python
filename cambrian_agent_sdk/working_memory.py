@@ -15,17 +15,22 @@ on the :class:`ToolCard` episodic buffer introduced here.
 
 The LLM remains a storage-less Central Executive (Baddeley); this is the memory
 it directs.
+
+Since 2026-11-15 (owner decision, T-20261105-remove-the-legacy-workingmemory-engine-and)
+this module holds only the entry types and renderers the ADR-0139 D3 context
+engine (``context_engine.py``) builds on: the entry-count, cosine-ranked
+``WorkingMemory`` buffer, its bounded assembly and the R4/R5 de-duplication were
+deleted with the legacy engine.
 """
 
 from __future__ import annotations
 
 import json
 import math
-import re
 import time
-from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional
+from datetime import datetime, timezone
+from typing import Any, List, Optional
 
 from .helpers import _esc  # v2: XML-escape for the rich trajectory renderer
 
@@ -356,7 +361,7 @@ def render_step_xml(s) -> str:
                 f" chars={s.chars!r}>\n"
                 f"    <summary>{_esc(s.summary or '(no summary — re-call or describe_tool)')}</summary>\n"
                 + cid_hint
-                + f"  </result>"
+                + "  </result>"
             )
         elif body and len(body) > _INLINE_BODY_CAP:
             # Body is large but no kernel offload. Show a truncated summary +
@@ -380,7 +385,7 @@ def render_step_xml(s) -> str:
                 f"    <summary>{_esc(s.summary or preview)}</summary>\n"
                 f"    <body_preview>{_esc(preview)}</body_preview>\n"
                 + offload_hint
-                + f"  </result>"
+                + "  </result>"
             )
         else:
             # Inline the full body. This is the default — and the path the
@@ -651,348 +656,18 @@ def action_text(tool: str, args: Any) -> str:
     return f"{tool} {a}"
 
 
-_TOOL_SPEC_RE = re.compile(r"<tool_spec name=['\"]?([^'\">\s]+)")
-
-
-def _tool_spec_name(content: str) -> Optional[str]:
-    """Extract the tool name from a ``<tool_spec name='X'>`` block (R4 detection),
-    matching the form ``react.describe_tool`` injects. Returns ``None`` otherwise."""
-    m = _TOOL_SPEC_RE.search(content)
-    return m.group(1) if m else None
-
-
-def _normalize_text(s: str) -> str:
-    """Whitespace-collapsed, lowercased form for near-duplicate comparison."""
-    return " ".join(s.split()).lower()
-
-
-def _near_duplicate(a: str, b: str, *, min_tokens: int = 30, overlap: float = 0.85) -> bool:
-    """True when two normalized text blocks are substantially the same content.
-
-    Conservative by design: only LARGE blocks (≥ ``min_tokens``) that are either
-    fully contained or share ≥ ``overlap`` of the shorter block's tokens are treated
-    as duplicates — so small distinct notes are never collapsed, but the
-    prior-step-result that arrives reordered via seed + recall + a later memory_query
-    (the triplication observed in <LTMContext>) is caught.
-    """
-    short, long = (a, b) if len(a) <= len(b) else (b, a)
-    if not short:
-        return False
-    if short in long:
-        return True
-    st = set(short.split())
-    if len(st) < min_tokens:
-        return False
-    lt = set(long.split())
-    return len(st & lt) / len(st) >= overlap
 
 
 def _cosine(a: Optional[List[float]], b: Optional[List[float]]) -> float:
     """Cosine similarity; -1.0 when either vector is missing/zero (ranks last)."""
     if not a or not b:
         return -1.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(y * y for y in b))
     if na == 0.0 or nb == 0.0:
         return -1.0
     return dot / (na * nb)
-
-
-class WorkingMemory:
-    """Ordered, typed working-memory buffers assembled into the prompt context.
-
-    For 0041-01 this is an ordered list of entries whose ``assemble()`` joins
-    their rendered forms with newlines — behavior-equivalent to the old
-    ``"\\n".join(scratch)`` — except tool results are :class:`ToolCard`s carrying
-    provenance. Later slices add bounding/relevance ranking (0041-03) over the
-    same entries.
-    """
-
-    def __init__(self, embed_fn: Optional[Callable[[str], Optional[List[float]]]] = None,
-                 cap: int = DEFAULT_CAP,
-                 offload_fn: Optional[Callable[[str], Optional[str]]] = None,
-                 text_inline_cap: int = DEFAULT_TEXT_INLINE_CAP) -> None:
-        self._entries: List[Any] = []
-        self._embed_fn = embed_fn
-        self._cap = cap
-        # R7: text -> cid offloader. When wired (needs a ContentStore WRITE path —
-        # only GetContextNode exists today), a large text block is replaced in the
-        # prompt by {gist + cid}, full text drill-downable. SAFE default: when None,
-        # large blocks render verbatim (no collapse without a retrieval path, so a
-        # later step that needs the full text — e.g. write_file — is never starved).
-        self._offload_fn = offload_fn
-        self._text_inline_cap = text_inline_cap
-        # v2: monotonic step counter; assigned by add_step.
-        self._next_n = 1
-
-    def _embed(self, text: str) -> Optional[List[float]]:
-        if self._embed_fn is None:
-            return None
-        try:
-            v = self._embed_fn(text)
-            return v or None
-        except Exception:  # noqa: BLE001 — degrade to recency ranking, never crash
-            return None
-
-    def add_text(self, content: str) -> None:
-        """Append a working-memory text block (workspace seed, memory result, note).
-
-        R7: a block over ``text_inline_cap`` is offloaded when an ``offload_fn`` is
-        wired — the prompt then carries {gist + cid} and the full text is drill-down
-        by cid. Without an offloader (no ContentStore write path yet) it renders
-        verbatim, so the full text is never dropped from a step that may need it.
-        Relevance is always embedded on the FULL content (richer ranking signal).
-        """
-        vec = self._embed(content)
-        if self._offload_fn is not None and len(content) > self._text_inline_cap:
-            cid = None
-            try:
-                cid = self._offload_fn(content)
-            except Exception:  # noqa: BLE001 — degrade to verbatim, never crash the loop
-                cid = None
-            if cid:
-                self._entries.append(TextEntry(
-                    content, vec=vec, cid=cid, summary=_summarize(content, max_chars=240)))
-                return
-        self._entries.append(TextEntry(content, vec=vec))
-
-    def add_skill(self, name: str, body: str, note: str = "") -> None:
-        """Append a loaded skill as a PINNED instruction entry (ADR-0139 D3, ADR-0046 D3).
-
-        Deliberately NOT :meth:`add_text`. A skill body over ``text_inline_cap`` went
-        through the R7 offloader there and reached the model as a 240-char head plus
-        a cid: a procedure cut off after its first step, with the grant note at the
-        end cut off too, so the model was never told it held the skill's tools. The
-        entry was also an ordinary rankable one, so ~4 tool calls later the cosine
-        ranking evicted it: "loaded for the rest of the run" held for four rounds.
-
-        A skill is an instruction, not evidence. It is stored verbatim, never
-        offloaded, never evicted and never deduplicated, and it does not count
-        against the trajectory's entry cap. The caller (``run_think``) owns the
-        total skill budget and refuses an overflowing load rather than truncating.
-
-        ``note`` (the "loaded; its tools ... are available" line) is its own pinned
-        entry, so the grant can never be lost with, or because of, the body.
-        """
-        self._entries.append(Step(kind="use_skill", n=self._next_n, skill=name,
-                                  body=(body or "").strip(), pinned=True))
-        self._next_n += 1
-        if note and note.strip():
-            self._entries.append(Step(kind="note", n=self._next_n, body=note.strip(),
-                                      pinned=True))
-            self._next_n += 1
-
-    def add_reflection(self, text: str) -> None:
-        """Append a verbal reflection (ADR-0052) as a PINNED working-memory entry.
-
-        A Reflexion-style lesson the loop extracts after the recurrence gate's
-        hard-veto (``react.run_think``): *why* the repeated action failed and *what*
-        to do differently. It is ``pinned`` so :meth:`assemble` keeps it every
-        subsequent turn regardless of bounding — the structural gate (which counts
-        duplicates) gains a *verbal* memory the LLM reads before its next attempt.
-        Embedded for relevance like any block; never offloaded (reflections are short).
-        """
-        clean = (text or "").strip()
-        if not clean:
-            return
-        # v2: a reflection is a Step(kind="reflection", pinned=True). The renderer
-        # produces ``<reflection n="N">...</reflection>``.
-        self.add_step(kind="reflection", body=clean, pinned=True)
-
-    def add_tool_card(self, card: ToolCard) -> None:
-        """Append a tool invocation card to the episodic buffer (embed once here)."""
-        if card.vec is None:
-            card.vec = self._embed(card.summary or card.tool)  # relevance vector (D2)
-        # Action vector (D4) — only failed cards are compared by the recurrence gate,
-        # so only they need it; saves an embed per successful call.
-        if card.status in ("error", "denied") and card.action_vec is None:
-            card.action_vec = self._embed(action_text(card.tool, card.args))
-        self._entries.append(card)
-
-    def add_step(self, kind: str, pinned: bool = False, **fields) -> None:
-        """Append a typed Step entry to the working memory (v2).
-
-        The kind field maps to the agent action. Other fields are passed to
-        the Step dataclass. The rich XML renderer in assemble() consumes these.
-        The step is auto-numbered (``n`` attribute on the rendered <step>) — the
-        caller-supplied ``n`` (if any) is ignored in favor of the monotonic counter
-        so the renderer's ``n`` is always sequential and unique within a run.
-        """
-        # Drop caller-supplied ``n``; the auto-counter is authoritative.
-        fields.pop("n", None)
-        step = Step(kind=kind, n=self._next_n, **fields)
-        # Mark reflections as pinned via a side-channel: a TextEntry with pinned=True
-        # would be needed for the assemble() pin logic, so we use a thin wrapper.
-        # The simplest path: if pinned, also stash a TextEntry mirror that the
-        # assemble() pin logic will find. This keeps backward compat with the
-        # text-entry pin mechanism while letting new code use the typed API.
-        self._next_n += 1
-        if pinned:
-            # The reflection block goes into the buffer twice: once as a Step (for
-            # the new rich renderer) and once as a TextEntry with pinned=True (for
-            # the assemble() pin logic). Cheap (~200 bytes) and keeps the
-            # pin logic unified.
-            block = f"<reflection>{fields.get('body', '').strip()}</reflection>"
-            self._entries.append(TextEntry(
-                block, vec=self._embed(block), pinned=True,
-            ))
-        self._entries.append(step)
-
-    @property
-    def cards(self) -> List[ToolCard]:
-        """The episodic buffer — the ordered tool invocation cards."""
-        return [e for e in self._entries if isinstance(e, ToolCard)]
-
-    def assemble(self, intent_vec: Optional[List[float]] = None, numbered: bool = False) -> str:
-        """Render a BOUNDED, relevance-ranked + pinned slice into the prompt (D2).
-
-        Up to ``cap`` entries reach the prompt — not the whole history — turning
-        per-turn prompt growth from O(N²) into ~O(k). Mandatory **pins** are always
-        kept regardless of relevance: any **open-failure** card (so the recurrence
-        gate keeps its evidence) and the **most recent** entry. Remaining slots are
-        filled by embedding-cosine similarity to the current intent; with no
-        ``intent_vec`` / embedder it degrades to recency. Selected entries render in
-        chronological order. (The originating task is always present in <Task>, so it
-        is not an entry here.)
-
-        ``numbered`` (legacy): prefixes each kept entry with its ordinal
-        ("1. ... 2. ...") — the v1 markdown-numbered form. Default (``numbered=False``)
-        uses the v2 rich XML with ``n`` attributes on each ``<step>`` block.
-
-        v2 renderer: each entry is rendered through :func:`render_entry_xml`, which
-        dispatches to :func:`render_step_xml` for :class:`Step` entries and to the
-        existing legacy renderers for :class:`ToolCard` / :class:`TextEntry` (for
-        backward compat with code that still uses the old API).
-        """
-        n = len(self._entries)
-        # ADR-0139 D3: pinned Steps (loaded skills + their grant notes) are the
-        # INSTRUCTIONS region. They are always kept and do not consume the cap, which
-        # bounds evidence/history entries only; otherwise five loaded skills plus
-        # their notes would fill the whole window and starve the trajectory.
-        instr = {i for i, e in enumerate(self._entries) if isinstance(e, Step) and e.pinned}
-        if n - len(instr) <= self._cap:
-            idxs = self._dedup(list(range(n)))
-            return self._render(idxs, self._collapse_superseded(idxs), numbered)
-
-        pinned = {n - 1}  # the most recent entry
-        for i, e in enumerate(self._entries):
-            if isinstance(e, ToolCard) and e.status in ("error", "denied"):
-                pinned.add(i)  # open-failure cards
-            elif isinstance(e, TextEntry) and e.pinned:
-                pinned.add(i)  # ADR-0052: verbal reflections — never bounded out
-
-        rankable = [i for i in range(n) if i not in pinned and i not in instr]
-        if intent_vec:
-            rankable.sort(key=lambda i: _cosine(getattr(self._entries[i], "vec", None), intent_vec),
-                          reverse=True)
-        else:
-            rankable.sort(reverse=True)  # recency fallback: most recent first
-
-        keep = set(pinned - instr)
-        for i in rankable:
-            if len(keep) >= self._cap:
-                break
-            keep.add(i)
-        keep |= instr  # instructions region: outside the cap, never bounded out
-        idxs = self._dedup(sorted(keep))
-        return self._render(idxs, self._collapse_superseded(idxs), numbered)
-
-    def _dedup(self, idxs: List[int]) -> List[int]:
-        """Drop later TEXT entries whose content is largely already present in an
-        earlier kept entry (ADR-0041 D3). The same prior-step result reaches the
-        prompt via the workspace seed, the mandatory recall, AND later memory_query
-        results — 2–3 near-identical copies that bloat <LTMContext>. Keeps the first
-        occurrence (chronological), preserving order. Tool cards are never deduped —
-        each invocation is distinct provenance the recurrence gate may need.
-
-        v2: dispatch on entry type — Step entries render through the v2 rich
-        renderer; ToolCard / TextEntry use their own .render() (legacy path).
-        """
-        kept_norms: List[str] = []
-        out: List[int] = []
-        for i in idxs:
-            e = self._entries[i]
-            if isinstance(e, ToolCard):
-                out.append(i)
-                continue
-            # v2: Step entries don't have a .render() — go through the dispatcher.
-            if isinstance(e, Step):
-                # Skip dedup for typed Steps — each is a discrete action round.
-                # The dedup target is the legacy ``<memory>`` triplication (seed +
-                # recall + later memory_query) which the v2 typed path already
-                # deduplicates by design (each round is a discrete Step).
-                out.append(i)
-                continue
-            norm = _normalize_text(e.render())
-            if norm and any(_near_duplicate(norm, prev) for prev in kept_norms):
-                continue
-            kept_norms.append(norm)
-            out.append(i)
-        return out
-
-    def _collapse_superseded(self, idxs: List[int]) -> dict:
-        """Replace entries made moot by a LATER event with one-line markers (R7/D7).
-
-        Returns ``{idx: marker}`` applied at render time only — the buffer (and the
-        recurrence gate's evidence) is untouched. Two cases:
-
-        - **R4 (consumed tool spec):** a ``<tool_spec name='X'>`` block whose tool X
-          was subsequently called collapses **immediately** (the spec did its job).
-        - **R5 (superseded failures):** failed cards for an action that a later card
-          *succeeded* collapse, with **one turn of hysteresis** — kept while the
-          success is the most-recent entry (just happened), collapsed once older.
-        """
-        overrides: dict = {}
-        cards = [(i, self._entries[i]) for i in idxs if isinstance(self._entries[i], ToolCard)]
-        last = idxs[-1] if idxs else -1
-
-        # R4 — a fetched spec whose tool was later called.
-        for i in idxs:
-            e = self._entries[i]
-            if isinstance(e, TextEntry):
-                name = _tool_spec_name(e.content)
-                if name and any(c.tool == name and ci > i for ci, c in cards):
-                    overrides[i] = f"<note>spec for {name!r} consumed</note>"
-
-        # R5 — failed cards superseded by a later success of the same action.
-        succeeded: dict = {}  # action signature -> earliest success index
-        for ci, c in cards:
-            if c.status == "ok":
-                succeeded.setdefault(action_text(c.tool, c.args), ci)
-        for ci, c in cards:
-            if c.status in ("error", "denied"):
-                succ_idx = succeeded.get(action_text(c.tool, c.args))
-                # collapse only once the success is no longer the most-recent entry
-                # (one-turn hysteresis — let the agent reason about the failure first).
-                if succ_idx is not None and succ_idx > ci and succ_idx != last:
-                    overrides[ci] = f"<note>{c.tool!r} failed, then succeeded</note>"
-        return overrides
-
-    def _render(self, idxs, overrides: Optional[dict] = None, numbered: bool = False) -> str:
-        """Render the kept slice through the v2 rich XML renderer.
-
-        For :class:`Step` entries: ``render_step_xml(s)`` (the new format).
-        For :class:`ToolCard` entries: ``render_entry_xml(card)`` converts the
-        card to a Step and renders (one call per card, cheap).
-        For :class:`TextEntry` entries: ``render_entry_xml(entry)`` — renders
-        inline for plain notes, ``<offloaded>`` for offloaded payloads.
-        For superseded entries (R4/R5): the override marker is used as-is.
-        """
-        overrides = overrides or {}
-        items = []
-        for i in idxs:
-            if i in overrides:
-                items.append(overrides[i])
-                continue
-            entry = self._entries[i]
-            items.append(render_entry_xml(entry, numbered=numbered))
-        if numbered:
-            return "\n".join(f"{n}. {s}" for n, s in enumerate(items, 1))
-        return "\n".join(items)
-
-    def __len__(self) -> int:
-        return len(self._entries)
 
 
 def render_entry_xml(entry: Any, numbered: bool = False) -> str:

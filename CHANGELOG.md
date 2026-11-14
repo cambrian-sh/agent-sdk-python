@@ -5,6 +5,15 @@ described by their git history.
 
 ## Unreleased
 
+### Changed
+
+- **Memory reads present the running task's lease by default** (ENG-518, owner decision
+  2026-11-14). `MemoryClient.recall` / `recall_actions` / `recall_entity` called without
+  `session_token_id` inside a task now send the lease the kernel dispatched that task under
+  (bound by the runtime around `run()`). A kernel on an authenticated deployment refuses a
+  lease-less agent-plane memory read (`no_lease`); an explicit `session_token_id` still wins,
+  and outside a task nothing is sent.
+
 ### Added
 
 - **Structured managed generation** (ADR-0139 C1, wave 1d). `SubstrateClient.generate_request(
@@ -96,6 +105,20 @@ described by their git history.
   labelled as prior transitions. Use `recall()` for facts.
 
 ### Removed
+
+- **`HTTPChatIngress`** (owner decision 2026-11-14, ENG-1449; deprecated since ADR-0142
+  K-5). It was an unauthenticated loopback HTTP chat endpoint: anyone who could reach its
+  port spoke as every conversation it served. Its only consumer, the airline benchmark
+  driver, now drives conversations through the authenticated operator plane
+  (`OpenConversation` / `SendTurn`). A person or harness talks to Cambrian through that
+  plane; a transceiver entry point subclasses `IngressAgent`.
+
+- **`DeterministicAgent`** and the agent trait **`"tool"`** (owner decision 2026-11-14,
+  ENG-1351; deprecated since 2026-10-31). No agent in any repository used them. A scripted
+  capability subclasses `CognitiveAgent` and overrides `run()`, or becomes a kernel-owned
+  tool invoked via `ExecuteTool`. The kernel now refuses a manifest declaring
+  `"trait": "tool"` (the agent is not registered) and migrates registry records stored
+  with it.
 
 - **The `recall_precedents` ReAct action** (same decision). The action protocol
   (`prompts/react-action-protocol/v1.md`, text and native variants) no longer advertises

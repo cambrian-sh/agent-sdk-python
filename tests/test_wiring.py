@@ -8,14 +8,13 @@ classes and import no Handoff / Payload / proto type.
 import os
 
 from cambrian_agent_sdk import (
-    AgentTask,
     CognitiveAgent,
     DaemonAgent,
     MemoryClient,
+    SubstrateClient,
 )
-from cambrian_agent_sdk import SubstrateClient
-from cambrian_agent_sdk.clients import ArtifactManager
 from cambrian_agent_sdk._proto import cambrian_pb2 as pb
+from cambrian_agent_sdk.clients import ArtifactManager
 
 
 class _FakeStub:
@@ -73,7 +72,8 @@ def test_tutorial_is_cognitive_and_daemon_is_daemon():
     import sys
 
     sys.path.insert(0, os.path.abspath(os.path.join(_SDK_DIR, "examples")))
-    import pulse_agent, tool_tutorial_agent
+    import pulse_agent
+    import tool_tutorial_agent
 
     assert isinstance(tool_tutorial_agent.agent, CognitiveAgent)
     assert sorted(tool_tutorial_agent.agent.tools.names()) == ["add", "divide", "multiply", "subtract"]

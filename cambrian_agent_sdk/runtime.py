@@ -17,17 +17,26 @@ from __future__ import annotations
 import logging
 import signal
 import sys
-import time
 from concurrent import futures
-from typing import TYPE_CHECKING, Union
+from typing import Any, Protocol, Union
 
-from .types import AgentResult, AgentTask, ContextRef
 from .errors import BudgetExceededError
-
-if TYPE_CHECKING:
-    from .base import Agent
+from .types import AgentResult, AgentTask, ContextRef
 
 logger = logging.getLogger("cambrian.runtime")
+
+
+class ServableAgent(Protocol):
+    """What the AgentService boundary needs from an agent: an id and ``run``.
+
+    ``base.Agent`` itself declares no ``run`` (a DaemonAgent has none; it is served
+    over SignalStream, never here), so the AgentService path is typed by this
+    protocol: CognitiveAgent and IngressAgent satisfy it.
+    """
+
+    agent_id: str
+
+    def run(self, task: AgentTask) -> Any: ...
 
 #: D2 keystone — one request at a time per process. Do not raise this; throughput is
 #: a process-count axis, not a thread-count one. The invariant survives a future async
@@ -126,11 +135,15 @@ def _handoff_from_result(result: AgentResult, request, agent_id: str):
     )
 
 
-def dispatch_run(agent: "Agent", task: AgentTask) -> AgentResult:
+def dispatch_run(agent: ServableAgent, task: AgentTask) -> AgentResult:
     """Call the agent's run() and coerce, mapping a principled budget refusal to a
     ``budget_signal`` result (the DAGExecutor distinguishes it from incapability)."""
+    from .clients import task_lease
+
     try:
-        return _coerce_agent_result(agent.run(task))
+        # ENG-518: memory reads made inside run() present this task's lease by default.
+        with task_lease(getattr(task, "session_token_id", "") or ""):
+            return _coerce_agent_result(agent.run(task))
     except BudgetExceededError as e:
         return AgentResult(data=f"BUDGET_EXCEEDED:{e.reason}".encode(), type="budget_signal", confidence=0.0)
 
@@ -147,7 +160,7 @@ DEPRECATED_PROPOSAL_RATIONALE = "deprecated: capability-typed dispatch solicits 
 class TraitServicer:
     """Routes inbound AgentService RPCs to a trait agent's run() over the D3 boundary."""
 
-    def __init__(self, agent: "Agent") -> None:
+    def __init__(self, agent: ServableAgent) -> None:
         self._agent = agent
 
     def RequestProposal(self, request, context):
@@ -191,7 +204,7 @@ class TraitServicer:
         return _handoff_from_result(result, request, self._agent.agent_id)
 
 
-def start_agent_server(agent: "Agent", address: str) -> None:
+def start_agent_server(agent: ServableAgent, address: str) -> None:
     """Boot a single-threaded AgentService server for a trait agent and block (D2)."""
     import grpc
 

@@ -16,11 +16,10 @@ from cambrian_agent_sdk import (
     CognitiveAgent,
     SubstrateClient,
     capability_missing,
+    react,
 )
-from cambrian_agent_sdk import react
-from cambrian_agent_sdk.composition import Composition, ComposedScopedSubstrate
+from cambrian_agent_sdk.composition import ComposedScopedSubstrate, Composition
 from cambrian_agent_sdk.runtime import _handoff_from_result
-
 
 # ── types.capability_missing ────────────────────────────────────────────────
 

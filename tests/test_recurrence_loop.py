@@ -14,7 +14,7 @@ returns the same body on every ``execute_tool`` call.
 """
 import json
 
-from cambrian_agent_sdk import AgentResult, AgentTask, CognitiveAgent
+from cambrian_agent_sdk import AgentTask, CognitiveAgent
 from cambrian_agent_sdk.react import run_think
 
 
@@ -125,7 +125,7 @@ def test_run_think_distinguishes_different_tool_names_with_same_args():
     sub = _AlwaysOkLLM(responses, tool_result={"content": "x" * 200})
     bot = Bot(agent_id="b")
     bot.substrate = sub
-    res = run_think(bot, AgentTask(text="x"))
+    run_think(bot, AgentTask(text="x"))
     # Both calls run (they are different tools).
     assert sub.tool_calls == 2
     # But neither is blocked by ALREADY DONE (different tools).

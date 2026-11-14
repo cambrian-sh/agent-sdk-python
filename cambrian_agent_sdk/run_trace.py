@@ -223,7 +223,8 @@ def _messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def _tool_call_part(c: Any) -> Dict[str, Any]:
     if not isinstance(c, dict):
         return {"type": "tool_call", "content": str(c)}
-    fn = c.get("function") if isinstance(c.get("function"), dict) else {}
+    fn_raw = c.get("function")
+    fn: Dict[str, Any] = fn_raw if isinstance(fn_raw, dict) else {}
     return {"type": "tool_call", "id": c.get("id", ""), "name": c.get("name") or fn.get("name", ""),
             "arguments": c.get("arguments", fn.get("arguments", ""))}
 

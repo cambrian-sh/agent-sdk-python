@@ -4,10 +4,7 @@ import json
 import sys
 import unittest.mock as mock
 
-import pytest
-
-from cambrian_agent_sdk.server import is_daemon_mode, _parse_daemon_cli
-
+from cambrian_agent_sdk.server import _parse_daemon_cli, is_daemon_mode
 
 # ── is_daemon_mode ────────────────────────────────────────────────────────────
 

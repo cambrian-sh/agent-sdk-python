@@ -32,7 +32,7 @@ loop can call **memory** (`memory_query` for facts), **tools** (`tool_call` — 
 ## Agent shapes
 
 - **`CognitiveAgent`** — LLM reasoning: `run()` → `think()` ReAct loop, memory, and `@tool` actions.
-- **`DeterministicAgent`** — *deprecated.* A scripted cell: typed `run()` only, no reasoning.
+- ~~`DeterministicAgent`~~ — *deleted 2026-11-14.* A scripted capability subclasses `CognitiveAgent` and overrides `run()`.
   Subclassing it emits a `DeprecationWarning`: the kernel no longer selects agents by static
   bid (default dispatch matches the capabilities your manifest declares) and has deprecated
   trait `"tool"`. Subclass `CognitiveAgent` and override `run()` with your scripted logic

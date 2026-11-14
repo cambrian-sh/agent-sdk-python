@@ -6,7 +6,7 @@ never issued memory_query because the schema listed the actions without
 explaining what they were for or when to use them.
 """
 
-from cambrian_agent_sdk.react import build_output_schema, _render_recall
+from cambrian_agent_sdk.react import _render_recall, build_output_schema
 
 
 class _FakeRegistry:
@@ -199,6 +199,7 @@ def test_recall_surfaces_summary_and_content_cid():
     # ADR-0048 #1: recall serves the SUMMARY plus the cid of the full body, so the
     # agent reads the gist and can drill down rather than ingesting the whole fact.
     import json as _json
+
     from cambrian_agent_sdk.react import _format_memory
     results = [{
         "text": "Web search results listing the world's longest rivers.",

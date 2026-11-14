@@ -201,7 +201,7 @@ def test_sanitized_names_do_not_collide():
     ])
     names = [d["name"] for d in defs]
     assert len(set(names)) == len(names), f"collision: {names}"
-    for safe, original in name_map.items():
+    for safe in name_map:
         assert safe in names
     # The three colliding system tools stay distinguishable alongside the built-in
     # discovery tools.

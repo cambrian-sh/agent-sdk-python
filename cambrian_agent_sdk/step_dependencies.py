@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Iterable, List, Mapping, Set
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Set
 
 logger = logging.getLogger("cambrian.step_dependencies")
 
@@ -75,7 +75,10 @@ def _omitted_pages(d: Mapping[str, Any]) -> str:
     """The ledger pages the omitted range spans, as "a" or "a–b" ("" if unknown)."""
     try:
         size = int(d.get("page_bytes") or 0)
-        lo, hi = int(d.get("omitted_from")), int(d.get("omitted_to"))
+        frm, to = d.get("omitted_from"), d.get("omitted_to")
+        if frm is None or to is None:
+            return ""
+        lo, hi = int(frm), int(to)
     except (TypeError, ValueError):
         return ""
     if size <= 0 or hi <= lo:
@@ -120,7 +123,7 @@ def _render_head_tail(d: Mapping[str, Any], head: str) -> str:
     return "\n".join(out)
 
 
-def render_step_dependencies(deps: List[Mapping[str, Any]]) -> str:
+def render_step_dependencies(deps: Sequence[Mapping[str, Any]]) -> str:
     """Render the manifest as an ``<upstream_results>`` evidence block ("" if none)."""
     if not deps:
         return ""

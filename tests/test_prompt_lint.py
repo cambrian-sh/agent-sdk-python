@@ -78,7 +78,7 @@ def test_sdk_prompts_load():
 def test_sdk_prompt_style(prompt):
     failures, warns = lint_body(prompt.body)
     for w in warns:
-        warnings.warn(f"{prompt.id}/v{prompt.version}: {w}")
+        warnings.warn(f"{prompt.id}/v{prompt.version}: {w}", stacklevel=2)
     assert not failures, failures
 
 

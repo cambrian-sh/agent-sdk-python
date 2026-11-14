@@ -13,13 +13,12 @@ import json
 import logging
 import signal
 import sys
-import time
 from typing import TYPE_CHECKING
 
 import grpc
 
 if TYPE_CHECKING:  # annotation only; base imports this module at run time
-    from .base import Agent
+    from .base import DaemonAgent
 
 logger = logging.getLogger("cambrian.server")
 
@@ -109,7 +108,7 @@ def _parse_daemon_cli() -> tuple[str, str, dict]:
     return stream_id, substrate_addr, params
 
 
-def start_daemon(agent: "Agent") -> None:
+def start_daemon(agent: "DaemonAgent") -> None:
     """Start the agent in daemon mode — opens a persistent SignalStream instead
     of an AgentService gRPC server. ADR-0033.
 
@@ -156,7 +155,8 @@ def start_daemon(agent: "Agent") -> None:
         """Enqueue a signal for emission on the open SignalStream."""
         _signal_queue.put((payload, raw_text))
 
-    agent.send_signal = _send_signal
+    # Rebinds the instance's send_signal to this stream's queue on purpose.
+    agent.send_signal = _send_signal  # type: ignore[method-assign]
 
     max_retries = 5
     retry = 0

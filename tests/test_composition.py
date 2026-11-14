@@ -1,8 +1,7 @@
 """ADR-0145 D12: the composed runtime's substrate view (cambrian_agent_sdk.composition)."""
 import json
 
-from cambrian_agent_sdk.composition import (COMPOSITION_KEY, ComposedScopedSubstrate, Composition,
-                                            composition_from_task)
+from cambrian_agent_sdk.composition import COMPOSITION_KEY, ComposedScopedSubstrate, Composition, composition_from_task
 from cambrian_agent_sdk.types import AgentTask
 
 

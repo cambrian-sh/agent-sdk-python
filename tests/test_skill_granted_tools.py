@@ -13,8 +13,7 @@ must still offer it, because ListSkills returned it as granted.
 """
 import json
 
-from cambrian_agent_sdk import AgentTask, CognitiveAgent
-from cambrian_agent_sdk import react
+from cambrian_agent_sdk import AgentTask, CognitiveAgent, react
 
 _WRITE = "mcp:fs/write_file"          # standing grant: describable via list_tools(names)
 _OVERLAY = "mcp:fs/overlay_only"       # conferred by the skill only: not describable

@@ -35,11 +35,47 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
 import threading
-from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from .base import Agent, CognitiveAgent, DaemonAgent
+from .clients import (
+    TIME_PRECISIONS,
+    TIME_SOURCES,
+    ArtifactManager,
+    ArtifactNotFound,
+    InvalidTagError,
+    MemoryClient,
+    SelfDelegationError,
+    WorkingMemory,
+    _lease_metadata,
+)
+from .context_engine import ContextConfig, ContextEngine, DefaultContextEngine
+from .errors import (
+    BudgetExceededError,
+    ContextOverflow,
+    GenerateError,
+    GenerationResourceExhausted,
+    InvalidRequest,
+    ModelUnavailable,
+    SchemaValidationFailed,
+    ToolCallingUnsupported,
+)
+from .execute_result import ExecuteResult
+from .helpers import PromptParts, build_prompt, build_prompt_parts, extract_code_block, find_step_ref
+from .ingress import IngressAgent, PermanentDeliveryError
+from .llm import (
+    CACHE_TTL_LONG,
+    CACHE_TTL_SHORT,
+    GenerateResult,
+    GenerateUsage,
+    ResponseSchema,
+    SystemBlock,
+)
+from .react import ReActLoopError
+from .tools import ToolRegistry, ToolSpec, capability, tool
 from .types import (
+    CAPABILITY_MISSING_RESULT_TYPE,
     AgentResult,
     AgentTask,
     Capability,
@@ -54,57 +90,17 @@ from .types import (
     SubGoal,
     VerifyRequest,
     VerifyResponse,
-    yield_subgoal,
     capability_missing,
-    CAPABILITY_MISSING_RESULT_TYPE,
-)
-from .base import Agent, CognitiveAgent, DeterministicAgent, DaemonAgent
-from .ingress import IngressAgent, PermanentDeliveryError
-from .http_chat_ingress import HTTPChatIngress
-from .tools import tool, capability, ToolRegistry, ToolSpec
-from .react import ReActLoopError
-from .execute_result import ExecuteResult
-from .context_engine import ContextConfig, ContextEngine, DefaultContextEngine
-from .clients import (
-    _lease_metadata,
-    ArtifactManager,
-    ArtifactNotFound,
-    InvalidTagError,
-    MemoryClient,
-    SelfDelegationError,
-    TIME_PRECISIONS,
-    TIME_SOURCES,
-    WorkingMemory,
-)
-from .helpers import extract_code_block, find_step_ref, build_prompt, build_prompt_parts, PromptParts
-from .errors import (
-    BudgetExceededError,
-    ContextOverflow,
-    GenerateError,
-    GenerationResourceExhausted,
-    InvalidRequest,
-    ModelUnavailable,
-    SchemaValidationFailed,
-    ToolCallingUnsupported,
-)
-from .llm import (
-    CACHE_TTL_LONG,
-    CACHE_TTL_SHORT,
-    GenerateResult,
-    GenerateUsage,
-    ResponseSchema,
-    SystemBlock,
+    yield_subgoal,
 )
 
 __all__ = [
     # ADR-0036 v2 trait-aligned surface
     "Agent",  # abstract base
     "CognitiveAgent",
-    "DeterministicAgent",
     "DaemonAgent",
     "IngressAgent",
     "PermanentDeliveryError",
-    "HTTPChatIngress",
     "AgentTask",
     "AgentResult",
     "SubGoal",
@@ -294,8 +290,15 @@ def _map_generate_error(exc, *, tools: bool):
     back to the prompt-encoded action protocol, deliberately distinct from every
     real failure so an outage never silently downgrades a run."""
     import grpc
-    from .errors import (ContextOverflow, GenerateError, GenerationResourceExhausted,
-                         InvalidRequest, ModelUnavailable, SchemaValidationFailed)
+
+    from .errors import (
+        ContextOverflow,
+        GenerateError,
+        GenerationResourceExhausted,
+        InvalidRequest,
+        ModelUnavailable,
+        SchemaValidationFailed,
+    )
     try:
         code = exc.code()
         details = exc.details() or ""
@@ -343,7 +346,7 @@ class SubstrateClient:
 
     def __init__(self, substrate_addr: str = "localhost:50051", stub=None, agent_id: str = "") -> None:
         self._addr = substrate_addr
-        self._channel = None
+        self._channel: Optional[Any] = None  # grpc.Channel once dialled
         self._stub = stub  # injectable for tests; otherwise lazily dialed
         self._agent_id = agent_id
         self._lock = threading.Lock()
@@ -438,6 +441,7 @@ class SubstrateClient:
         """
         self._ensure()
         import grpc
+
         from ._proto import cambrian_pb2
         from .llm import GenerateResult as _Result
 
@@ -514,8 +518,7 @@ class SubstrateClient:
         is never read twice; an older kernel still gets the whole text (without the
         cache breakpoint).
         """
-        from .llm import (coerce_cache_ttl, coerce_messages, coerce_response_schema,
-                          coerce_system, flatten_prompt)
+        from .llm import coerce_cache_ttl, coerce_messages, coerce_response_schema, coerce_system, flatten_prompt
         blocks = coerce_system(system)
         msgs = coerce_messages(messages)
         schema = coerce_response_schema(response_schema)
@@ -587,9 +590,10 @@ class SubstrateClient:
         """
         self._ensure()
         import grpc
+
         from ._proto import cambrian_pb2
-        from .llm import (GenerateResult as _Result, coerce_cache_ttl, coerce_messages,
-                          coerce_response_schema, coerce_system)
+        from .llm import GenerateResult as _Result
+        from .llm import coerce_cache_ttl, coerce_messages, coerce_response_schema, coerce_system
 
         blocks = coerce_system(system)
         msgs = coerce_messages(messages)
@@ -721,6 +725,9 @@ class SubstrateClient:
             "error": resp.error,
             "arg_hash": resp.arg_hash,
             "result_hash": resp.result_hash,
+            # ADR-0139 D11 hook context, carried beside the result (contract 0104);
+            # an older kernel sends none.
+            "annotations": list(getattr(resp, "annotations", []) or []),
         }
 
     def embed(self, text: str) -> List[float]:
@@ -1109,7 +1116,10 @@ class SubstrateClient:
 
         Give exactly one of ``cron`` (5 fields or @daily/@weekly/...) or ``rrule``
         (FREQ=HOURLY|DAILY|WEEKLY|MONTHLY with BYHOUR/BYMINUTE/BYDAY/BYMONTHDAY).
-        ``delivery`` is ``conversation`` (default), ``notify`` or ``email``. Returns
+        ``delivery`` is ``conversation`` (default), ``notify`` or ``email``.
+        ``agent_id`` is DEPRECATED: leave it empty — the task always runs as its
+        owner on the chat lane, and the kernel refuses a non-empty value as
+        ``invalid``. Returns
         ``{"created": True, "task": {...}}`` once approved, or ``{"created": False,
         "rejection": "invalid"|"limit"|"too_frequent"|"denied"|"no_decision"|
         "no_principal", "detail": ...}``; None when the kernel has no scheduled tasks.

@@ -8,8 +8,8 @@ module refuses, so the two must agree on every case: a profile the kernel regist
 the runtime refused would be an agent that is routed to and never answers. Error text is
 not compared, only the verdict and the parsed fields.
 """
-import json
 import fnmatch
+import json
 from pathlib import Path
 
 import pytest

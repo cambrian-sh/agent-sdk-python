@@ -10,12 +10,9 @@ offloader, so none of this was visible to CI.
 """
 import json
 
-from cambrian_agent_sdk import AgentTask, CognitiveAgent, tool
-from cambrian_agent_sdk import react
+from cambrian_agent_sdk import AgentTask, CognitiveAgent, react, tool
 from cambrian_agent_sdk.helpers import default_anti_patterns, default_constraints
 from cambrian_agent_sdk.reflection import build_reflection_prompt
-from cambrian_agent_sdk.working_memory import WorkingMemory
-
 
 # A real-sized procedure: ~3k chars, with a sentinel at the END so a head cut is caught.
 _STEPS = "".join(
@@ -88,15 +85,6 @@ def test_big_skill_body_survives_offloader_and_many_tool_calls():
     assert not any("SKILL-TAIL-7f3a" in t for t in bot.substrate.offloaded)
 
 
-def test_pinned_skill_is_kept_by_assemble_and_not_counted_against_the_cap():
-    wm = WorkingMemory(cap=3, offload_fn=lambda t: "cid-x")
-    wm.add_skill("audit", _BIG_BODY, "Loaded skill 'audit'.")
-    for i in range(10):
-        wm.add_text(f"<note>filler {i}</note>")
-    out = wm.assemble()
-    assert _BIG_BODY in out and "Loaded skill" in out
-    # The cap still bounds the evidence/history entries: 3 of the 10 fillers.
-    assert sum(f"filler {i}<" in out for i in range(10)) == 3
 
 
 def test_overflowing_skill_is_refused_whole_never_truncated(monkeypatch):
