@@ -67,6 +67,23 @@ class PermanentDeliveryError(Exception):
     """
 
 
+class RateLimitedError(Exception):
+    """Raised by ``on_deliver`` or ``on_progress`` when the far side rate-limited us
+    and said how long to wait — Telegram's 429 ``parameters.retry_after``, an HTTP
+    ``Retry-After``.
+
+    It is a TRANSIENT failure (never permanent), reported to the kernel with
+    ``retry_after`` in seconds. For progress this is the one failure that is not
+    swallowed: the kernel's progress bridge widens its interval to at least
+    ``retry_after`` instead of editing into the limit every few seconds
+    (ADR-0098 D4).
+    """
+
+    def __init__(self, message: str, retry_after: float):
+        super().__init__(message)
+        self.retry_after = float(retry_after)
+
+
 class IngressAgent(Agent):
     """Base class for an entry point into Cambrian.
 
@@ -164,7 +181,9 @@ class IngressAgent(Agent):
 
         Best-effort by contract: raising here is tolerated but pointless — the kernel does
         not retry progress, because by the time a retry landed the snapshot would already
-        be stale and superseded.
+        be stale and superseded. The one exception worth raising is
+        :class:`RateLimitedError`: it is reported back with its ``retry_after`` so the
+        kernel sends the next snapshot no sooner than the channel asked.
         """
         return None
 
@@ -180,10 +199,19 @@ class IngressAgent(Agent):
 
         if kind == PROGRESS_KIND:
             # Progress is fire-and-forget and must never fail the turn it describes, so a
-            # rendering error is logged and acknowledged rather than reported back.
+            # rendering error is logged and acknowledged rather than reported back — except
+            # a rate limit, which is reported (transient, with retry_after) so the kernel's
+            # progress bridge slows down instead of editing into the limit
+            # (ADR-0098 D4, T-20261113-progress-back-off-never-widens-on-a-telegram). A
+            # progress failure never reaches the turn: only the bridge reads it.
             try:
                 self.on_progress(body.get("recipient", ""), body.get("text", ""),
                                  body.get("conversation_id", ""), bool(body.get("final", False)))
+            except RateLimitedError as exc:
+                logger.debug("ingress %s: progress rate-limited for %.1fs: %s",
+                             self.agent_id, exc.retry_after, exc)
+                return _ack(status="failed", permanent=False, error=str(exc),
+                            retry_after=exc.retry_after)
             except Exception as exc:  # noqa: BLE001 — progress must not propagate
                 logger.debug("ingress %s: progress render failed: %s", self.agent_id, exc)
             return _ack(status="sent")
@@ -203,6 +231,10 @@ class IngressAgent(Agent):
         except PermanentDeliveryError as exc:
             logger.warning("ingress %s: permanently undeliverable to %s: %s", self.agent_id, recipient, exc)
             return _ack(status="failed", permanent=True, error=str(exc))
+        except RateLimitedError as exc:
+            logger.warning("ingress %s: delivery to %s rate-limited for %.1fs, may retry: %s",
+                           self.agent_id, recipient, exc.retry_after, exc)
+            return _ack(status="failed", permanent=False, error=str(exc), retry_after=exc.retry_after)
         except Exception as exc:  # noqa: BLE001 — anything unlabelled is retryable
             logger.warning("ingress %s: delivery to %s failed, may retry: %s", self.agent_id, recipient, exc)
             return _ack(status="failed", permanent=False, error=str(exc))
@@ -261,11 +293,18 @@ def _decode(task: AgentTask) -> dict:
     return body if isinstance(body, dict) else {}
 
 
-def _ack(status: str, permanent: bool = False, error: str = "") -> AgentResult:
-    """Build the acknowledgement the kernel's delivery path expects."""
+def _ack(status: str, permanent: bool = False, error: str = "",
+         retry_after: float = 0.0) -> AgentResult:
+    """Build the acknowledgement the kernel's delivery path expects.
+
+    ``retry_after`` (seconds) is read by ``internal/ingress/transport.go: interpret``
+    into ``domain.DeliveryRetryAfterError``.
+    """
     body: Dict[str, Any] = {"status": status}
     if status != "sent":
         body["permanent"] = permanent
         if error:
             body["error"] = error
+        if retry_after > 0:
+            body["retry_after"] = retry_after
     return AgentResult(data=json.dumps(body).encode(), type="text")

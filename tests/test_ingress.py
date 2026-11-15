@@ -8,7 +8,7 @@ import json
 
 import pytest
 
-from cambrian_agent_sdk import IngressAgent, PermanentDeliveryError
+from cambrian_agent_sdk import IngressAgent, PermanentDeliveryError, RateLimitedError
 from cambrian_agent_sdk.types import AgentTask
 
 
@@ -151,3 +151,38 @@ def test_daemon_loop_delegates_to_listen():
 
 def test_trait_is_daemon_so_the_kernel_supervises_it():
     assert FakeIngress().trait == "daemon"
+
+
+# ── progress rate limits (ADR-0098 D4, T-20261113-progress-back-off-never-widens-on-a-telegram) ──
+
+class ProgressIngress(FakeIngress):
+    def __init__(self, exc=None):
+        super().__init__()
+        self.exc = exc
+
+    def on_progress(self, recipient, text, conversation_id, final=False):
+        if self.exc is not None:
+            raise self.exc
+
+
+def progress_task():
+    return AgentTask(data=json.dumps({"kind": "ingress.progress", "conversation_id": "conv-7",
+                                      "recipient": "tg:12345", "text": "still working"}).encode())
+
+
+def test_progress_rate_limit_is_reported_with_retry_after():
+    ack = json.loads(ProgressIngress(RateLimitedError("429 too many requests", retry_after=12)).run(progress_task()).data)
+    assert ack == {"status": "failed", "permanent": False, "error": "429 too many requests", "retry_after": 12.0}
+
+
+def test_other_progress_failures_stay_swallowed():
+    ack = json.loads(ProgressIngress(RuntimeError("message to edit not found")).run(progress_task()).data)
+    assert ack == {"status": "sent"}
+
+
+def test_rate_limited_delivery_is_transient_with_retry_after():
+    class Limited(FakeIngress):
+        def on_deliver(self, recipient, text, conversation_id):
+            raise RateLimitedError("429", retry_after=3.5)
+    ack = json.loads(Limited().run(delivery()).data)
+    assert ack["status"] == "failed" and ack["permanent"] is False and ack["retry_after"] == 3.5

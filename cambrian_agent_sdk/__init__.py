@@ -63,7 +63,7 @@ from .errors import (
 )
 from .execute_result import ExecuteResult
 from .helpers import PromptParts, build_prompt, build_prompt_parts, extract_code_block, find_step_ref
-from .ingress import IngressAgent, PermanentDeliveryError
+from .ingress import IngressAgent, PermanentDeliveryError, RateLimitedError
 from .llm import (
     CACHE_TTL_LONG,
     CACHE_TTL_SHORT,
@@ -101,6 +101,7 @@ __all__ = [
     "DaemonAgent",
     "IngressAgent",
     "PermanentDeliveryError",
+    "RateLimitedError",
     "AgentTask",
     "AgentResult",
     "SubGoal",

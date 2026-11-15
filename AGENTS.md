@@ -1,19 +1,21 @@
 Sub-repo: sdk
 Language: Python
-Top-level context: pyproject.toml + ../cambrian-knowledge/adrs/0036-trait-aligned-cognitive-agent-sdk-v2.md
-Authoritative ADR: ../cambrian-knowledge/adrs/0036-trait-aligned-cognitive-agent-sdk-v2.md
+Top-level context: pyproject.toml + HQ document `adrs/0036-trait-aligned-cognitive-agent-sdk-v2.md`
+Authoritative ADR: HQ document `adrs/0036-trait-aligned-cognitive-agent-sdk-v2.md`
 
 # sdk, AGENTS.md
 
-## Knowledge substrate & tickets (MANDATORY — every task)
+## Knowledge & tickets in HQ (MANDATORY — every task)
 
-The full protocol is root [`../AGENTS.md` §0](../AGENTS.md) — read it. **Live status lives in HQ**
-on a cut-over machine (`../cambrian-knowledge/.hq-cutover` exists — the owner's machine): use the
-`hq` MCP tools (`ready`, `create_ticket`, `update_ticket`, `list_tickets`, `brief`, `record_finding`,
-`verify_card`, `list_decisions` / `set_decision_status`, the benchmark tools) or
-`C:/Users/afsin/Dev/hq/bin/hq.exe … --config ../hq.yaml`. There the old `bin/ticket` / `bin/bench`
-scripts and the codebase-memory-mcp ticket tools **refuse writes**. Without the marker, the file
-workflow of root §0.4/§0.5 applies. In short, for every change in this repo, however small:
+The full protocol is root [`../AGENTS.md` §0](../AGENTS.md) — read it. **All project knowledge and
+all live status live in HQ**: ADRs, decisions, investigations, research and knowledge cards are
+versioned HQ documents (the `cambrian-knowledge/` repo is read-only until it is archived — never edit
+it), and tickets, ADR status, card freshness and benchmark runs are HQ records. Use the `hq` MCP
+tools (`ready`, `create_ticket`, `update_ticket`, `list_tickets`, `brief`, `read_doc`, `search_docs`,
+`write_doc`, `record_finding`, `verify_card`, `list_decisions` / `set_decision_status`, the benchmark
+tools) or `C:/Users/afsin/Dev/hq/bin/hq.exe … --config ../hq.yaml`. Every call carries your HQ token
+(MCP header; the CLI and hooks read `~/.hq/token-cambrian`) — never print it. In short, for every
+change in this repo, however small:
 
 1. **Before editing:** `ready` / `list_tickets` (`repo: "sdk"`) → `create_ticket` if the work is
    not ticketed → `update_ticket` action `claim`. `brief <path>` (or the card that loads when you
@@ -21,21 +23,23 @@ workflow of root §0.4/§0.5 applies. In short, for every change in this repo, h
    touch; a drifted card or stale ADR is a claim to re-verify against code before relying on it.
 2. **While working:** `log` findings, dead ends and `decision:` lines on the ticket. A bug or
    follow-up you will not fix now gets its own `create_ticket` (`triage=true`), immediately.
-3. **Decisions:** architectural → `cambrian-knowledge/adrs/NNNN-slug.md` (proposed, per
-   `cambrian-knowledge/meta/SCHEMA.md`; its lifecycle status is set in HQ, not the frontmatter);
-   operating rule → `cambrian-knowledge/decisions/`; tradeoff → the ADR's `tradeoffs:`. **Never
-   write ADRs to `docs/adr/`** — no sub-repo has that directory; ADRs live in `cambrian-knowledge/adrs/`.
+3. **Decisions:** architectural → document `adrs/NNNN-slug.md` via `write_doc` (`status: proposed`,
+   template `meta/SCHEMA.md`; its lifecycle status is set in HQ, not the frontmatter); operating rule
+   → document `decisions/<slug>.md`; tradeoff → the ADR's `tradeoffs:`. ADR and decision writes are
+   **drafts** only the owner approves — never approve one yourself. **Never write ADRs to
+   `docs/adr/`** — no sub-repo has that directory.
 4. **Before reporting done:** benchmark runs → a run record each (`record_benchmark_run`; the
    procedure is root `../AGENTS.md` §0.5); other numbers you produced → the ADR's `measurements:`;
-   gotchas → `observations:`; re-verified ADRs → `last_verified` + `verified_at_rev`; cards you
-   re-read against code → `verify_card` (the Stop hook blocks while a card your edit drifted is
-   unverified); `CONTEXT.md` if architecture or gaps changed (never edit between the
-   `<!-- hq:cards:start -->` / `<!-- hq:cards:end -->` markers — `hq context` generates that block).
-   Then `close` the ticket with a resolution (files changed, ADRs updated, tests run and result) —
-   or, if unfinished, `log` where you stopped and `release`.
+   gotchas → `observations:` (ADR drafts) or `record_finding` on the card; re-verified ADRs →
+   `last_verified` + `verified_at_rev`; cards you re-read against code → `verify_card` (the Stop hook
+   blocks while a card your edit drifted is unverified); architecture, behaviour or gaps changed →
+   the area's card via `read_doc` → `write_doc` (with `base_rev` and a reason; never an empty or
+   truncated text). `CONTEXT.md` here is a short stub — never add facts to it. Then `close` the
+   ticket with a resolution (files changed, documents written with their revisions, drafts left for
+   the owner, tests run and result) — or, if unfinished, `log` where you stopped and `release`.
 
-Pass `by: "agent:<name>"` on ticket calls. Never hand-edit `cambrian-knowledge/tickets/`; tickets
-never close from commit messages.
+Pass `by: "agent:<name>"` on HQ calls (you are recorded as `agent:<name>@<person>`). Tickets never
+close from commit messages.
 
 **Default execution lane (ADR-0150, owner decision 2026-11-13).** A request runs in the
 **single-agent lane** by default: one agent holds the person's tools and answers itself, fanning
@@ -43,7 +47,7 @@ out read-only work through the kernel-run `run_subtasks` tool (`execution.lane.d
 single_agent`, `cambrian-core/internal/config/lane.go`). The ADR-0145 **multi-agent research lane** (planner →
 Gatekeeper → Dispatcher → DAG, coverage, verifier) runs only under `execution.lane.default:
 planner` and is kept for research — so plan views, dispatch events and Gatekeeper scoring appear
-only in that lane. See [`decisions/default-lane-single-agent-with-fan-out.md`](../cambrian-knowledge/decisions/default-lane-single-agent-with-fan-out.md).
+only in that lane. See document `decisions/default-lane-single-agent-with-fan-out.md`.
 
 The Python agent SDK. Authors subclass one of three trait-aligned bases, decorate
 `@tool` methods, and call `agent.serve()`. The kernel auto-discovers the agent
@@ -106,13 +110,13 @@ yourself before claiming a change is clean.
 
 ## Change discipline
 
-- **Keep the sub-repo's `CONTEXT.md` in sync.** When you add, remove, or change code, architecture, status, modules, domain terms, or known gaps, update the sub-repo's `CONTEXT.md` to reflect the change. The context is the source of truth for AI agents (and humans) navigating the sub-repo; a stale context is worse than no context. Update the relevant section: `Module Breakdown` (paths), `Implementation Status` (areas with ADR + status), `Terminology Glossary` (new terms), `Known Gaps` (new deferred work), `Core Philosophy` (principle changes).
+- **Keep the knowledge cards true.** When you add, remove, or change code, architecture, behaviour, modules, domain terms, or known gaps, update the card(s) for that area in HQ (`brief <path>` names them; `read_doc` → edit → `write_doc` with a reason and `base_rev`, then `verify_card`). A new area gets a new card (`read_doc cards/README.md` for the format); new terms go into `card.concept.glossary`; known gaps are tickets, not prose. The cards are the source of truth for agents and humans navigating the repo; a stale card is worse than none. `CONTEXT.md` is a short stub and holds no facts.
 
 ## Cross-repo pointer
 
 - [`../CONTEXT.md`](../CONTEXT.md): the monorepo map; this sub-repo's place in the topology.
 - [`../AGENTS.md`](../AGENTS.md): the cross-repo invariants (§5), including "gRPC proto is the only SDK contract".
-- [`../cambrian-knowledge/adrs/0036-trait-aligned-cognitive-agent-sdk-v2.md`](../cambrian-knowledge/adrs/0036-trait-aligned-cognitive-agent-sdk-v2.md): the SDK's main ADR (trait taxonomy, structural enforcement).
-- [`../cambrian-knowledge/adrs/0041-local-recurrent-workspace-lrw-for-the-agent-loop.md`](../cambrian-knowledge/adrs/0041-local-recurrent-workspace-lrw-for-the-agent-loop.md): the LRW gate implemented in `recurrence.py`.
-- [`../cambrian-knowledge/adrs/0046-agent-skills-authored-procedural-capabilities-system-and-age.md`](../cambrian-knowledge/adrs/0046-agent-skills-authored-procedural-capabilities-system-and-age.md): skill model and the local-vs-system lexical scoping rule.
-- [`../cambrian-knowledge/adrs/0052-verbal-self-reflection-on-the-recurrence-gate.md`](../cambrian-knowledge/adrs/0052-verbal-self-reflection-on-the-recurrence-gate.md): verbal reflection on the recurrence gate, in `reflection.py`.
+- document `adrs/0036-trait-aligned-cognitive-agent-sdk-v2.md`: the SDK's main ADR (trait taxonomy, structural enforcement).
+- document `adrs/0041-local-recurrent-workspace-lrw-for-the-agent-loop.md`: the LRW gate implemented in `recurrence.py`.
+- document `adrs/0046-agent-skills-authored-procedural-capabilities-system-and-age.md`: skill model and the local-vs-system lexical scoping rule.
+- document `adrs/0052-verbal-self-reflection-on-the-recurrence-gate.md`: verbal reflection on the recurrence gate, in `reflection.py`.
