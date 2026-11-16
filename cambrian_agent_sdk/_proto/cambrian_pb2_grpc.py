@@ -174,6 +174,21 @@ class OrchestratorStub:
                 request_serializer=cambrian__pb2.ProposeOntologyChangeRequest.SerializeToString,
                 response_deserializer=cambrian__pb2.ProposeOntologyChangeResponse.FromString,
                 _registered_method=True)
+        self.PreviewForget = channel.unary_unary(
+                '/cambrian.Orchestrator/PreviewForget',
+                request_serializer=cambrian__pb2.PreviewForgetRequest.SerializeToString,
+                response_deserializer=cambrian__pb2.PreviewForgetResponse.FromString,
+                _registered_method=True)
+        self.Forget = channel.unary_unary(
+                '/cambrian.Orchestrator/Forget',
+                request_serializer=cambrian__pb2.ForgetRequest.SerializeToString,
+                response_deserializer=cambrian__pb2.ForgetResponse.FromString,
+                _registered_method=True)
+        self.ListMyErasures = channel.unary_unary(
+                '/cambrian.Orchestrator/ListMyErasures',
+                request_serializer=cambrian__pb2.ListMyErasuresRequest.SerializeToString,
+                response_deserializer=cambrian__pb2.ListMyErasuresResponse.FromString,
+                _registered_method=True)
 
 
 class OrchestratorServicer:
@@ -484,6 +499,34 @@ class OrchestratorServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def PreviewForget(self, request, context):
+        """Memory erasure (ADR-0137 D2/D9, ENG-411 stage C; contract 0105, capability
+        "memory-erasure"). Two phases: PreviewForget resolves a selector of concrete ids to
+        the records the CALLING agent can see (hidden records are absent) and returns them
+        with a deterministic preview token; Forget executes exactly the previewed records
+        (or explicit ids), re-authorized in full. An agent erases only what it wrote within
+        its read scope, and only when execution.erasure.agent_erase_enabled is on. The
+        kernel never resolves free text into deletions: search first, then preview the ids.
+        Content-free: ids, kinds and counts only. UNIMPLEMENTED when erasure is disabled;
+        PERMISSION_DENIED (denied) and NOT_FOUND (nothing to erase) are distinct.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Forget(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListMyErasures(self, request, context):
+        """ListMyErasures: the calling agent's own erasure receipts, newest first.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_OrchestratorServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -626,6 +669,21 @@ def add_OrchestratorServicer_to_server(servicer, server):
                     servicer.ProposeOntologyChange,
                     request_deserializer=cambrian__pb2.ProposeOntologyChangeRequest.FromString,
                     response_serializer=cambrian__pb2.ProposeOntologyChangeResponse.SerializeToString,
+            ),
+            'PreviewForget': grpc.unary_unary_rpc_method_handler(
+                    servicer.PreviewForget,
+                    request_deserializer=cambrian__pb2.PreviewForgetRequest.FromString,
+                    response_serializer=cambrian__pb2.PreviewForgetResponse.SerializeToString,
+            ),
+            'Forget': grpc.unary_unary_rpc_method_handler(
+                    servicer.Forget,
+                    request_deserializer=cambrian__pb2.ForgetRequest.FromString,
+                    response_serializer=cambrian__pb2.ForgetResponse.SerializeToString,
+            ),
+            'ListMyErasures': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListMyErasures,
+                    request_deserializer=cambrian__pb2.ListMyErasuresRequest.FromString,
+                    response_serializer=cambrian__pb2.ListMyErasuresResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -1384,6 +1442,87 @@ class Orchestrator:
             '/cambrian.Orchestrator/ProposeOntologyChange',
             cambrian__pb2.ProposeOntologyChangeRequest.SerializeToString,
             cambrian__pb2.ProposeOntologyChangeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PreviewForget(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cambrian.Orchestrator/PreviewForget',
+            cambrian__pb2.PreviewForgetRequest.SerializeToString,
+            cambrian__pb2.PreviewForgetResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Forget(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cambrian.Orchestrator/Forget',
+            cambrian__pb2.ForgetRequest.SerializeToString,
+            cambrian__pb2.ForgetResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListMyErasures(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cambrian.Orchestrator/ListMyErasures',
+            cambrian__pb2.ListMyErasuresRequest.SerializeToString,
+            cambrian__pb2.ListMyErasuresResponse.FromString,
             options,
             channel_credentials,
             insecure,

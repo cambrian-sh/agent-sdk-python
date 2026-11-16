@@ -16,6 +16,12 @@ described by their git history.
 
 ### Added
 
+- **Vendored stubs for the memory-erasure RPCs** (ADR-0137 S6, ENG-411 stage C; kernel
+  contract 0105). `cambrian_agent_sdk/_proto` now carries `PreviewForget`, `Forget` and
+  `ListMyErasures` with `ErasureSelector` / `ErasureCandidate` / `ErasureReceipt`. No client
+  method or ReAct action is added: agents erase through the kernel's `forget_memory` tool on
+  their tool menu (offered only when the kernel enables agent erasure).
+
 - **Structured managed generation** (ADR-0139 C1, wave 1d). `SubstrateClient.generate_request(
   lease, *, system, messages, response_schema, cache_ttl, max_tokens, temperature, stop,
   strict)` returns a `GenerateResult` with `text`, `tool_calls`, `stop_reason`, `usage`
