@@ -16,6 +16,11 @@ described by their git history.
 
 ### Added
 
+- **Vendored stubs for `PreviewForgetResponse.truncated`** (ENG-1953; kernel contract 0107,
+  additive). The kernel now floors a query-form forget preview on each hit's cosine to the
+  query and caps it at `execution.erasure.preview_max_candidates`; `truncated` is set when the
+  cap cut the list (narrow the query to reach the rest). No client method is added.
+
 - **Vendored stubs for the query form of `PreviewForget`** (ADR-0137 D2, ENG-1948; kernel
   contract 0106, additive). `PreviewForgetRequest.query` (free text, exclusive with
   `selector`) and `ErasureCandidate.snippet` (a clipped excerpt of the caller's own text, set
