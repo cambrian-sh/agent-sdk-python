@@ -8,7 +8,7 @@ is specified in ``cambrian-core/agents/profiles/README.md``; this module is its 
 and validator, and the client-side half of the tool allowlist.
 
 **YAML.** PyYAML is not an SDK dependency, and a profile is flat (scalars and lists of
-scalars), so a profile file is the same strict YAML subset as a prompt's frontmatter
+scalars, plus ``sandbox_paths`` as a one-line JSON list of objects), so a profile file is the same strict YAML subset as a prompt's frontmatter
 (``cambrian-core/prompts/SPEC.md`` §2.2) and is parsed by the same parser
 (:func:`cambrian_agent_sdk.prompt_library.parse_frontmatter`). Every file in the subset is
 also valid YAML that a full parser reads the same way; the kernel ports this subset
@@ -47,6 +47,7 @@ from .prompt_library import InvalidPrompt, parse_frontmatter, split_frontmatter
 
 __all__ = [
     "Profile",
+    "SandboxPath",
     "InvalidProfile",
     "ToolAllowlist",
     "ProfileScopedSubstrate",
@@ -93,6 +94,7 @@ MODEL_ROLES = ("planner", "verifier", "router", "memory", "facts")
 _FIELDS = {
     "name", "description", "capabilities", "skills", "tools", "model", "trust_tier",
     "max_tool_rounds", "max_tokens", "role", "version", "examples", "streams_output",
+    "sandbox_paths",
 }
 _REQUIRED = ("name", "description", "capabilities", "skills", "tools", "trust_tier", "role")
 
@@ -115,6 +117,13 @@ _NATIVE_GLOB = re.compile(r"^[a-z][a-z0-9_.*?-]*$")
 # Contributed tools (ADR-0127): local:<machine id or *>/<tool glob>; "local:*" is
 # every machine and tool. Port of internal/agentprofile reLocalGlob.
 _LOCAL_GLOB = re.compile(r"^local:(\*|[A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9_.*?-]+)$")
+
+# A declared sandbox path (ADR-0157 D1.2): absolute on some OS (/..., X:\... or X:/...,
+# \\server\...) or home-relative (~/... or ~\..., the kernel's expandHome). OS-independent
+# on purpose, so the parity fixture holds on every host; whether the path is absolute on
+# the kernel's host, inside allowlist_cap and outside the kernel's state is decided at
+# boot. Port of internal/agentprofile reSandboxPath.
+_SANDBOX_PATH = re.compile(r"^(/|~[/\\]|[A-Za-z]:[/\\]|\\\\)")
 
 _MAX_TOOL_ROUNDS = (1, 64)
 _MAX_TOKENS = (256, 131072)
@@ -247,6 +256,23 @@ def skill_index(skills_dir: Union[str, Path]) -> Dict[str, SkillRef]:
 
 
 @dataclass(frozen=True)
+class SandboxPath:
+    """One declared path of the agent's confinement allowlist (ADR-0157 D1.2).
+
+    ``path`` is absolute or starts with ``~/``; ``write`` makes it writable for the agent.
+    The kernel admits it at boot against ``execution.agents.sandbox.allowlist_cap`` and
+    refuses one inside its own state, exactly like an AGENT_MANIFEST's ``sandbox_paths``
+    (cambrian-core agentmgr.AgentSandbox.admitDeclared)."""
+
+    path: str
+    write: bool = False
+
+    def manifest(self) -> Dict[str, Any]:
+        """The manifest shape (``domain.SandboxPath``; ``write`` only when true)."""
+        return {"path": self.path, "write": True} if self.write else {"path": self.path}
+
+
+@dataclass(frozen=True)
 class Profile:
     """One validated profile. Construct with :func:`parse_profile` / :func:`load_profile`."""
 
@@ -266,6 +292,9 @@ class Profile:
     #: (``SubstrateClient.emit_step_output``), so the kernel forwards no gateway
     #: deltas for its steps — one step never streams twice.
     streams_output: bool = False
+    #: ADR-0157 D1.2 (ENG-1960): paths the agent needs beyond its code and runtime when
+    #: it runs confined; carried into the manifest's ``sandbox_paths``.
+    sandbox_paths: Tuple[SandboxPath, ...] = ()
     path: Optional[Path] = None
     warnings: Tuple[str, ...] = field(default=(), compare=False)
 
@@ -302,6 +331,8 @@ class Profile:
             m["examples"] = list(self.examples)
         if self.streams_output:
             m["streams_output"] = True
+        if self.sandbox_paths:
+            m["sandbox_paths"] = [p.manifest() for p in self.sandbox_paths]
         return m
 
 
@@ -340,6 +371,44 @@ def _bool_field(data: Mapping[str, Any], key: str, where: str) -> bool:
     if isinstance(v, str) and v.strip() in ("true", "false"):
         return v.strip() == "true"
     raise InvalidProfile(f"{where}: {key!r} must be true or false (got {v!r})")
+
+
+def _sandbox_paths_field(data: Mapping[str, Any], where: str) -> Tuple[SandboxPath, ...]:
+    """The optional ``sandbox_paths``: a one-line JSON list of ``{"path", "write"}``
+    objects, the path in the ``_SANDBOX_PATH`` form, ``write`` a JSON boolean (absent or
+    null is False), no other key, no path twice. Absent, null or ``[]`` is none. The Go
+    port is agentprofile.sandboxPathsField."""
+    v = data.get("sandbox_paths")
+    if v in (None, "", []):
+        return ()
+    if not isinstance(v, list):
+        raise InvalidProfile(f"{where}: 'sandbox_paths' must be a one-line JSON list of "
+                             '{"path": ..., "write": ...} objects')
+    out: List[SandboxPath] = []
+    seen = set()
+    for e in v:
+        if not isinstance(e, dict):
+            raise InvalidProfile(f"{where}: sandbox_paths entry {e!r} must be an object "
+                                 '{"path": ..., "write": ...}')
+        extra = sorted(set(e) - {"path", "write"})
+        if extra:
+            raise InvalidProfile(f"{where}: sandbox_paths entry has unknown key(s) {extra}; "
+                                 "allowed: ['path', 'write']")
+        p = e.get("path")
+        if not isinstance(p, str) or not p or p != p.strip() or "\x00" in p:
+            raise InvalidProfile(f"{where}: sandbox_paths 'path' must be a non-empty string "
+                                 "without surrounding whitespace")
+        if not _SANDBOX_PATH.match(p):
+            raise InvalidProfile(f"{where}: sandbox_paths path {p!r} must be absolute or start "
+                                 "with ~/ (a relative path has no meaning to a confined agent)")
+        w = e.get("write")
+        if w is not None and not isinstance(w, bool):
+            raise InvalidProfile(f"{where}: sandbox_paths {p!r}: 'write' must be true or false")
+        if p in seen:
+            raise InvalidProfile(f"{where}: sandbox_paths declares {p!r} twice")
+        seen.add(p)
+        out.append(SandboxPath(path=p, write=bool(w)))
+    return tuple(out)
 
 
 def parse_profile(
@@ -442,6 +511,8 @@ def parse_profile(
 
     streams_output = _bool_field(data, "streams_output", where)
 
+    sandbox_paths = _sandbox_paths_field(data, where)
+
     max_tool_rounds = _int_field(data, "max_tool_rounds", _MAX_TOOL_ROUNDS, where)
     max_tokens = _int_field(data, "max_tokens", _MAX_TOKENS, where)
 
@@ -463,7 +534,7 @@ def parse_profile(
         skills=tuple(skills), tools=tuple(tools), trust_tier=trust_tier, role=role,
         model=model, max_tool_rounds=max_tool_rounds, max_tokens=max_tokens,
         version=version, examples=tuple(examples), streams_output=streams_output,
-        path=path, warnings=tuple(warnings),
+        sandbox_paths=sandbox_paths, path=path, warnings=tuple(warnings),
     )
 
 

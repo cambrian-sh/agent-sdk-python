@@ -12,6 +12,7 @@ import pytest
 from cambrian_agent_sdk.profiles import (
     InvalidProfile,
     ProfileScopedSubstrate,
+    SandboxPath,
     ToolAllowlist,
     load_profile,
     load_profiles,
@@ -122,6 +123,33 @@ def test_streams_output_reaches_the_manifest(skills):
     assert p.streams_output is True and p.manifest()["streams_output"] is True
     with pytest.raises(InvalidProfile):
         parse_profile(_VALID + "streams_output: yes\n", skills_dir=skills)
+
+
+def test_sandbox_paths_reach_the_manifest(skills):
+    """ADR-0157 D1.2 (ENG-1960): a profile declares the paths its agent needs when
+    confined, in the manifest's shape; the kernel admits them at boot against
+    allowlist_cap like an AGENT_MANIFEST's."""
+    assert parse_profile(_VALID, skills_dir=skills).sandbox_paths == ()
+    assert "sandbox_paths" not in parse_profile(_VALID, skills_dir=skills).manifest()
+    text = _VALID + 'sandbox_paths: [{"path": "/srv/models"}, {"path": "~/cache/hf", "write": true}]\n'
+    p = parse_profile(text, skills_dir=skills)
+    assert p.sandbox_paths == (SandboxPath("/srv/models"), SandboxPath("~/cache/hf", write=True))
+    m = p.manifest()
+    assert m["sandbox_paths"] == [{"path": "/srv/models"}, {"path": "~/cache/hf", "write": True}]
+    json.dumps(m)
+
+
+@pytest.mark.parametrize("value", [
+    '[{"path": "models/cache"}]',          # relative
+    '[{"path": "/srv/a", "mode": "rw"}]',  # unknown key
+    '[{"path": "/srv/a", "write": "true"}]',
+    '[{"path": "/srv/a"}, {"path": "/srv/a"}]',
+    '[/srv/models]',                       # a flow list of strings is not the shape
+    '[{"path": "/srv/a",}]',               # not JSON
+])
+def test_sandbox_paths_refused(skills, value):
+    with pytest.raises(InvalidProfile):
+        parse_profile(_VALID + f"sandbox_paths: {value}\n", skills_dir=skills)
 
 
 # ── strictness ───────────────────────────────────────────────────────────────

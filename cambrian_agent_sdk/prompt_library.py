@@ -215,6 +215,17 @@ def parse_frontmatter(front: str) -> Dict[str, Any]:
         elif value.startswith("["):
             if not value.endswith("]"):
                 raise InvalidPrompt(f"frontmatter line {n}: unterminated flow list")
+            if value[1:].strip().startswith("{"):
+                # An inline list of objects is one-line JSON, as an inline object is
+                # (a profile's sandbox_paths, ADR-0157 D1.2). JSON is YAML flow syntax,
+                # so a full YAML parser reads it the same way. Go port:
+                # cambrian-core internal/agentprofile parseSubset.
+                try:
+                    out[key] = json.loads(value)
+                except ValueError as e:
+                    raise InvalidPrompt(
+                        f"frontmatter line {n}: inline list of objects is not JSON: {e}") from None
+                continue
             out[key] = _flow_list(value)
         elif value.startswith("{"):
             try:
