@@ -505,9 +505,13 @@ class OrchestratorServicer:
         the records the CALLING agent can see (hidden records are absent) and returns them
         with a deterministic preview token; Forget executes exactly the previewed records
         (or explicit ids), re-authorized in full. An agent erases only what it wrote within
-        its read scope, and only when execution.erasure.agent_erase_enabled is on. The
-        kernel never resolves free text into deletions: search first, then preview the ids.
-        Content-free: ids, kinds and counts only. UNIMPLEMENTED when erasure is disabled;
+        its read scope, and only when execution.erasure.agent_erase_enabled is on.
+        Contract 0106 (ENG-1948): PreviewForget also takes a free-text query, resolved by
+        the CALLER'S OWN scoped retrieval (the same search QueryMemory runs); every hit
+        maps to its whole document, only records the caller wrote are candidates, and each
+        candidate carries a clipped snippet of the caller's own text. No model decides what
+        to delete: the preview names concrete ids, and nothing is erased until Forget runs
+        with its token. Receipts stay content-free. UNIMPLEMENTED when erasure is disabled;
         PERMISSION_DENIED (denied) and NOT_FOUND (nothing to erase) are distinct.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)

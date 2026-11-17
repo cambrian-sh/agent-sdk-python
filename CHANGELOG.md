@@ -16,6 +16,14 @@ described by their git history.
 
 ### Added
 
+- **Vendored stubs for the query form of `PreviewForget`** (ADR-0137 D2, ENG-1948; kernel
+  contract 0106, additive). `PreviewForgetRequest.query` (free text, exclusive with
+  `selector`) and `ErasureCandidate.snippet` (a clipped excerpt of the caller's own text, set
+  on query previews only). The kernel resolves the query with the caller's own scoped recall;
+  every hit becomes its whole document and only records the caller wrote are listed. No client
+  method or ReAct action is added (owner decision 2026-11-17); agents reach it through the
+  kernel's `forget_memory` tool, which gained a `query` argument.
+
 - **Vendored stubs for the memory-erasure RPCs** (ADR-0137 S6, ENG-411 stage C; kernel
   contract 0105). `cambrian_agent_sdk/_proto` now carries `PreviewForget`, `Forget` and
   `ListMyErasures` with `ErasureSelector` / `ErasureCandidate` / `ErasureReceipt`. No client
