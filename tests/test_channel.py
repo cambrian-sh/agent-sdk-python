@@ -74,6 +74,30 @@ def test_no_root_builds_plaintext_and_warns_once(monkeypatch, caplog):
     assert ch.transport_mode() == "insecure"
 
 
+@pytest.mark.parametrize("addr", ["unix:/tmp/sbx/kernel.sock", "unix:///tmp/sbx/kernel.sock", "unix-abstract:kernel"])
+def test_unix_socket_target_logs_no_plaintext_warning(monkeypatch, caplog, addr):
+    """ENG-1970: a kernel-only sandboxed agent dials ``unix:<dir>/kernel.sock``
+    (ADR-0157 S2); a local socket is plaintext by design, so no TLS advice."""
+    rec = _Recorder()
+    with caplog.at_level(logging.DEBUG, logger="cambrian.channel"):
+        ch.build_channel(addr, _secure_channel=rec.secure, _insecure_channel=rec.insecure).close()
+    assert [c[:2] for c in rec.calls] == [("insecure", addr)], "the target reaches grpc unchanged"
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not [r for r in caplog.records if "PLAINTEXT" in r.getMessage()]
+
+
+def test_tcp_plaintext_still_warns_after_a_unix_dial(monkeypatch, caplog):
+    """The unix skip must not use up the once-per-process WARN for a TCP dial."""
+    rec = _Recorder()
+    with caplog.at_level(logging.WARNING, logger="cambrian.channel"):
+        ch.build_channel("unix:/tmp/sbx/kernel.sock", _secure_channel=rec.secure, _insecure_channel=rec.insecure).close()
+        ch.build_channel("10.0.0.5:50051", _secure_channel=rec.secure, _insecure_channel=rec.insecure).close()
+    warnings = [r for r in caplog.records if "PLAINTEXT" in r.getMessage()]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+    assert "10.0.0.5:50051" in warnings[0].getMessage()
+
+
 def test_options_reach_the_insecure_channel(monkeypatch):
     rec = _Recorder()
     opts = [("grpc.max_send_message_length", 50 * 1024 * 1024)]

@@ -14,7 +14,9 @@ Two facts the kernel establishes on the agent plane, and this module supplies:
   with it as the ``x-agent-id`` assertion the kernel checks the token against — the
   header is never the identity, the token is.
 * **Transport** — ``CAMBRIAN_TLS_CA``, a PEM root the kernel's certificate chains to.
-  Set, the channel is TLS; unset, it is plaintext and the SDK says so ONCE at WARN.
+  Set, the channel is TLS; unset, it is plaintext and the SDK says so ONCE at WARN —
+  except for a ``unix:`` socket target, which is local by construction (a kernel-only
+  sandboxed agent's socket, ADR-0157 S2) and needs no TLS advice.
   ``CAMBRIAN_TLS_SERVER_NAME`` overrides the name the certificate is verified
   against (a kernel reached as ``localhost`` with a certificate for its hostname).
 
@@ -47,9 +49,29 @@ _warned_insecure = False
 _warn_lock = threading.Lock()
 
 
+#: gRPC target schemes that name a local socket, never a network address.
+_LOCAL_SOCKET_SCHEMES = ("unix:", "unix-abstract:")
+
+
+def _is_local_socket(addr: str) -> bool:
+    return addr.strip().lower().startswith(_LOCAL_SOCKET_SCHEMES)
+
+
 def _warn_insecure_once(addr: str) -> None:
-    """One WARN per process when the kernel is dialed without TLS (ADR-0130 D4)."""
+    """One WARN per process when the kernel is dialed without TLS over the network
+    (ADR-0130 D4).
+
+    A ``unix:`` target is skipped: the socket is local by construction — the kernel
+    hands a kernel-only (network-denied) sandboxed agent ``unix:<dir>/kernel.sock``
+    (ADR-0157 S2) and treats a unix peer as local (``authz.routablePeer``) — so
+    plaintext is the intended transport and the TLS advice would mislead operators
+    (the kernel forwards it as an ERROR line per agent). It logs at DEBUG and does
+    not use up the once-per-process WARN, so a later TCP plaintext dial still warns.
+    """
     global _warned_insecure
+    if _is_local_socket(addr):
+        logger.debug("dialing the kernel at %s over a local unix socket (plaintext by design)", addr)
+        return
     with _warn_lock:
         if _warned_insecure:
             return
