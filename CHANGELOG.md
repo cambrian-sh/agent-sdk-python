@@ -5,45 +5,16 @@ described by their git history.
 
 ## Unreleased
 
-### Added
-
-- **The reasoning loop recovers once from a context overflow** (ENG-2128). When a model call
-  is refused `OUT_OF_RANGE` (`ContextOverflow`: the kernel's pre-send window check or the
-  provider's own "prompt is too long"), `think()` replaces the newest oversized tool result
-  in the conversation with the placeholder compaction already uses (its run-ledger id,
-  readable with `ledger_get`, or else its cid) and retries that call once. If the retry
-  overflows too, or there is no tool result to shrink, the step fails as before. The system
-  tier, the user's turn and pinned skill turns are never shrunk. Each shrink is logged
-  (`react_context_overflow_shrunk_retrying`), recorded as an `overflow_shrink` context-engine
-  event and written as a `context.overflow_shrink` run-trace span. New
-  `DefaultContextEngine.shrink_for_overflow`.
-
-### Fixed
-
-- **A pool worker whose class declares a different `agent_id` is no longer refused by the
-  kernel** (ENG-2129). `CognitiveAgent.serve()` now adopts `CAMBRIAN_AGENT_ID`, the registry
-  id the kernel launched the process as and minted its per-instance token for, over the id
-  the class declares, the way a daemon adopts `--agent-id`. Before, the declared id went out
-  as `x-agent-id` and every memory, LLM gateway and tool call was refused UNAUTHENTICATED.
-  A mismatch is logged once at WARN naming both ids. With `CAMBRIAN_AGENT_ID` unset (an agent
-  started by hand) the declared id is kept. New helper `channel.kernel_agent_id`.
-- **A worker whose `run()` ends on a gateway failure now answers with the gateway's code, not
-  INTERNAL** (ENG-2125). When the exception chain holds a `GenerateError` coded
-  `UNAUTHENTICATED`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED` or `UNAVAILABLE`, the worker's
-  Execute status carries that code (as it already did `OUT_OF_RANGE` for a context overflow),
-  so the kernel's self-healer and the chat lane see a refused credential, a rate limit or a
-  provider outage instead of an opaque INTERNAL. The provider's retry delay travels too:
-  `GenerateError.retry_delay` (seconds, or `None`) is read from the gateway's
-  `google.rpc.RetryInfo` detail and written back on the worker's status. Any other failure,
-  including an author bug, stays INTERNAL.
-
 ## 0.1.8 (2026-11-18)
 
 Ships heartbeat liveness (ADR-0070 D3): a kernel-spawned daemon or pool worker that stays
 alive but can serve nobody is now detected and replaced by the kernel. Needs a kernel that
 passes `--heartbeat-interval-ms` (cambrian-core with ENG-1348); against an older kernel
 nothing changes. Also fixes the skill menu breaking the prompt cache across chat turns
-(ENG-126).
+(ENG-126), a pool worker whose class declares a different `agent_id` being refused by the
+kernel (ENG-2129), and a worker's gateway failure reaching the kernel as an opaque INTERNAL
+instead of the gateway's status code (ENG-2125); and the reasoning loop now recovers once
+from a context overflow by shrinking the newest oversized tool result (ENG-2128).
 
 ### Added
 
@@ -58,6 +29,17 @@ nothing changes. Also fixes the skill menu breaking the prompt cache across chat
   keeps beating (`busy`). Heartbeats are signals with `_signal_type: _heartbeat`; the kernel
   consumes them before routing, so they never reach a pipeline. `start_agent_server` takes
   `heartbeat_stream=False` for a process whose own signal stream carries the beats.
+
+- **The reasoning loop recovers once from a context overflow** (ENG-2128). When a model call
+  is refused `OUT_OF_RANGE` (`ContextOverflow`: the kernel's pre-send window check or the
+  provider's own "prompt is too long"), `think()` replaces the newest oversized tool result
+  in the conversation with the placeholder compaction already uses (its run-ledger id,
+  readable with `ledger_get`, or else its cid) and retries that call once. If the retry
+  overflows too, or there is no tool result to shrink, the step fails as before. The system
+  tier, the user's turn and pinned skill turns are never shrunk. Each shrink is logged
+  (`react_context_overflow_shrunk_retrying`), recorded as an `overflow_shrink` context-engine
+  event and written as a `context.overflow_shrink` run-trace span. New
+  `DefaultContextEngine.shrink_for_overflow`.
 
 ### Changed
 
@@ -77,6 +59,22 @@ nothing changes. Also fixes the skill menu breaking the prompt cache across chat
   run, so a per-message top-k changed that tier on every turn of a conversation and the
   provider re-read the whole system prompt at full price. Agents without
   `seed_tools_full` keep the task-relevant push.
+- **A pool worker whose class declares a different `agent_id` is no longer refused by the
+  kernel** (ENG-2129). `CognitiveAgent.serve()` now adopts `CAMBRIAN_AGENT_ID`, the registry
+  id the kernel launched the process as and minted its per-instance token for, over the id
+  the class declares, the way a daemon adopts `--agent-id`. Before, the declared id went out
+  as `x-agent-id` and every memory, LLM gateway and tool call was refused UNAUTHENTICATED.
+  A mismatch is logged once at WARN naming both ids. With `CAMBRIAN_AGENT_ID` unset (an agent
+  started by hand) the declared id is kept. New helper `channel.kernel_agent_id`.
+- **A worker whose `run()` ends on a gateway failure now answers with the gateway's code, not
+  INTERNAL** (ENG-2125). When the exception chain holds a `GenerateError` coded
+  `UNAUTHENTICATED`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED` or `UNAVAILABLE`, the worker's
+  Execute status carries that code (as it already did `OUT_OF_RANGE` for a context overflow),
+  so the kernel's self-healer and the chat lane see a refused credential, a rate limit or a
+  provider outage instead of an opaque INTERNAL. The provider's retry delay travels too:
+  `GenerateError.retry_delay` (seconds, or `None`) is read from the gateway's
+  `google.rpc.RetryInfo` detail and written back on the worker's status. Any other failure,
+  including an author bug, stays INTERNAL.
 
 ## 0.1.7 (2026-11-18)
 
