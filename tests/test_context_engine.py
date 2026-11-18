@@ -451,6 +451,36 @@ def test_estimate_tokens_is_chars_over_four():
     assert ce.estimate_tokens("abcde") == 2
 
 
+# The kernel's TestEstimateTokens_ContentAware (internal/infrastructure/llm/
+# context_guard_test.go) checks the same vectors from the same pattern, so the
+# kernel's pre-send check and the SDK's compaction agree on a prompt's size.
+_B64 = "QUJDZGVmMTIz"
+
+
+def _b64_run(n):
+    return (_B64 * (n // len(_B64) + 1))[:n]
+
+
+@pytest.mark.parametrize("text,want", [
+    ("", 0),
+    ("abc " * 100, 100),
+    (_b64_run(1300), 1000),
+    ("abc " * 100 + _b64_run(1300), 1100),
+    ("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 50),
+    ("a" * 100, 25),
+    (_b64_run(ce.HIGH_ENTROPY_MIN_RUN - 4), (ce.HIGH_ENTROPY_MIN_RUN - 4) // 4),
+])
+def test_estimate_tokens_is_content_aware(text, want):
+    assert ce.estimate_tokens(text) == want
+
+
+def test_estimate_tokens_does_not_under_count_base64():
+    # Run 20261112T132056Z p06: len/4 said 100011 tokens, the provider counted
+    # ~278483 (~1.44 chars a token).
+    text = "Tool result: " + _b64_run(400000)
+    assert ce.estimate_tokens(text) >= 400000 * 100 // 144
+
+
 @pytest.mark.parametrize("value,want", [
     ("plain", "plain"), ({"text": "d"}, "d"), (["a", {"notes": "b"}], "a\nb"),
     (types.SimpleNamespace(content="c"), "c"), (None, ""), (object(), ""),

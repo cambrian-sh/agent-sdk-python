@@ -60,6 +60,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -89,12 +90,43 @@ ENGINE_DEFAULT = "default"
 ENGINE_REMOVED_LEGACY = "legacy"
 
 
+# Content-aware estimate (T-20261112-pre-send-context-window-check-per-model-with):
+# the kernel's llm.EstimateTokens applies the same rule with the same constants
+# (internal/config/content.go HighEntropy*), and both test suites check the same
+# vectors. len/4 under-counted base64 2-3x, so a compaction that reported a
+# prompt under budget could still overflow the model's context window.
+HIGH_ENTROPY_CHARS_PER_TOKEN = 1.3
+HIGH_ENTROPY_MIN_RUN = 64
+_ENTROPY_RUN = re.compile(r"[A-Za-z0-9+/=_-]{%d,}" % HIGH_ENTROPY_MIN_RUN)
+_LOWER, _UPPER, _DIGIT = re.compile(r"[a-z]"), re.compile(r"[A-Z]"), re.compile(r"[0-9]")
+
+
+def _entropy_chars(text: str) -> int:
+    """Characters of ``text`` inside high-entropy runs: maximal runs of at least
+    HIGH_ENTROPY_MIN_RUN base64 / base64url / hex characters mixing at least two
+    of lower case, upper case and digits."""
+    total = 0
+    for m in _ENTROPY_RUN.finditer(text):
+        run = m.group(0)
+        classes = sum(1 for rx in (_LOWER, _UPPER, _DIGIT) if rx.search(run))
+        if classes >= 2:
+            total += len(run)
+    return total
+
+
 def estimate_tokens(text: Any) -> int:
-    """``ceil(len(text) / 4)``: the SDK's token heuristic (no tokenizer)."""
+    """The SDK's token heuristic (no tokenizer), content-aware: ordinary text at
+    ``ceil(len / 4)``, high-entropy runs (base64, hex) at 1.3 characters a token."""
     if not text:
         return 0
-    n = len(text) if isinstance(text, str) else len(str(text))
-    return (n + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
+    if not isinstance(text, str):
+        text = str(text)
+    entropy = _entropy_chars(text) if len(text) >= HIGH_ENTROPY_MIN_RUN else 0
+    normal = len(text) - entropy
+    tokens = (normal + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
+    if entropy:
+        tokens += math.ceil(entropy / HIGH_ENTROPY_CHARS_PER_TOKEN)
+    return tokens
 
 
 def _cp(section: str, **values) -> str:

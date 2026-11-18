@@ -5,6 +5,14 @@ described by their git history.
 
 ## Unreleased
 
+### Changed
+
+- **Token estimate is content-aware** (ENG-1050). `context_engine.estimate_tokens` counts
+  high-entropy runs (base64, hex: at least 64 characters mixing two of lower case, upper case
+  and digits) at 1.3 characters a token instead of 4, the same rule as the kernel's pre-send
+  context-window check. len/4 under-counted base64 2-3x, so compaction could report a prompt
+  under budget that overflowed the model's window. Ordinary text is unchanged.
+
 ## 0.1.7 (2026-11-18)
 
 Releases the lease fixes: on 0.1.6 the reasoning loop's skill menu and the artifact calls sent
