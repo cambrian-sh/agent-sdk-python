@@ -74,6 +74,17 @@ def agent_id_override() -> str:
     return ""
 
 
+def stream_id_arg() -> str:
+    """``--stream-id`` from argv, "" when absent (the stream a kernel-spawned daemon or
+    pool worker was launched for; carried on its heartbeats, ADR-0070 D3)."""
+    argv = sys.argv
+    if "--stream-id" in argv:
+        idx = argv.index("--stream-id")
+        if idx + 1 < len(argv):
+            return argv[idx + 1]
+    return ""
+
+
 def is_daemon_mode() -> bool:
     """Return True if ``--daemon-mode`` was passed as a CLI arg. ADR-0033."""
     return "--daemon-mode" in sys.argv

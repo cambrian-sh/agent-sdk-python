@@ -255,7 +255,9 @@ class IngressAgent(Agent):
 
         stream = threading.Thread(target=self._run_inbound, name=f"{self.agent_id}-inbound", daemon=True)
         stream.start()
-        start_agent_server(self, address or _parse_listen_address())
+        # The inbound stream carries this process's heartbeats (ADR-0070 D3), so the
+        # delivery server opens no second, heartbeat-only stream.
+        start_agent_server(self, address or _parse_listen_address(), heartbeat_stream=False)
 
     def _run_inbound(self) -> None:
         """Open the signal stream and run the supervised ``listen`` loop."""

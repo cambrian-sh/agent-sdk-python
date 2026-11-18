@@ -5,6 +5,27 @@ described by their git history.
 
 ## Unreleased
 
+## 0.1.8 (2026-11-18)
+
+Ships heartbeat liveness (ADR-0070 D3): a kernel-spawned daemon or pool worker that stays
+alive but can serve nobody is now detected and replaced by the kernel. Needs a kernel that
+passes `--heartbeat-interval-ms` (cambrian-core with ENG-1348); against an older kernel
+nothing changes.
+
+### Added
+
+- **Heartbeat liveness** (ENG-1348, ADR-0070 D3). New `cambrian_agent_sdk.liveness`. When the
+  kernel launches a long-lived process with `--heartbeat-interval-ms N`, the SDK sends a
+  heartbeat on the process's SignalStream every N ms with no author code: a `DaemonAgent` or
+  `IngressAgent` interleaves it on its open signal stream, and an AgentService worker (a chat
+  pool worker) opens a heartbeat-only stream beside its server. A beat is WITHHELD while an
+  `Execute` its caller abandoned (cancelled or past its deadline) is still running: the server
+  is single-threaded, so such a worker can serve nobody, and the kernel kills it after N missed
+  beats and restarts it through its restart policy. A long call whose caller is still waiting
+  keeps beating (`busy`). Heartbeats are signals with `_signal_type: _heartbeat`; the kernel
+  consumes them before routing, so they never reach a pipeline. `start_agent_server` takes
+  `heartbeat_stream=False` for a process whose own signal stream carries the beats.
+
 ### Changed
 
 - **Token estimate is content-aware** (ENG-1050). `context_engine.estimate_tokens` counts

@@ -122,10 +122,19 @@ def start_daemon(agent, substrate_addr: Optional[str] = None) -> None:
     def _should_continue():
         return not shutdown["flag"]
 
+    # ADR-0070 D3: the kernel asked for heartbeats (--heartbeat-interval-ms) — they ride
+    # this stream, interleaved with the author's signals; no author code involved.
+    from .liveness import configure_from_argv, heartbeat_handoff
+
+    liveness = configure_from_argv()
+
     def _request_iter():
         import queue as _queue
 
         while not shutdown["flag"]:
+            beat = liveness.next_beat()
+            if beat is not None:
+                yield heartbeat_handoff(agent.agent_id, stream_id, beat)
             try:
                 payload_dict, raw_text = agent._signal_queue.get(timeout=0.1)
             except _queue.Empty:

@@ -175,6 +175,17 @@ class TraitServicer:
         )
 
     def Execute(self, request, context):
+        # ADR-0070 D3: the heartbeat is withheld while this call runs on after its caller
+        # has gone (liveness.py) — registered for the whole handler, released on any exit.
+        from .liveness import LIVENESS
+
+        token = LIVENESS.begin(context)
+        try:
+            return self._execute(request, context)
+        finally:
+            LIVENESS.end(token)
+
+    def _execute(self, request, context):
         from ._proto import cambrian_pb2
 
         task = _task_from_handoff(request, context)
@@ -204,8 +215,14 @@ class TraitServicer:
         return _handoff_from_result(result, request, self._agent.agent_id)
 
 
-def start_agent_server(agent: ServableAgent, address: str) -> None:
-    """Boot a single-threaded AgentService server for a trait agent and block (D2)."""
+def start_agent_server(agent: ServableAgent, address: str, *, heartbeat_stream: bool = True) -> None:
+    """Boot a single-threaded AgentService server for a trait agent and block (D2).
+
+    When the kernel spawned this process as a long-lived worker and asked for heartbeats
+    (``--heartbeat-interval-ms``, ADR-0070 D3), a heartbeat-only SignalStream is opened
+    beside the server. ``heartbeat_stream=False`` is for a process whose own signal stream
+    already carries the beats (an ingress: ``daemon.start_daemon`` emits them).
+    """
     import grpc
 
     from ._proto import cambrian_pb2_grpc
@@ -237,6 +254,12 @@ def start_agent_server(agent: ServableAgent, address: str) -> None:
     server.add_insecure_port(address)
     server.start()
     logger.info("Agent '%s' serving on %s (max_workers=%d)", agent.agent_id, address, MAX_WORKERS)
+
+    if heartbeat_stream:
+        from .liveness import start_heartbeat_stream
+        from .server import _parse_substrate_addr, stream_id_arg
+
+        start_heartbeat_stream(agent.agent_id, _parse_substrate_addr(), stream_id_arg())
 
     def _handle_sigterm(*_):
         server.stop(grace=5)
