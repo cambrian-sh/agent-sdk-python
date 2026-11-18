@@ -113,6 +113,19 @@ elsewhere; `CAMBRIAN_PYTEST_MEMORY_MB`, default 1536, `0` = off — ENG-1606): a
 with `MemoryError` under its own name instead of exhausting the host. Do not switch it off to make a
 test pass; fix the test.
 
+Agents (and anyone on a shared machine) run pytest through the external capped runner as well,
+until the owner's ~2026-11-25 review of the two guards (ENG-1606, ENG-2016): it kills the whole
+process tree at a hard memory cap (default 2048 MB) or a wall-clock timeout (default 120 s) and
+exits 137 (memory) or 124 (timeout), naming the limit — the CPython 3.13.1 defaulted-arg recursion
+that once committed 94 GB (ENG-1604) ends at the cap (ENG-2053):
+
+```sh
+powershell -NoProfile -File scripts/pytest_capped.ps1 -q tests/test_x.py   # Windows: Job Object cap
+bash scripts/pytest_capped.sh -q tests/test_x.py                          # Linux/macOS: cgroup scope or ulimit -v
+# limits: --memory-mb N --timeout-sec N (or PYTEST_CAPPED_MEMORY_MB / PYTEST_CAPPED_TIMEOUT_SEC);
+# python: PYTEST_CAPPED_PYTHON, else .venv, else python on PATH; every other argument goes to pytest
+```
+
 ## Change discipline
 
 - **Keep the knowledge cards true.** When you add, remove, or change code, architecture, behaviour, modules, domain terms, or known gaps, update the card(s) for that area in HQ (`brief <path>` names them; `read_doc` → edit → `write_doc` with a reason and `base_rev`, then `verify_card`). A new area gets a new card (`read_doc cards/README.md` for the format); new terms go into `card.concept.glossary`; known gaps are tickets, not prose. The cards are the source of truth for agents and humans navigating the repo; a stale card is worse than none. `CONTEXT.md` is a short stub and holds no facts.
