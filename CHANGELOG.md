@@ -5,6 +5,15 @@ described by their git history.
 
 ## Unreleased
 
+### Fixed
+
+- **Skill and tool menus present the running task's lease** (ENG-2087). `SubstrateClient.
+  list_skills`, `list_tools` and `find_tools` called without `session_token_id` inside a task
+  now send the task's lease as `x-lease-id`, as memory reads have since 0.1.6. The reasoning
+  loop's skill menu sent no lease at all, so a kernel on an authenticated deployment refused
+  it `no_lease` on every chat turn and composed step. A use_skill load still sends its run
+  key as `x-session-token` too.
+
 ## 0.1.6 (2026-11-18)
 
 The first release that ships `cambrian_agent_sdk.channel`, the unix kernel-socket path a

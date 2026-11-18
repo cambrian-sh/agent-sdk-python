@@ -49,6 +49,7 @@ from .clients import (
     SelfDelegationError,
     WorkingMemory,
     _lease_metadata,
+    _lease_or_current,
 )
 from .context_engine import ContextConfig, ContextEngine, DefaultContextEngine
 from .errors import (
@@ -772,7 +773,8 @@ class SubstrateClient:
 
         ``session_token_id`` (the run's lease) lets the kernel also describe tools a
         system skill conferred for THIS run (ADR-0046 D6); without it only standing
-        grants are described.
+        grants are described. Unset, the running task's lease is presented
+        (:func:`~cambrian_agent_sdk.clients.task_lease`), as memory reads do.
         """
         self._ensure()
         from ._proto import cambrian_pb2
@@ -786,8 +788,9 @@ class SubstrateClient:
             md.append(("x-tool-names", ",".join(names)))
         if full:
             md.append(("x-tool-full", "true"))
-        if session_token_id:
-            md.append(("x-lease-id", session_token_id))
+        lease = _lease_or_current(session_token_id)
+        if lease:
+            md.append(("x-lease-id", lease))
         try:
             resp = self._stub.ListTools(cambrian_pb2.ListToolsRequest(), metadata=md)
         except Exception:  # noqa: BLE001 — degrade to an empty menu, never crash
@@ -825,8 +828,9 @@ class SubstrateClient:
             md.append(("x-tool-k", str(k)))
         if full:
             md.append(("x-tool-full", "true"))
-        if session_token_id:
-            md.append(("x-lease-id", session_token_id))
+        lease = _lease_or_current(session_token_id)
+        if lease:
+            md.append(("x-lease-id", lease))
         try:
             resp, call = self._stub.ListTools.with_call(cambrian_pb2.ListToolsRequest(), metadata=md)
         except Exception:  # noqa: BLE001 — degrade to an empty menu, never crash
@@ -886,6 +890,14 @@ class SubstrateClient:
             md.append(("x-skill-names", ",".join(names)))
         if full:
             md.append(("x-skill-full", "true"))
+        # The lease the kernel dispatched this task under (explicit, else the task's
+        # lease the runtime set around run()), as x-lease-id: the kernel resolves the
+        # caller's session / conversation owner from it, and a credential-authenticated
+        # menu call without one is refused ``no_lease`` (ENG-518;
+        # T-20261118-chat-agent-and-composed-worker-memory-reads-are).
+        lease = _lease_or_current(session_token_id)
+        if lease:
+            md.append(("x-lease-id", lease))
         if session_token_id:
             md.append(("x-session-token", session_token_id))  # ADR-0046 D6: run key for grant activation
         if rationale:
