@@ -5,6 +5,17 @@ described by their git history.
 
 ## Unreleased
 
+### Fixed
+
+- **The skill menu no longer breaks the prompt cache across turns** (ENG-126). An agent on
+  the full tool menu (`seed_tools_full`, e.g. the single-agent lane's chat agent and the
+  profile workers) now also gets the full permitted skill menu (`list_skills` with no
+  query; the kernel serves it sorted by name) instead of the top-3 skills ranked by the
+  task text. The menu is rendered into the cached system tier, and a chat turn is a fresh
+  run, so a per-message top-k changed that tier on every turn of a conversation and the
+  provider re-read the whole system prompt at full price. Agents without
+  `seed_tools_full` keep the task-relevant push.
+
 ## 0.1.8 (2026-11-18)
 
 Ships heartbeat liveness (ADR-0070 D3): a kernel-spawned daemon or pool worker that stays

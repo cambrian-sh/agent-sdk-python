@@ -1427,7 +1427,13 @@ def run_think(
     # ADR-0046: the loadable skill menu — agent-local skills (always present) first,
     # then task-relevant system skills (the push), with same-name system skills
     # shadowed by agent-local ones (structural prioritization, no central ranking).
-    system_skills = _assemble_skill_menu(agent, query=task.text)
+    # The skill query follows the tool query: an agent on the FULL tool menu
+    # (seed_tools_full) gets the full permitted skill menu too (query="" ⇒ the kernel
+    # serves every skill in scope, sorted by name). The menu is rendered into the
+    # cached system tier, so a per-message top-k changed that tier on every turn of a
+    # conversation and voided the provider's prompt cache across turns (ENG-126; the
+    # same reasoning as ADR-0150 D3.2 for the tool list).
+    system_skills = _assemble_skill_menu(agent, query=_seed_tool_query)
 
     # #4: the ActionProtocol is loop-INVARIANT (agent, granted tools/skills, and the
     # domain answer-format are fixed for the task). Compose it ONCE so it is identical
