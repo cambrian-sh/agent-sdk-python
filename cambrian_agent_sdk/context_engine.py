@@ -690,6 +690,73 @@ class DefaultContextEngine:
             return _cp("placeholder-ledger", tool=tool, chars=len(body), ref=ref)
         return _cp("placeholder", tool=tool, chars=len(body), cid=cid)
 
+    def _compact_native_turn(self, m: Dict[str, Any], names: Dict[str, str]) -> Tuple[str, int]:
+        """Replace one native tool turn's content by its placeholder, in place: the
+        one phase-1 pathway shared by the budget pass, the age trigger and the
+        overflow shrink. A resolve window points back at its original cid and page
+        (no new cid, so nothing new to re-open); any other output is stored and gets
+        the ledger or cid placeholder. Returns ``(cid, tokens_saved)``."""
+        tid = m.get("tool_call_id", "")
+        body = m.get("content") or ""
+        window = self._window_by_tid.get(tid)
+        if window is not None:
+            cid, page, pages, total = window
+            m["content"] = _cp("placeholder-window", cid=cid, page=page, pages=pages,
+                               chars=total or len(body))
+        else:
+            cid = self._store(body)
+            m["content"] = self._placeholder(names.get(tid) or "the tool", body, cid)
+            sig = self._sig_by_tid.get(tid)
+            if sig:
+                self._compacted_by_sig[sig] = cid
+        self._compacted_ids.add(tid)
+        return cid, estimate_tokens(body) - estimate_tokens(m["content"])
+
+    def shrink_for_overflow(self, conversation: Optional[List[Dict[str, Any]]] = None
+                            ) -> Optional[Dict[str, Any]]:
+        """Reactive recovery from a context overflow (ENG-2128, owner decision
+        2026-11-18): the model call was refused OUT_OF_RANGE (the kernel's pre-send
+        window check, ENG-1050, or the provider's own refusal). Replace the NEWEST
+        oversized tool result with its placeholder / ledger reference — the same
+        phase-1 compaction the budget pass applies, also inside the protected tail —
+        so the loop can retry the call once.
+
+        ``conversation`` is the native conversation (shrunk in place); None means the
+        text path's history. Only tool results are touched: never the system tier,
+        the user's turn, a pinned skill turn or an output already placeholdered.
+        Returns the ``overflow_shrink`` event (also on :attr:`events` and logged),
+        or None when there is no tool result left to shrink."""
+        limit = self.config.tool_output_compact_chars
+        if conversation is not None:
+            names = {c.get("id"): c.get("name", "") for m in conversation
+                     for c in (m.get("tool_calls") or [])}
+            for m in reversed(conversation):
+                tid = m.get("tool_call_id", "")
+                body = m.get("content") or ""
+                if (m.get("role") != "tool" or tid in self._pinned_ids or tid in self._compacted_ids
+                        or len(body) <= limit):
+                    continue
+                cid, saved = self._compact_native_turn(m, names)
+                ev = dict(event="overflow_shrink", path="native", tool=names.get(tid) or "",
+                          ref=ledger_ref_of(body) or cid, chars=len(body), tokens_saved=saved)
+                self._event(**ev)
+                return ev
+            return None
+        for it in reversed(self._history):
+            s = it.step
+            if (s is None or s.kind != "tool_call" or s.pinned or it.compacted_cid or s.cid
+                    or len(it.tool_body()) <= limit):
+                continue
+            body = it.tool_body()
+            saved = self._compact_item(it)
+            # The text path renders a compacted item as its cid placeholder.
+            ev = dict(event="overflow_shrink", path="text", tool=s.tool or "",
+                      ref=it.compacted_cid, chars=len(body),
+                      tokens_saved=saved)
+            self._event(**ev)
+            return ev
+        return None
+
     def _clear_aged_native(self, conversation: List[Dict[str, Any]]) -> bool:
         """ADR-0150 D7 age trigger (native path): every tool output but the newest
         ``keep_recent_tool_results`` becomes its placeholder, under budget or not.
@@ -711,12 +778,7 @@ class DefaultContextEngine:
             if (tid in self._pinned_ids or tid in self._compacted_ids or tid in self._window_by_tid
                     or len(body) <= self.config.tool_output_compact_chars):
                 continue
-            cid = self._store(body)
-            m["content"] = self._placeholder(names.get(tid) or "the tool", body, cid)
-            self._compacted_ids.add(tid)
-            sig = self._sig_by_tid.get(tid)
-            if sig:
-                self._compacted_by_sig[sig] = cid
+            cid, _ = self._compact_native_turn(m, names)
             cids.append(cid)
         if cids:
             self._event(event="compaction", phase=1, path="native", reason="age", items=len(cids),
@@ -834,24 +896,8 @@ class DefaultContextEngine:
                 if (m.get("role") != "tool" or tid in self._pinned_ids or tid in self._compacted_ids
                         or len(body) <= self.config.tool_output_compact_chars):
                     continue
-                window = self._window_by_tid.get(tid)
-                if window is not None:
-                    # A resolve window: point back at the original cid and page; no
-                    # new cid, so nothing new to re-open.
-                    cid, page, pages, total = window
-                    m["content"] = _cp("placeholder-window", cid=cid, page=page, pages=pages,
-                                       chars=total or len(body))
-                    self._compacted_ids.add(tid)
-                    saved += estimate_tokens(body) - estimate_tokens(m["content"])
-                    cids.append(cid)
-                    continue
-                cid = self._store(body)
-                m["content"] = self._placeholder(names.get(tid) or "the tool", body, cid)
-                self._compacted_ids.add(tid)
-                sig = self._sig_by_tid.get(tid)
-                if sig:
-                    self._compacted_by_sig[sig] = cid
-                saved += estimate_tokens(body) - estimate_tokens(m["content"])
+                cid, s = self._compact_native_turn(m, names)
+                saved += s
                 cids.append(cid)
         changed = bool(cids) or aged
         if cids:

@@ -309,6 +309,20 @@ def model_call(agent, task, *, path: str, round_no: int, system: Optional[List[D
         logger.debug("run_trace_model_call_failed", extra={"err": str(exc)})
 
 
+def context_event(agent, task, name: str, attributes: Dict[str, Any]) -> None:
+    """Record one context-engine event (e.g. ``context.overflow_shrink``, ENG-2128)
+    as an INTERNAL span with the step's attributes. Never raises."""
+    try:
+        w = writer(getattr(agent, "agent_id", ""))
+        if w is None:
+            return
+        attrs = _task_attrs(agent, task)
+        attrs.update({"cambrian.context." + k: v for k, v in attributes.items()})
+        w.span(name, attrs, trace_key=getattr(task, "session_token_id", "") or "")
+    except Exception as exc:  # noqa: BLE001 - tracing must never break the loop
+        logger.debug("run_trace_context_event_failed", extra={"err": str(exc)})
+
+
 def _executed_by(agent, name: str) -> str:
     """"agent" for a tool the agent runs in-process, else "kernel" (ExecuteTool, which
     the kernel traces too: a reader can show one side of such a call)."""

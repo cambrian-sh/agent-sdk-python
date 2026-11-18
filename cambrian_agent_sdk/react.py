@@ -1559,6 +1559,10 @@ def run_think(
     _log_prompt_versions(agent)
 
     round_no = 0
+    # ENG-2128: the round whose model call already had its one overflow retry.
+    # round_no advances only on a served turn, so a second OUT_OF_RANGE for the
+    # same call fails the step instead of shrinking again (never a loop).
+    overflow_retried_round = -1
     while True:
         if lane_clock is not None and lane_clock.expired():
             return _lane_stop(EXIT_WALL, f"the run reached its wall-time cap ({lane_clock.max_wall_seconds} s)")
@@ -1711,6 +1715,11 @@ def run_think(
                                           system=_trace_sys, messages=conversation, tools=tool_defs,
                                           start_ns=_trace_t0, span_id=_trace_sid,
                                           error=f"{type(_trace_exc).__name__}: {_trace_exc}")
+                    if (overflow_retried_round != round_no and _shrink_after_overflow(
+                            agent, task, wm, _trace_exc, conversation, path="native",
+                            round_no=round_no + 1)):
+                        overflow_retried_round = round_no
+                        continue
                     raise
                 n_text, n_calls, n_stop = n_res
                 n_ignored = list(getattr(n_res, "ignored", None) or [])
@@ -1796,9 +1805,18 @@ def run_think(
                 continue
 
         if action is None:
-            raw, structured_text = _generate_text_turn(
-                agent, task, parts, structured=structured_text, cache_ttl=run_cache_ttl,
-                max_tokens=max_tokens, temperature=temperature, round_no=round_no + 1)
+            try:
+                raw, structured_text = _generate_text_turn(
+                    agent, task, parts, structured=structured_text, cache_ttl=run_cache_ttl,
+                    max_tokens=max_tokens, temperature=temperature, round_no=round_no + 1)
+            except Exception as exc:
+                # ENG-2128: shrink the newest tool result in the engine's history and
+                # retake the turn; the prompt is re-rendered from the engine.
+                if (overflow_retried_round != round_no and _shrink_after_overflow(
+                        agent, task, wm, exc, None, path="text", round_no=round_no + 1)):
+                    overflow_retried_round = round_no
+                    continue
+                raise
             action = parse_action(raw)
         kind = action.get("action")
 
@@ -2918,6 +2936,35 @@ def _generate_text_turn(agent, task, parts, *, structured: bool, cache_ttl: str,
                           prompt=parts.legacy_prompt(), text=raw if isinstance(raw, str) else str(raw),
                           start_ns=_trace_t0, span_id=_trace_sid)
     return raw, structured and req_fn is not None
+
+
+def _shrink_after_overflow(agent, task, wm: Any, exc: BaseException,
+                           conversation: Optional[List[Dict[str, Any]]], *, path: str,
+                           round_no: int) -> bool:
+    """Reactive recovery from a context overflow (ENG-2128, owner decision
+    2026-11-18). When ``exc`` is a :class:`ContextOverflow` (the kernel's pre-send
+    window check or the provider's own refusal, both OUT_OF_RANGE), replace the
+    newest oversized tool result with its placeholder / ledger reference and return
+    True so the caller retries the call once. False — the caller re-raises and the
+    step fails as before — when it is another error, the engine cannot shrink, or
+    there is no tool result left to shrink. The shrink is logged, is an
+    ``overflow_shrink`` engine event and a ``context.overflow_shrink`` trace span."""
+    from ._logging import safe_extra
+    from .errors import is_context_overflow
+    if not is_context_overflow(exc):
+        return False
+    shrink = getattr(_base_engine(wm), "shrink_for_overflow", None)
+    ev = shrink(conversation) if shrink is not None else None
+    if not ev:
+        logger.warning("react_context_overflow_nothing_to_shrink",
+                       extra={"path": path, "round": round_no})
+        return False
+    attrs = {k: v for k, v in ev.items() if k != "event"}
+    logger.warning("react_context_overflow_shrunk_retrying",
+                   extra=safe_extra({"round": round_no, **attrs}))
+    _run_trace.context_event(agent, task, "context.overflow_shrink",
+                             {"round": round_no, "error": str(exc)[:500], **attrs})
+    return True
 
 
 def _best_effort(wm: Any) -> str:

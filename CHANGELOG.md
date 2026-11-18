@@ -5,6 +5,19 @@ described by their git history.
 
 ## Unreleased
 
+### Added
+
+- **The reasoning loop recovers once from a context overflow** (ENG-2128). When a model call
+  is refused `OUT_OF_RANGE` (`ContextOverflow`: the kernel's pre-send window check or the
+  provider's own "prompt is too long"), `think()` replaces the newest oversized tool result
+  in the conversation with the placeholder compaction already uses (its run-ledger id,
+  readable with `ledger_get`, or else its cid) and retries that call once. If the retry
+  overflows too, or there is no tool result to shrink, the step fails as before. The system
+  tier, the user's turn and pinned skill turns are never shrunk. Each shrink is logged
+  (`react_context_overflow_shrunk_retrying`), recorded as an `overflow_shrink` context-engine
+  event and written as a `context.overflow_shrink` run-trace span. New
+  `DefaultContextEngine.shrink_for_overflow`.
+
 ### Fixed
 
 - **A pool worker whose class declares a different `agent_id` is no longer refused by the
