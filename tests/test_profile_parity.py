@@ -70,6 +70,8 @@ def test_profile_verdict_matches_go(case, tmp_path):
     assert got.streams_output == bool(want.get("streams_output"))
     # ADR-0157 D1.2 (ENG-1960): the declared paths, in the manifest's shape.
     assert [p.manifest() for p in got.sandbox_paths] == (want.get("sandbox_paths") or [])
+    # ADR-0157 D7.6 (ENG-2009): the declared packages, in the manifest's shape.
+    assert [p.manifest() for p in got.python_packages] == (want.get("python_packages") or [])
     assert len(got.warnings) == case["warnings"]
 
 

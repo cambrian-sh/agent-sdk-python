@@ -12,6 +12,7 @@ import pytest
 from cambrian_agent_sdk.profiles import (
     InvalidProfile,
     ProfileScopedSubstrate,
+    PythonPackage,
     SandboxPath,
     ToolAllowlist,
     load_profile,
@@ -150,6 +151,38 @@ def test_sandbox_paths_reach_the_manifest(skills):
 def test_sandbox_paths_refused(skills, value):
     with pytest.raises(InvalidProfile):
         parse_profile(_VALID + f"sandbox_paths: {value}\n", skills_dir=skills)
+
+
+def test_python_packages_reach_the_manifest(skills):
+    """ADR-0157 D7.6 (ENG-2009): a profile declares the packages its agent's own layer
+    needs, exact versions, in the manifest's shape; the kernel resolves, card-approves and
+    installs them before it starts the agent."""
+    assert parse_profile(_VALID, skills_dir=skills).python_packages == ()
+    assert "python_packages" not in parse_profile(_VALID, skills_dir=skills).manifest()
+    text = _VALID + ('python_packages: [{"name": "polars", "version": "1.9.0"}, '
+                     '{"name": "httpx", "version": "0.27.2", "extras": ["http2"]}]\n')
+    p = parse_profile(text, skills_dir=skills)
+    assert p.python_packages == (PythonPackage("polars", "1.9.0"),
+                                 PythonPackage("httpx", "0.27.2", ("http2",)))
+    m = p.manifest()
+    assert m["python_packages"] == [{"name": "polars", "version": "1.9.0"},
+                                    {"name": "httpx", "version": "0.27.2", "extras": ["http2"]}]
+    json.dumps(m)
+
+
+@pytest.mark.parametrize("value", [
+    '[{"name": "polars", "version": ">=1.9"}]',               # a range
+    '[{"name": "polars", "version": "==1.9.0"}]',             # an operator
+    '[{"name": "polars", "version": "1.9.0\\n"}]',           # trailing newline (fullmatch)
+    '[{"name": "polars", "version": 1.9}]',                   # not a string
+    '[{"name": "polars", "version": "1.9.0", "url": "x"}]',   # unknown key
+    '[{"name": "Foo_Bar", "version": "1"}, {"name": "foo-bar", "version": "2"}]',
+    '[{"name": "httpx", "version": "1", "extras": ["a", "A"]}]',
+    '[polars]',
+])
+def test_python_packages_refused(skills, value):
+    with pytest.raises(InvalidProfile):
+        parse_profile(_VALID + f"python_packages: {value}\n", skills_dir=skills)
 
 
 # ── strictness ───────────────────────────────────────────────────────────────

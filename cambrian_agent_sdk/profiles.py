@@ -94,7 +94,7 @@ MODEL_ROLES = ("planner", "verifier", "router", "memory", "facts")
 _FIELDS = {
     "name", "description", "capabilities", "skills", "tools", "model", "trust_tier",
     "max_tool_rounds", "max_tokens", "role", "version", "examples", "streams_output",
-    "sandbox_paths",
+    "sandbox_paths", "python_packages",
 }
 _REQUIRED = ("name", "description", "capabilities", "skills", "tools", "trust_tier", "role")
 
@@ -272,6 +272,40 @@ class SandboxPath:
         return {"path": self.path, "write": True} if self.write else {"path": self.path}
 
 
+#: ADR-0157 D7.6: a declared package's name (PEP 508 project name), its one exact version
+#: (PEP 440, no operator, wildcard or whitespace) and an extra's name. The Go port is
+#: domain.ValidatePythonPackages; both match the whole string (fullmatch / ^…$).
+_PY_PROJECT = re.compile(r"[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?")
+_PY_VERSION = re.compile(r"[0-9][A-Za-z0-9.+!_-]*")
+_PY_EXTRA = re.compile(r"[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?")
+
+
+def _normalize_py_name(n: str) -> str:
+    """PEP 503 normalization (lower case, runs of -_. become one -)."""
+    return re.sub(r"[-_.]+", "-", n.lower())
+
+
+@dataclass(frozen=True)
+class PythonPackage:
+    """One package the agent needs beyond the kernel-managed base env (ADR-0157 D7.6).
+
+    ``version`` is one exact version; ``extras`` are optional extras. The kernel resolves
+    the package against the base, pins every file by SHA-256, asks an Operator (approval
+    kind ``python_package``) and installs it into the agent's own layer before it starts
+    the agent; agents never run pip. Hashes are never declared (they differ per platform)."""
+
+    name: str
+    version: str
+    extras: Tuple[str, ...] = ()
+
+    def manifest(self) -> Dict[str, Any]:
+        """The manifest shape (``domain.PythonPackage``; ``extras`` only when set)."""
+        m: Dict[str, Any] = {"name": self.name, "version": self.version}
+        if self.extras:
+            m["extras"] = list(self.extras)
+        return m
+
+
 @dataclass(frozen=True)
 class Profile:
     """One validated profile. Construct with :func:`parse_profile` / :func:`load_profile`."""
@@ -295,6 +329,9 @@ class Profile:
     #: ADR-0157 D1.2 (ENG-1960): paths the agent needs beyond its code and runtime when
     #: it runs confined; carried into the manifest's ``sandbox_paths``.
     sandbox_paths: Tuple[SandboxPath, ...] = ()
+    #: ADR-0157 D7.6 (ENG-2009): packages the agent's own layer needs beyond the base env;
+    #: carried into the manifest's ``python_packages``.
+    python_packages: Tuple[PythonPackage, ...] = ()
     path: Optional[Path] = None
     warnings: Tuple[str, ...] = field(default=(), compare=False)
 
@@ -333,6 +370,8 @@ class Profile:
             m["streams_output"] = True
         if self.sandbox_paths:
             m["sandbox_paths"] = [p.manifest() for p in self.sandbox_paths]
+        if self.python_packages:
+            m["python_packages"] = [p.manifest() for p in self.python_packages]
         return m
 
 
@@ -408,6 +447,62 @@ def _sandbox_paths_field(data: Mapping[str, Any], where: str) -> Tuple[SandboxPa
             raise InvalidProfile(f"{where}: sandbox_paths declares {p!r} twice")
         seen.add(p)
         out.append(SandboxPath(path=p, write=bool(w)))
+    return tuple(out)
+
+
+def _python_packages_field(data: Mapping[str, Any], where: str) -> Tuple[PythonPackage, ...]:
+    """The optional ``python_packages``: a one-line JSON list of ``{"name", "version",
+    "extras"}`` objects — a PEP 508 project name, one exact version, an optional list of
+    extra names — no other key (no URL, path, VCS reference, index or hash), no project
+    twice (PEP 503 normalized), no extra twice. Absent, null or ``[]`` is none. The Go port
+    is agentprofile.pythonPackagesField + domain.ValidatePythonPackages."""
+    v = data.get("python_packages")
+    if v in (None, "", []):
+        return ()
+    if not isinstance(v, list):
+        raise InvalidProfile(f"{where}: 'python_packages' must be a one-line JSON list of "
+                             '{"name": ..., "version": ...} objects')
+    out: List[PythonPackage] = []
+    seen = set()
+    for e in v:
+        if not isinstance(e, dict):
+            raise InvalidProfile(f"{where}: python_packages entry {e!r} must be an object "
+                                 '{"name": ..., "version": ...}')
+        extra = sorted(set(e) - {"name", "version", "extras"})
+        if extra:
+            raise InvalidProfile(f"{where}: python_packages entry has unknown key(s) {extra}; "
+                                 "allowed: ['extras', 'name', 'version']")
+        name = e.get("name")
+        if not isinstance(name, str) or not name:
+            raise InvalidProfile(f"{where}: python_packages 'name' must be a non-empty string")
+        version = e.get("version")
+        if not isinstance(version, str) or not version:
+            raise InvalidProfile(f"{where}: python_packages {name!r}: 'version' must be a "
+                                 "non-empty string")
+        extras: List[str] = []
+        x = e.get("extras")
+        if x is not None:
+            if not isinstance(x, list) or not all(isinstance(i, str) for i in x):
+                raise InvalidProfile(f"{where}: python_packages {name!r}: 'extras' must be a "
+                                     "list of strings")
+            extras = list(x)
+        if not _PY_PROJECT.fullmatch(name):
+            raise InvalidProfile(f"{where}: python_packages name {name!r} is not a PEP 508 "
+                                 "project name")
+        if not _PY_VERSION.fullmatch(version):
+            raise InvalidProfile(f"{where}: python_packages {name}: version {version!r} must be "
+                                 "one exact version (no range, no '==', no wildcard)")
+        seen_extras = set()
+        for xe in extras:
+            if not _PY_EXTRA.fullmatch(xe):
+                raise InvalidProfile(f"{where}: python_packages {name}: extra {xe!r} is malformed")
+            if _normalize_py_name(xe) in seen_extras:
+                raise InvalidProfile(f"{where}: python_packages {name}: extra {xe!r} listed twice")
+            seen_extras.add(_normalize_py_name(xe))
+        if _normalize_py_name(name) in seen:
+            raise InvalidProfile(f"{where}: python_packages declares {name} twice")
+        seen.add(_normalize_py_name(name))
+        out.append(PythonPackage(name=name, version=version, extras=tuple(extras)))
     return tuple(out)
 
 
@@ -513,6 +608,8 @@ def parse_profile(
 
     sandbox_paths = _sandbox_paths_field(data, where)
 
+    python_packages = _python_packages_field(data, where)
+
     max_tool_rounds = _int_field(data, "max_tool_rounds", _MAX_TOOL_ROUNDS, where)
     max_tokens = _int_field(data, "max_tokens", _MAX_TOKENS, where)
 
@@ -534,7 +631,8 @@ def parse_profile(
         skills=tuple(skills), tools=tuple(tools), trust_tier=trust_tier, role=role,
         model=model, max_tool_rounds=max_tool_rounds, max_tokens=max_tokens,
         version=version, examples=tuple(examples), streams_output=streams_output,
-        sandbox_paths=sandbox_paths, path=path, warnings=tuple(warnings),
+        sandbox_paths=sandbox_paths, python_packages=python_packages, path=path,
+        warnings=tuple(warnings),
     )
 
 
