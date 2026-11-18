@@ -5,6 +5,16 @@ described by their git history.
 
 ## Unreleased
 
+### Fixed
+
+- **A pool worker whose class declares a different `agent_id` is no longer refused by the
+  kernel** (ENG-2129). `CognitiveAgent.serve()` now adopts `CAMBRIAN_AGENT_ID`, the registry
+  id the kernel launched the process as and minted its per-instance token for, over the id
+  the class declares, the way a daemon adopts `--agent-id`. Before, the declared id went out
+  as `x-agent-id` and every memory, LLM gateway and tool call was refused UNAUTHENTICATED.
+  A mismatch is logged once at WARN naming both ids. With `CAMBRIAN_AGENT_ID` unset (an agent
+  started by hand) the declared id is kept. New helper `channel.kernel_agent_id`.
+
 ## 0.1.8 (2026-11-18)
 
 Ships heartbeat liveness (ADR-0070 D3): a kernel-spawned daemon or pool worker that stays

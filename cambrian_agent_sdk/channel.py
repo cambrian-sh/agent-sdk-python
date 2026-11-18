@@ -89,6 +89,43 @@ def _reset_insecure_warning_for_tests() -> None:
         _warned_insecure = False
 
 
+_warned_identity: set = set()
+
+
+def kernel_agent_id(declared: str) -> str:
+    """The id this process must assert to the kernel: ``CAMBRIAN_AGENT_ID`` when set,
+    else ``declared`` (ENG-2129).
+
+    The kernel mints the per-instance token for the agent's REGISTRY id (derived from
+    its filename) and passes that id in ``CAMBRIAN_AGENT_ID``. A class that declares a
+    different ``agent_id`` would assert the wrong ``x-agent-id`` and every
+    agent→kernel call (memory, LLM gateway, tools) is refused UNAUTHENTICATED: the
+    token names the registry id. So the registry id wins, the way ``daemon.py`` adopts
+    ``--agent-id``. Unset (an agent started by hand, outside the kernel), the declared
+    id is kept. A mismatch is logged ONCE per (declared, registry) pair.
+    """
+    declared = (declared or "").strip()
+    registry = (os.environ.get(AGENT_ID_ENV) or "").strip()
+    if not registry:
+        return declared
+    if declared and declared != registry:
+        with _warn_lock:
+            first = (declared, registry) not in _warned_identity
+            _warned_identity.add((declared, registry))
+        if first:
+            logger.warning(
+                "agent declares agent_id '%s' but the kernel launched it as '%s' (%s); "
+                "using '%s' for the kernel credential and x-agent-id",
+                declared, registry, AGENT_ID_ENV, registry,
+            )
+    return registry
+
+
+def _reset_identity_warning_for_tests() -> None:
+    with _warn_lock:
+        _warned_identity.clear()
+
+
 class _Credentials:
     """What the environment says about this process's identity and transport."""
 
@@ -167,8 +204,10 @@ def build_channel(
     _insecure_channel: Optional[Callable] = None,
 ) -> grpc.Channel:
     """Dial the kernel at ``addr`` with the transport and credential the environment
-    configures (module docstring). ``agent_id`` is the caller's own id, used as the
-    ``x-agent-id`` assertion when ``CAMBRIAN_AGENT_ID`` is unset.
+    configures (module docstring). ``agent_id`` is the caller's own id, the
+    ``x-agent-id`` assertion; it wins over ``CAMBRIAN_AGENT_ID``, which is used only
+    when it is empty. A kernel-launched agent resolves its id with
+    :func:`kernel_agent_id` first (ENG-2129), so the two agree.
 
     The two ``_*_channel`` parameters are test seams for the grpc constructors.
     """

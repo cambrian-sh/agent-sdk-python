@@ -224,9 +224,16 @@ class CognitiveAgent(Agent):
     def serve(self, address: Optional[str] = None) -> None:
         """Bind clients to the Substrate, then boot the single-threaded server (D2)."""
         from ._proto import cambrian_pb2_grpc
-        from .channel import build_channel
+        from .channel import build_channel, kernel_agent_id
         from .runtime import start_agent_server
         from .server import _parse_listen_address, _parse_substrate_addr
+
+        # ENG-2129: adopt the registry id the kernel launched us as (CAMBRIAN_AGENT_ID,
+        # the id its per-instance token names) over the class-declared one, the way
+        # daemon.py adopts --agent-id. The clients' x-agent-id, the handoffs'
+        # from_agent and the heartbeat stream all read self.agent_id; asserting the
+        # declared id instead gets every agent->kernel call refused UNAUTHENTICATED.
+        self.agent_id = kernel_agent_id(self.agent_id)
 
         # ADR-0130 D4: the one channel builder — TLS root and agent credential
         # from the environment, plaintext (warned once) on a loopback kernel.
