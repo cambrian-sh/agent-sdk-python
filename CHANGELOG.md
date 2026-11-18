@@ -5,13 +5,6 @@ described by their git history.
 
 ## Unreleased
 
-### Changed
-
-- Re-vendored `cambrian_pb2` for kernel contract 0110 (ENG-2147, ENG-2154): the agent-plane
-  `ErasureSelector.memory_note_ids` (name entries of the run principal's own memory notes)
-  and `ErasureReceipt.redacted_messages` (the chat replies an erase redacted). Additive; no
-  SDK API changes.
-
 ## 0.1.8 (2026-11-18)
 
 Ships heartbeat liveness (ADR-0070 D3): a kernel-spawned daemon or pool worker that stays
@@ -21,7 +14,8 @@ nothing changes. Also fixes the skill menu breaking the prompt cache across chat
 (ENG-126), a pool worker whose class declares a different `agent_id` being refused by the
 kernel (ENG-2129), and a worker's gateway failure reaching the kernel as an opaque INTERNAL
 instead of the gateway's status code (ENG-2125); and the reasoning loop now recovers once
-from a context overflow by shrinking the newest oversized tool result (ENG-2128).
+from a context overflow by shrinking the newest oversized tool result (ENG-2128). The vendored
+`cambrian_pb2` stubs match kernel contract 0110 (ENG-2147).
 
 ### Added
 
@@ -55,6 +49,11 @@ from a context overflow by shrinking the newest oversized tool result (ENG-2128)
   and digits) at 1.3 characters a token instead of 4, the same rule as the kernel's pre-send
   context-window check. len/4 under-counted base64 2-3x, so compaction could report a prompt
   under budget that overflowed the model's window. Ordinary text is unchanged.
+
+- **Re-vendored `cambrian_pb2` for kernel contract 0110** (ENG-2147, ENG-2154): the
+  agent-plane `ErasureSelector.memory_note_ids` (name entries of the run principal's own memory
+  notes) and `ErasureReceipt.redacted_messages` (the chat replies an erase redacted). Additive;
+  no SDK API changes.
 
 ### Fixed
 
