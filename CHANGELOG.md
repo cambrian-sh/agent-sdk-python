@@ -14,6 +14,15 @@ described by their git history.
   as `x-agent-id` and every memory, LLM gateway and tool call was refused UNAUTHENTICATED.
   A mismatch is logged once at WARN naming both ids. With `CAMBRIAN_AGENT_ID` unset (an agent
   started by hand) the declared id is kept. New helper `channel.kernel_agent_id`.
+- **A worker whose `run()` ends on a gateway failure now answers with the gateway's code, not
+  INTERNAL** (ENG-2125). When the exception chain holds a `GenerateError` coded
+  `UNAUTHENTICATED`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED` or `UNAVAILABLE`, the worker's
+  Execute status carries that code (as it already did `OUT_OF_RANGE` for a context overflow),
+  so the kernel's self-healer and the chat lane see a refused credential, a rate limit or a
+  provider outage instead of an opaque INTERNAL. The provider's retry delay travels too:
+  `GenerateError.retry_delay` (seconds, or `None`) is read from the gateway's
+  `google.rpc.RetryInfo` detail and written back on the worker's status. Any other failure,
+  including an author bug, stays INTERNAL.
 
 ## 0.1.8 (2026-11-18)
 

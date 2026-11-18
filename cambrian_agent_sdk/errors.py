@@ -74,12 +74,18 @@ else:
 class GenerateError(_RpcBase):
     """A managed generation call failed. ``code`` is the gRPC status name
     (e.g. ``"UNAVAILABLE"``); ``details`` the kernel's message. The ``code()`` and
-    ``details()`` methods mirror ``grpc.RpcError`` for code written against it."""
+    ``details()`` methods mirror ``grpc.RpcError`` for code written against it.
 
-    def __init__(self, details: str = "", code: str = "UNKNOWN") -> None:
+    ``retry_delay`` is the seconds the provider asked to wait before trying again
+    (the kernel's ``google.rpc.RetryInfo`` detail on a ``RESOURCE_EXHAUSTED`` or
+    ``UNAVAILABLE``), or None when the kernel sent none."""
+
+    def __init__(self, details: str = "", code: str = "UNKNOWN",
+                 retry_delay: "float | None" = None) -> None:
         super().__init__(details)
         self._code = code
         self._details = details
+        self.retry_delay = retry_delay
 
     def code(self):  # grpc.RpcError compatibility
         try:
@@ -125,14 +131,39 @@ class ContextOverflow(GenerateError):
     (T-20261112-worker-resolve-cid-inline-has-no-size-cap-a, owner decision A4)."""
 
 
-def is_context_overflow(exc: BaseException) -> bool:
-    """True when ``exc`` or anything in its cause/context chain is a
-    :class:`ContextOverflow`."""
+def _chain(exc: BaseException):
+    """``exc`` and its cause/context chain, outermost first, each once."""
     seen = set()
     cur: "BaseException | None" = exc
     while cur is not None and id(cur) not in seen:
-        if isinstance(cur, ContextOverflow):
-            return True
+        yield cur
         seen.add(id(cur))
         cur = cur.__cause__ or cur.__context__
-    return False
+
+
+def is_context_overflow(exc: BaseException) -> bool:
+    """True when ``exc`` or anything in its cause/context chain is a
+    :class:`ContextOverflow`."""
+    return any(isinstance(e, ContextOverflow) for e in _chain(exc))
+
+
+#: Gateway failure codes a worker answers its Execute with when its ``run()`` ended
+#: on one, instead of INTERNAL (ENG-2125, owner decision 2026-11-18). Each says
+#: something the kernel acts on: the self-healer never retries OUT_OF_RANGE or
+#: UNAUTHENTICATED / PERMISSION_DENIED (deterministic) and backs off on
+#: RESOURCE_EXHAUSTED / UNAVAILABLE (transient); the chat lane tells the person
+#: which (cambrian-core internal/chat/failure.go). Any other code — INTERNAL from
+#: the gateway, INVALID_ARGUMENT, ABORTED, an author bug — stays INTERNAL: it is a
+#: fault of this worker's step, not a gateway verdict the kernel can act on.
+RELAYED_GATEWAY_CODES = frozenset({
+    "OUT_OF_RANGE", "UNAUTHENTICATED", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "UNAVAILABLE",
+})
+
+
+def relayed_gateway_error(exc: BaseException) -> "GenerateError | None":
+    """The :class:`GenerateError` in ``exc``'s cause/context chain whose code is one
+    of :data:`RELAYED_GATEWAY_CODES` (the outermost such), or None."""
+    for e in _chain(exc):
+        if isinstance(e, GenerateError) and e.status in RELAYED_GATEWAY_CODES:
+            return e
+    return None

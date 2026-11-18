@@ -157,6 +157,19 @@ def dispatch_run(agent: ServableAgent, task: AgentTask) -> AgentResult:
 DEPRECATED_PROPOSAL_RATIONALE = "deprecated: capability-typed dispatch solicits no bids (ADR-0100)"
 
 
+def _set_retry_info(context, code, details: str, retry_delay: float) -> None:
+    """Attach ``retry_delay`` to the Execute status as a google.rpc.RetryInfo detail, the
+    way the kernel gateway sent it (ENG-2125). Advice only: a failure here leaves the
+    code and details as set."""
+    from ._rpc_status import STATUS_DETAILS_KEY, status_details_bin
+
+    try:
+        raw = status_details_bin(code.value[0], details, retry_delay)
+        context.set_trailing_metadata(((STATUS_DETAILS_KEY, raw),))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("could not attach RetryInfo to the Execute status: %s", e)
+
+
 class TraitServicer:
     """Routes inbound AgentService RPCs to a trait agent's run() over the D3 boundary."""
 
@@ -191,11 +204,13 @@ class TraitServicer:
         task = _task_from_handoff(request, context)
         try:
             result = dispatch_run(self._agent, task)
-        except Exception as exc:  # author bug — surface as INTERNAL, never crash the server
+        except Exception as exc:  # never crash the server: answer with a status
             import grpc
 
-            from .errors import is_context_overflow
+            from .errors import is_context_overflow, relayed_gateway_error
 
+            code, retry_delay = grpc.StatusCode.INTERNAL, None
+            relayed = relayed_gateway_error(exc)
             # A prompt over the model's context window is deterministic for this
             # step: OUT_OF_RANGE, which the kernel's self-healer never retries.
             # Reported as INTERNAL it was retried as "unclassified" and the whole
@@ -203,14 +218,25 @@ class TraitServicer:
             # T-20261112-worker-resolve-cid-inline-has-no-size-cap-a).
             if is_context_overflow(exc):
                 logger.error("run() ended on a context overflow: %s", exc)
-                context.set_code(grpc.StatusCode.OUT_OF_RANGE)
+                code = grpc.StatusCode.OUT_OF_RANGE
+            elif relayed is not None:
+                # A gateway verdict (refused credential, rate limit, provider down) is
+                # passed through as the kernel's own code, with its RetryInfo, so the
+                # self-healer and the chat lane read the same thing they would from the
+                # gateway itself. As INTERNAL the person saw "StatusCode.INTERNAL:
+                # UNAUTHENTICATED: ..." (ENG-2125, owner decision 2026-11-18).
+                logger.error("run() ended on a gateway %s: %s", relayed.status, exc)
+                code, retry_delay = getattr(grpc.StatusCode, relayed.status), relayed.retry_delay
             else:
                 logger.error("run() raised: %s", exc, exc_info=True)
-                context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_code(code)
+            details = str(exc)[:2000]
             try:
-                context.set_details(str(exc)[:2000])
+                context.set_details(details)
             except Exception:  # noqa: BLE001 — a context double without set_details
                 pass
+            if retry_delay:
+                _set_retry_info(context, code, details, retry_delay)
             return cambrian_pb2.Handoff()
         return _handoff_from_result(result, request, self._agent.agent_id)
 

@@ -317,7 +317,9 @@ def _map_generate_error(exc, *, tools: bool):
         # The prompt is over the model's context window (owner decision A4).
         grpc.StatusCode.OUT_OF_RANGE: ContextOverflow,
     }.get(code, GenerateError)
-    return cls(details, code=name)
+    # The provider's Retry-After, when the gateway attached it as RetryInfo (ENG-2125).
+    from ._rpc_status import retry_delay_from_rpc
+    return cls(details, code=name, retry_delay=retry_delay_from_rpc(exc))
 
 
 def _log_request(rpc: str, blocks, messages, schema, ttl: str) -> None:
