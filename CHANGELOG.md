@@ -5,6 +5,13 @@ described by their git history.
 
 ## Unreleased
 
+## 0.1.6 (2026-11-18)
+
+The first release that ships `cambrian_agent_sdk.channel`, the unix kernel-socket path a
+sandboxed agent uses to reach the kernel (ADR-0157 S2/S5). 0.1.5 on PyPI lacks it, so a
+release-built agent environment could not boot a sandboxed agent (ENG-2033). Everything below
+was unreleased until now.
+
 ### Changed
 
 - **Memory reads present the running task's lease by default** (ENG-518, owner decision
