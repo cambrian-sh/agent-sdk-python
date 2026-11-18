@@ -143,6 +143,13 @@ def _lease_or_current(session_token_id: str) -> str:
     return session_token_id or _current_lease.get()
 
 
+def _lease_kwargs(session_token_id: str) -> dict:
+    """``{"metadata": <lease headers>}`` for a call made under the task's lease, or
+    ``{}`` when there is none (so a stub that takes no metadata keeps working)."""
+    md = _lease_metadata(_lease_or_current(session_token_id))
+    return {"metadata": md} if md else {}
+
+
 def _is_invalid_argument(exc) -> bool:
     import grpc
 
@@ -358,7 +365,14 @@ class MemoryClient:
 
 
 class ArtifactManager:
-    """``artifacts`` — save (narrow-only hint) / get / list_from_step. No scope tags."""
+    """``artifacts`` — save (narrow-only hint) / get / list_from_step. No scope tags.
+
+    Every call presents the running task's lease (``x-lease-id``; an explicit
+    ``session_token_id`` wins, outside a task nothing is sent), as memory reads do:
+    the kernel files an upload in that lease's run, session and step, and resolves
+    the caller's conversation owner for reads from it
+    (T-20261118-agent-artifacts-from-planner-lane-steps-carry). The request's own
+    ``session_id`` / ``step_index`` are never trusted for provenance."""
 
     def __init__(self, stub=None, channel=None) -> None:
         self._stub = stub
@@ -372,9 +386,11 @@ class ArtifactManager:
         session_id: str = "",
         step_index: int = 0,
         semantic_summary: str = "",
+        session_token_id: str = "",
     ) -> str:
         """Store bytes + metadata. ``hint`` is a **narrow-only** classification hint.
-        Returns the content hash. A coined hint raises :class:`InvalidTagError`."""
+        Returns the artifact reference (a ledger id). A coined hint raises
+        :class:`InvalidTagError`."""
         from ._proto import cambrian_pb2
 
         req = cambrian_pb2.UploadArtifactRequest(
@@ -386,29 +402,31 @@ class ArtifactManager:
             semantic_summary=semantic_summary,
         )
         try:
-            resp = self._stub.UploadArtifact(req)
+            resp = self._stub.UploadArtifact(req, **_lease_kwargs(session_token_id))
         except Exception as exc:
             if _is_invalid_argument(exc):
                 raise InvalidTagError(str(exc)) from exc
             raise
         return resp.hash
 
-    def get(self, artifact_hash: str) -> bytes:
+    def get(self, artifact_hash: str, session_token_id: str = "") -> bytes:
         """Fetch artifact bytes. Carries no scope tags — a scope-denied or missing
         artifact raises :class:`ArtifactNotFound` (absence, no existence leak)."""
         from ._proto import cambrian_pb2
 
-        resp = self._stub.GetArtifact(cambrian_pb2.GetArtifactRequest(hash=artifact_hash))
+        resp = self._stub.GetArtifact(cambrian_pb2.GetArtifactRequest(hash=artifact_hash),
+                                      **_lease_kwargs(session_token_id))
         if not resp.found:
             raise ArtifactNotFound(artifact_hash)
         return bytes(resp.content)
 
-    def list_from_step(self, session_id: str, step_index: int) -> list:
+    def list_from_step(self, session_id: str, step_index: int, session_token_id: str = "") -> list:
         """List prior-step artifacts readable under the agent's scope. No scope tags sent."""
         from ._proto import cambrian_pb2
 
         resp = self._stub.ListStepArtifacts(
-            cambrian_pb2.ListStepArtifactsRequest(session_id=session_id, step_index=step_index)
+            cambrian_pb2.ListStepArtifactsRequest(session_id=session_id, step_index=step_index),
+            **_lease_kwargs(session_token_id),
         )
         return list(resp.artifacts)
 

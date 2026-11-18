@@ -14,6 +14,12 @@ described by their git history.
   it `no_lease` on every chat turn and composed step. A use_skill load still sends its run
   key as `x-session-token` too.
 
+- **Artifact calls present the running task's lease** (ENG-2086). `ArtifactManager.save`, `get`
+  and `list_from_step` take an optional `session_token_id` and otherwise send the task's lease
+  as `x-lease-id`, so an upload is filed in the run, session and step it was made in and an
+  artifact read resolves the caller's conversation owner. `save` returns the artifact reference
+  (a ledger id), as it has since ADR-0157 S4.
+
 ## 0.1.6 (2026-11-18)
 
 The first release that ships `cambrian_agent_sdk.channel`, the unix kernel-socket path a
