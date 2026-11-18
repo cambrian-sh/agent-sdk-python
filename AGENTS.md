@@ -108,6 +108,11 @@ mypy                  # types: the cambrian_agent_sdk package, _proto/ excluded 
 All three pass on a clean tree (ENG-1450, 2026-11-14). No CI workflow runs them yet, so run them
 yourself before claiming a change is clean.
 
+`tests/conftest.py` caps the test process's committed memory (Windows job object, `RLIMIT_DATA`
+elsewhere; `CAMBRIAN_PYTEST_MEMORY_MB`, default 1536, `0` = off — ENG-1606): a runaway test fails
+with `MemoryError` under its own name instead of exhausting the host. Do not switch it off to make a
+test pass; fix the test.
+
 ## Change discipline
 
 - **Keep the knowledge cards true.** When you add, remove, or change code, architecture, behaviour, modules, domain terms, or known gaps, update the card(s) for that area in HQ (`brief <path>` names them; `read_doc` → edit → `write_doc` with a reason and `base_rev`, then `verify_card`). A new area gets a new card (`read_doc cards/README.md` for the format); new terms go into `card.concept.glossary`; known gaps are tickets, not prose. The cards are the source of truth for agents and humans navigating the repo; a stale card is worse than none. `CONTEXT.md` is a short stub and holds no facts.
