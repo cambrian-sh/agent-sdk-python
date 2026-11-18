@@ -5,6 +5,13 @@ described by their git history.
 
 ## Unreleased
 
+### Changed
+
+- Re-vendored `cambrian_pb2` for kernel contract 0110 (ENG-2147, ENG-2154): the agent-plane
+  `ErasureSelector.memory_note_ids` (name entries of the run principal's own memory notes)
+  and `ErasureReceipt.redacted_messages` (the chat replies an erase redacted). Additive; no
+  SDK API changes.
+
 ## 0.1.8 (2026-11-18)
 
 Ships heartbeat liveness (ADR-0070 D3): a kernel-spawned daemon or pool worker that stays
