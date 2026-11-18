@@ -5,6 +5,11 @@ described by their git history.
 
 ## Unreleased
 
+## 0.1.7 (2026-11-18)
+
+Releases the lease fixes: on 0.1.6 the reasoning loop's skill menu and the artifact calls sent
+no lease, so an authenticated kernel refused the menu `no_lease` on every chat turn.
+
 ### Fixed
 
 - **Skill and tool menus present the running task's lease** (ENG-2087). `SubstrateClient.
