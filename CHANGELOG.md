@@ -13,6 +13,12 @@ described by their git history.
   `failed`, chunks embedded of total, error), and the new `GetIngestStatus` RPC reads a
   document's progress (writer only) for a caller that needs read-your-writes. No SDK API
   change: `remember()` returns the entity id as before.
+- **Vendored stubs match kernel contract 0112** (ENG-2170). `IngestMemoryRequest.labels`: the
+  writer's non-classification markers (a document revision's lifecycle `in-force` /
+  `superseded`, `rev<N>`, corpus and document ids), carried beside `tags`. The kernel stores
+  them on the document and every chunk, never treats them as classification (the write ceiling
+  never filters them), and reads `superseded` for the superseded-revision ranking. Additive;
+  no SDK API change.
 
 ## 0.1.8 (2026-11-18)
 
