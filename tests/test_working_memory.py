@@ -316,8 +316,7 @@ def test_tool_call_step_inlines_small_body_in_full():
     doesn't need to re-read. This is the path that closed the field's
     'model re-reads 4 times' gap (a 3475-char HTML was being truncated
     to 400 chars; the model kept re-reading)."""
-    import html as _html
-
+    from cambrian_agent_sdk.payload_fence import fence_untrusted
     from cambrian_agent_sdk.working_memory import Step, render_step_xml
     body = "<!DOCTYPE html>... 3475 chars ...</html>"
     s = Step(
@@ -326,8 +325,9 @@ def test_tool_call_step_inlines_small_body_in_full():
         summary="read_file result", body=body, cid="", chars=len(body),
     )
     xml = render_step_xml(s)
-    # The FULL body is in the prompt (XML-escaped) — not a 400-char preview.
-    assert _html.escape(body) in xml
+    # The FULL body is in the prompt (inside the tool-output payload fence, ENG-94) —
+    # not a 400-char preview.
+    assert fence_untrusted(body, "tool_output", "tool:mcp:filesystem/read_file") in xml
     # The status is visible.
     assert "status='ok'" in xml
     # There's no offload hint (the body is inlined, so no need).

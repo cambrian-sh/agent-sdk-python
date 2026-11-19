@@ -5,6 +5,23 @@ described by their git history.
 
 ## Unreleased
 
+### Security
+
+- **Recalled memory and tool output reach the model inside the payload fence** (ENG-94,
+  ADR-0063). Every recalled memory (seed recall, `memory_query` steps and tool turns) and
+  every tool result (text-path trajectory, native tool turns, oversize previews) is now
+  rendered inside a nonce-delimited `<untrusted_data provenance="…" origin="…">` block
+  whose text is one JSON-encoded line, so a recalled document or tool output that says
+  "ignore previous instructions", forges a fence line or carries a fake closing tag stays
+  data. The block is the kernel's own format (`cambrian-core/domain/untrusted_fence.go`),
+  held byte for byte by a fixture the Go tests write
+  (`tests/test_payload_fence.py`). New: `cambrian_agent_sdk.payload_fence`
+  (`fence_untrusted`), `working_memory.render_recalled_memory` and
+  `working_memory.fence_tool_output`. The fence's nonce is keyed on the block's content
+  under a per-process secret, so the history the loop re-sends every round stays
+  byte-identical (the provider cache keeps its prefix). Prompts that quoted tool output
+  or memory text verbatim now carry it JSON-encoded inside the fence.
+
 ## 0.1.8 (2026-11-18)
 
 Ships heartbeat liveness (ADR-0070 D3): a kernel-spawned daemon or pool worker that stays

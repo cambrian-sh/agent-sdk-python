@@ -33,6 +33,11 @@ from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 from .helpers import _esc  # v2: XML-escape for the rich trajectory renderer
+from .payload_fence import (
+    PROVENANCE_RECALLED_MEMORY,
+    PROVENANCE_TOOL_OUTPUT,
+    fence_untrusted,
+)
 
 # Default working-memory capacity: the max entries assembled into the prompt each
 # turn (ADR-0041 D2). Bounding here is what turns O(N²) prompt growth into ~O(k).
@@ -359,7 +364,7 @@ def render_step_xml(s) -> str:
                 f"  <result status={_esc(s.status)!r}"
                 f" offloaded_cid={_esc(s.cid)!r}"
                 f" chars={s.chars!r}>\n"
-                f"    <summary>{_esc(s.summary or '(no summary — re-call or describe_tool)')}</summary>\n"
+                f"    <summary>{fence_tool_output(s.summary, s.tool) if s.summary else '(no summary — re-call or describe_tool)'}</summary>\n"
                 + cid_hint
                 + "  </result>"
             )
@@ -382,8 +387,8 @@ def render_step_xml(s) -> str:
             result_xml = (
                 f"  <result status={_esc(s.status)!r}"
                 f" chars={s.chars or len(body)!r}>\n"
-                f"    <summary>{_esc(s.summary or preview)}</summary>\n"
-                f"    <body_preview>{_esc(preview)}</body_preview>\n"
+                f"    <summary>{fence_tool_output(s.summary or preview, s.tool)}</summary>\n"
+                f"    <body_preview>{fence_tool_output(preview, s.tool)}</body_preview>\n"
                 + offload_hint
                 + "  </result>"
             )
@@ -394,7 +399,7 @@ def render_step_xml(s) -> str:
             # need to call again.
             result_xml = (
                 f"  <result status={_esc(s.status)!r}>\n"
-                f"    <body>{_esc(body)}</body>\n"
+                f"    <body>{fence_tool_output(body, s.tool)}</body>\n"
                 f"  </result>"
             )
         return (
@@ -604,16 +609,41 @@ def memory_provenance_attrs(r) -> str:
     return " ".join(attrs)
 
 
+def memory_origin(r) -> str:
+    """Who wrote a recalled memory, for its fence's ``origin``: the kernel-stamped
+    writing principal (``source:<connector>:<id>`` for an ingested document, webhook
+    or poller body; an agent id; ``system``), or ``''`` when the kernel sent none."""
+    src = str(_memory_meta(r).get("source_agent", "") or "")
+    return "system" if src == "System" else src
+
+
+def render_recalled_memory(r, indent: str = "") -> str:
+    """One recalled memory as it reaches a prompt (ENG-94): the ``<memory>`` element
+    with its provenance + freshness attributes (ADR-0048 A1), its TEXT inside the
+    kernel's nonce payload fence (ADR-0063) marked ``provenance="recalled_memory"``
+    with the writer as origin. A recalled document that says "ignore previous
+    instructions" is one JSON-encoded data line the model is told is not
+    instructions, and a fake closing tag in it cannot end the region. Every recall
+    surface (memory_query steps and tool turns, the seed recall, the chat agent's
+    seed recall) renders through here."""
+    text = r.get("text", r) if isinstance(r, dict) else getattr(r, "text", r)
+    fenced = fence_untrusted(text, PROVENANCE_RECALLED_MEMORY, memory_origin(r))
+    return f"{indent}<memory {memory_provenance_attrs(r)}>\n{fenced}\n{indent}</memory>"
+
+
+def fence_tool_output(body: Any, tool: str) -> str:
+    """A tool's output as it reaches a prompt (ENG-94): inside the kernel's payload
+    fence, ``provenance="tool_output"``, ``origin="tool:<name>"``. A preview or a
+    summary of a tool's output is its output too and goes through here."""
+    return fence_untrusted(body, PROVENANCE_TOOL_OUTPUT, f"tool:{tool}" if tool else "tool")
+
+
 def _render_memory_results(results) -> str:
     """Render a memory_query's results as ``<memory>`` children with provenance +
-    freshness attributes (ADR-0048 A1)."""
+    freshness attributes (ADR-0048 A1), each text fenced (ENG-94)."""
     if not results:
         return "  <note>no relevant memory found</note>"
-    items = []
-    for r in results:
-        text = r.get("text", r) if isinstance(r, dict) else getattr(r, "text", r)
-        items.append(f"  <memory {memory_provenance_attrs(r)}>{_esc(text)}</memory>")
-    return "\n".join(items)
+    return "\n".join(render_recalled_memory(r, indent="  ") for r in results)
 
 
 # The longest query text a memory_query rendering carries in an attribute. The query

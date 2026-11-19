@@ -76,6 +76,7 @@ from .working_memory import (
     _condense_args,
     _render_call_xml,
     _render_memory_results,
+    fence_tool_output,
     render_step_xml,
     short_query,
 )
@@ -446,14 +447,17 @@ class DefaultContextEngine:
     def tool_turn_content(self, content: str, tool: str) -> str:
         """The native tool turn for one output: verbatim, unless it alone is over
         ``tool_output_max_chars``, in which case a head preview plus a cid (kept
-        retrievable) replaces it even in the protected tail."""
+        retrievable) replaces it even in the protected tail. The preview is the tool's
+        output, so it is fenced as tool output (ENG-94); a verbatim return is fenced
+        by the caller (react._tool_turn_content)."""
         if len(content) <= self.config.tool_output_max_chars:
             return content
         cid = self._store(content)
         preview = content[: self.config.tool_output_preview_chars]
         self._event(event="compaction", phase=1, path="native", reason="oversize", cids=[cid],
                     chars=len(content))
-        return _cp("placeholder-preview", tool=tool, chars=len(content), cid=cid, preview=preview)
+        return _cp("placeholder-preview", tool=tool, chars=len(content), cid=cid,
+                   preview=fence_tool_output(preview, tool))
 
     def add_tool_card(self, card: ToolCard) -> None:
         """Compatibility: a card without a history step (recurrence evidence only)."""
@@ -555,7 +559,7 @@ class DefaultContextEngine:
             if it.compacted_cid:
                 if it.preview:
                     inner = _cp("placeholder-preview", tool=s.tool, chars=it.compacted_chars,
-                                cid=it.compacted_cid, preview=_esc(it.preview))
+                                cid=it.compacted_cid, preview=fence_tool_output(it.preview, s.tool))
                 else:
                     inner = _cp("placeholder", tool=s.tool, chars=it.compacted_chars,
                                 cid=it.compacted_cid)
@@ -565,11 +569,14 @@ class DefaultContextEngine:
             elif s.cid:
                 ev = (f"  <evidence source={_esc(src)!r} status={_esc(s.status)!r}"
                       f" offloaded_cid={_esc(s.cid)!r}>\n"
-                      f"    {_esc(s.summary or '')}\n"
+                      f"    {fence_tool_output(s.summary, s.tool) if s.summary else ''}\n"
                       f"    {_cp('kernel-offloaded', cid=s.cid)}\n  </evidence>")
             else:
+                # ENG-94: the output is fenced data with its provenance; the fence's
+                # nonce is keyed on the content, so a re-render of the same history
+                # is byte-identical (the prompt cache keeps the prefix).
                 ev = (f"  <evidence source={_esc(src)!r} status={_esc(s.status)!r}>\n"
-                      f"{_esc(it.tool_body())}\n  </evidence>")
+                      f"{fence_tool_output(it.tool_body(), s.tool)}\n  </evidence>")
             return (f"<step n={s.n!r} type='tool_call' tool={_esc(s.tool)!r} status={_esc(s.status)!r}>\n"
                     f"  <call>{call_xml}\n  </call>\n{ev}\n</step>")
         if s.kind == "memory_query":
@@ -932,7 +939,9 @@ class DefaultContextEngine:
         return True
 
 
-_LEDGER_REF_RE = re.compile(r'"(?:_ledger_ref|cid)"\s*:\s*"(led_[0-9a-f]+)"')
+# A native tool turn is the output inside the payload fence (ENG-94), JSON-encoded
+# once more, so its quotes arrive escaped (\"_ledger_ref\": \"led_…\"); both forms match.
+_LEDGER_REF_RE = re.compile(r'\\?"(?:_ledger_ref|cid)\\?"\s*:\s*\\?"(led_[0-9a-f]+)\\?"')
 
 
 def ledger_ref_of(body: str) -> str:

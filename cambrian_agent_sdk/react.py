@@ -76,6 +76,7 @@ from .working_memory import (
     ToolCard,
     _render_memory_results,
     action_text,
+    fence_tool_output,
     memory_provenance_attrs,
     render_memory_query_reply,
     render_step_xml,
@@ -3123,13 +3124,21 @@ def _fixed_native_tokens(system: List[Dict[str, Any]], tool_defs: List[Dict[str,
 
 def _tool_turn_content(engine, out: Any, tool: str) -> str:
     """The native tool turn for one result: JSON where possible; an engine that caps a
-    single oversize output (the default engine) replaces it with a preview plus cid."""
+    single oversize output (the default engine) replaces it with a preview plus cid.
+
+    The output reaches the model inside the payload fence, ``provenance="tool_output"``
+    (ENG-94): what a tool returned is data, never instructions. The cap runs on the raw
+    output (an engine's placeholder fences its own preview), so a capped turn is never
+    a fence cut in half."""
     try:
         content = json.dumps(out, default=str)
     except (TypeError, ValueError):
         content = str(out)
     cap = getattr(engine, "tool_turn_content", None)
-    return cap(content, tool) if cap is not None else content
+    capped = cap(content, tool) if cap is not None else content
+    if capped == content:
+        return fence_tool_output(content, tool)
+    return capped
 
 
 def _is_read_only_tool(agent, system_tools: Optional[List[Dict]], name: str) -> bool:
@@ -4034,14 +4043,10 @@ def _render_memory_children(results) -> str:
     """Render a memory_query's results as ``<memory>`` children with provenance +
     freshness attributes (ADR-0048 A1: source/author/session/written/age/freshness/
     content_cid). Attribute assembly is shared with the working_memory renderers via
-    :func:`memory_provenance_attrs` so every recall surface tags facts identically."""
-    if not results:
-        return "  <note>no relevant memory found</note>"
-    items = []
-    for r in results:
-        text = r.get("text", r) if isinstance(r, dict) else getattr(r, "text", r)
-        items.append(f"  <memory {memory_provenance_attrs(r)}>{_esc(text)}</memory>")
-    return "\n".join(items)
+    :func:`memory_provenance_attrs` so every recall surface tags facts identically, and
+    each text is inside the payload fence (ENG-94) — this IS the working_memory
+    renderer, so the two cannot drift."""
+    return _render_memory_results(results)
 
 
 # ADR-0048 #1: the recall block carried into the prompt. When the kernel's
