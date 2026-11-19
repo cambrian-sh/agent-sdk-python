@@ -5,6 +5,15 @@ described by their git history.
 
 ## Unreleased
 
+### Changed
+
+- **Vendored `cambrian_pb2` stubs match kernel contract 0111** (ENG-2143): additive. A large
+  `IngestMemory` is accepted at once and embedded in the background; the response gains
+  `document_id` and `status` (`IngestStatus`: state `accepted` | `embedding` | `searchable` |
+  `failed`, chunks embedded of total, error), and the new `GetIngestStatus` RPC reads a
+  document's progress (writer only) for a caller that needs read-your-writes. No SDK API
+  change: `remember()` returns the entity id as before.
+
 ## 0.1.8 (2026-11-18)
 
 Ships heartbeat liveness (ADR-0070 D3): a kernel-spawned daemon or pool worker that stays

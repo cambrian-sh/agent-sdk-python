@@ -94,6 +94,11 @@ class OrchestratorStub:
                 request_serializer=cambrian__pb2.IngestMemoryRequest.SerializeToString,
                 response_deserializer=cambrian__pb2.IngestMemoryResponse.FromString,
                 _registered_method=True)
+        self.GetIngestStatus = channel.unary_unary(
+                '/cambrian.Orchestrator/GetIngestStatus',
+                request_serializer=cambrian__pb2.GetIngestStatusRequest.SerializeToString,
+                response_deserializer=cambrian__pb2.IngestStatus.FromString,
+                _registered_method=True)
         self.ExecuteTool = channel.unary_unary(
                 '/cambrian.Orchestrator/ExecuteTool',
                 request_serializer=cambrian__pb2.ExecuteToolRequest.SerializeToString,
@@ -302,6 +307,17 @@ class OrchestratorServicer:
     def IngestMemory(self, request, context):
         """memory.remember() write-back. The kernel DERIVES classification from the
         agent's DefaultWriteTags (ADR-0035 C2); req.tags is a narrow-only hint.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetIngestStatus(self, request, context):
+        """ENG-2143: where an ingested document stands. A large document is accepted at
+        once and embedded in the background; this reads its progress (accepted ->
+        embedding n/total -> searchable, or failed with a reason). Only the document's
+        writer may read it; any other caller, and an unknown id, get NOT_FOUND. A
+        caller needing read-your-writes polls until the state is searchable.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -593,6 +609,11 @@ def add_OrchestratorServicer_to_server(servicer, server):
                     servicer.IngestMemory,
                     request_deserializer=cambrian__pb2.IngestMemoryRequest.FromString,
                     response_serializer=cambrian__pb2.IngestMemoryResponse.SerializeToString,
+            ),
+            'GetIngestStatus': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetIngestStatus,
+                    request_deserializer=cambrian__pb2.GetIngestStatusRequest.FromString,
+                    response_serializer=cambrian__pb2.IngestStatus.SerializeToString,
             ),
             'ExecuteTool': grpc.unary_unary_rpc_method_handler(
                     servicer.ExecuteTool,
@@ -1014,6 +1035,33 @@ class Orchestrator:
             '/cambrian.Orchestrator/IngestMemory',
             cambrian__pb2.IngestMemoryRequest.SerializeToString,
             cambrian__pb2.IngestMemoryResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetIngestStatus(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cambrian.Orchestrator/GetIngestStatus',
+            cambrian__pb2.GetIngestStatusRequest.SerializeToString,
+            cambrian__pb2.IngestStatus.FromString,
             options,
             channel_credentials,
             insecure,
