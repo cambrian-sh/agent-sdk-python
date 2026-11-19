@@ -547,8 +547,11 @@ class ArtifactManager:
         return resp.hash
 
     def get(self, artifact_hash: str, session_token_id: str = "") -> bytes:
-        """Fetch artifact bytes. Carries no scope tags — a scope-denied or missing
-        artifact raises :class:`ArtifactNotFound` (absence, no existence leak)."""
+        """Fetch artifact bytes. ``artifact_hash`` is the reference :meth:`save`
+        returned — a run-ledger id since ADR-0157 S4, not a content hash; the
+        parameter keeps its name so existing keyword callers still work. Carries
+        no scope tags — a scope-denied or missing artifact raises
+        :class:`ArtifactNotFound` (absence, no existence leak)."""
         from ._proto import cambrian_pb2
 
         resp = self._stub.GetArtifact(cambrian_pb2.GetArtifactRequest(hash=artifact_hash),
