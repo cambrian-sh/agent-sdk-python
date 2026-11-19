@@ -17,8 +17,8 @@ from __future__ import annotations
 import time
 import warnings
 from contextlib import contextmanager
-from dataclasses import dataclass
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Sequence, Tuple
 

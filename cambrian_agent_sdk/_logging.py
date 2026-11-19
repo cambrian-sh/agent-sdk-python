@@ -21,7 +21,10 @@ _agent_id_var: ContextVar[str] = ContextVar("agent_id", default="")
 # ``extra={...}`` and is forwarded as a structured field. Without this the SDK's
 # structured lines (react_llm_request, react_llm_usage, ...) reached the kernel log
 # with their data silently dropped (T-20261105-sdk-react-llm-request-react-llm-usage-evidence).
-_STD_ATTRS = frozenset(vars(logging.LogRecord("", 0, "", 0, "", None, None))) | {"message", "asctime"}
+# "taskName" is listed explicitly: LogRecord carries it only from Python 3.12, and
+# without it the reserved set (and so what safe_extra renames) differed between the
+# 3.10 floor pyproject declares and newer Pythons.
+_STD_ATTRS = frozenset(vars(logging.LogRecord("", 0, "", 0, "", None, None))) | {"message", "asctime", "taskName"}
 _RESERVED = frozenset({"time", "level", "msg", "logger", "task_id", "agent_id"})
 
 

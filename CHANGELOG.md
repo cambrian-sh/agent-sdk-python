@@ -5,6 +5,13 @@ described by their git history.
 
 ## Unreleased
 
+### Fixed
+
+- **`safe_extra` renames `taskName` on every Python** (ENG-2230). `LogRecord` carries
+  `taskName` only from Python 3.12, so on 3.10/3.11 an `extra={"taskName": ...}` field was
+  not treated as reserved; the reserved set now lists it explicitly and behaves the same
+  on every supported Python.
+
 ## 0.1.8 (2026-11-18)
 
 Ships heartbeat liveness (ADR-0070 D3): a kernel-spawned daemon or pool worker that stays

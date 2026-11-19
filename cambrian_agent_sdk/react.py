@@ -77,7 +77,6 @@ from .working_memory import (
     _render_memory_results,
     action_text,
     fence_tool_output,
-    memory_provenance_attrs,
     render_memory_query_reply,
     render_step_xml,
 )

@@ -40,10 +40,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .base import Agent, CognitiveAgent, DaemonAgent
 from .clients import (
+    INGEST_STATES,
     TIME_PRECISIONS,
     TIME_SOURCES,
     ArtifactManager,
-    INGEST_STATES,
     ArtifactNotFound,
     IngestFailedError,
     IngestStatus,

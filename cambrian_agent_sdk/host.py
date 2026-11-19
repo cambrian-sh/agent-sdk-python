@@ -71,8 +71,12 @@ def _windows_desktop() -> Optional[Path]:
     all. The registry's Shell Folders entry is what Explorer itself uses, so it
     is the only source that survives redirection.
     """
+    # The platform check is what lets mypy type-check this module on Linux:
+    # it skips the Windows-only winreg calls instead of flagging them.
+    if sys.platform != "win32":
+        return None
     try:
-        import winreg  # type: ignore[import-not-found]  # Windows-only stdlib
+        import winreg  # Windows-only stdlib
 
         key = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
@@ -82,8 +86,8 @@ def _windows_desktop() -> Optional[Path]:
             if p.is_dir():
                 return p
     except Exception:
-        # No registry, no such value, or a non-Windows import error: fall through
-        # to the conventional location rather than failing the whole block.
+        # No registry or no such value: fall through to the conventional
+        # location rather than failing the whole block.
         pass
     return None
 
