@@ -976,9 +976,17 @@ def action_from_native_turn(text: str, calls: List[Dict[str, str]], stop_reason:
         if raw:
             try:
                 args = json.loads(raw)
-            except ValueError:
+            except ValueError as exc:
                 # A malformed argument blob is a failed action, not a final answer.
-                return {"action": "_truncated", "raw": raw}
+                # It was CUT OFF only when the provider stopped at the output limit;
+                # any other stop reason means the model wrote malformed JSON, and
+                # telling it to "chunk the output" would be the wrong advice
+                # (T-20261114-sdk-reports-malformed-native-tool-call).
+                if stop_reason == "max_tokens":
+                    return {"action": "_truncated", "raw": raw}
+                bad = first.get("name", "")
+                return {"action": "_invalid_args", "tool": (name_map or {}).get(bad, bad),
+                        "error": str(exc), "raw": raw}
         if not isinstance(args, dict):
             args = {"value": args}
         provider_name = first.get("name", "")
@@ -1290,6 +1298,7 @@ def run_think(
     denial_counts: Dict[Tuple[str, str, str], int] = {}
     success_dedup_counts: Dict[str, int] = {}  # ADR-0041 D4: per-action already-succeeded tally
     truncation_retries = 0  # #2: consecutive token-limit truncations re-prompted
+    invalid_args_retries = 0  # malformed native tool-call arguments re-prompted (T-20261114-sdk-reports-malformed-native-tool-call)
     inferred_answer_retries = 0  # non-action responses re-prompted (see note above)
     drafted_answer = ""  # the last inferred answer re-prompted; carried on ReActLoopError
     unknown_action_retries = 0  # unrecognised action kinds re-prompted (_MAX_UNKNOWN_ACTION_RETRIES)
@@ -1856,6 +1865,25 @@ def run_think(
             else:
                 how = _nudge("truncated-how-none")
             wm.add_text(_nudge("truncated", how=how))
+            continue
+
+        if kind == "_invalid_args":
+            # The model's native tool call carried arguments that are not valid JSON
+            # (and the provider did not stop at the output limit): nothing ran. Say
+            # so, with the parse error, and let it call again — bounded like the
+            # truncation retries.
+            invalid_args_retries += 1
+            if invalid_args_retries > _MAX_TRUNCATION_RETRIES:
+                logger.warning("react_invalid_args_exhausted", extra={"round": round_no})
+                return AgentResult.from_text(
+                    "Could not complete the task: the tool-call arguments kept failing "
+                    "to parse as JSON.",
+                    type="error",
+                )
+            logger.info("react_invalid_args", extra={"round": round_no, "retry": invalid_args_retries,
+                                                     "tool": action.get("tool", "")})
+            wm.add_text(_nudge("invalid-args", tool=repr(action.get("tool", "")),
+                               error=action.get("error", "")))
             continue
 
         if kind == "memory_query":

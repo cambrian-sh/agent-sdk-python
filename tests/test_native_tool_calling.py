@@ -8,7 +8,7 @@ import json
 
 import pytest
 
-from cambrian_agent_sdk import AgentTask, CognitiveAgent, ToolCallingUnsupported, tool
+from cambrian_agent_sdk import AgentTask, CognitiveAgent, ToolCallingUnsupported, react, tool
 from cambrian_agent_sdk.react import (
     action_from_native_turn,
     build_tool_definitions,
@@ -93,9 +93,42 @@ def test_non_end_turn_without_calls_is_incomplete(stop):
 
 def test_malformed_arguments_are_not_a_final_answer():
     """A tool call the provider mangled is a failed ACTION. Treating it as an answer
-    would finish the task on a parse error — the exact bug this ADR removes."""
-    act = action_from_native_turn("", [{"id": "c1", "name": "w", "arguments": "{not json"}], "tool_use")
-    assert act["action"] == "_truncated"
+    would finish the task on a parse error — the exact bug this ADR removes. Cut off
+    at the output limit it is a truncation; under any other stop reason the JSON was
+    malformed (T-20261114-sdk-reports-malformed-native-tool-call)."""
+    cut = action_from_native_turn("", [{"id": "c1", "name": "w", "arguments": '{"text": "abc'}], "max_tokens")
+    assert cut["action"] == "_truncated"
+    for stop in ("tool_use", "end_turn", "unknown", ""):
+        bad = action_from_native_turn("", [{"id": "c1", "name": "w_s", "arguments": "{not json"}], stop,
+                                      name_map={"w_s": "mcp:fs/write"})
+        assert bad["action"] == "_invalid_args", stop
+        assert bad["tool"] == "mcp:fs/write" and bad["error"] and bad["raw"] == "{not json"
+
+
+def test_malformed_arguments_get_the_invalid_args_note_not_the_truncation_note():
+    """The loop tells the model its arguments were not valid JSON (with the error),
+    never that it hit the output limit, and lets it call again."""
+    sub = _NativeLLM(turns=[
+        ("", [{"id": "c1", "name": "echo", "arguments": "{text: hi}"}], "tool_use"),
+        ("", [{"id": "fa", "name": "final_answer", "arguments": '{"answer": "done"}'}], "tool_use"),
+    ])
+    bot = ToolBot(agent_id="b")
+    bot.substrate = sub
+    res = run_think(bot, AgentTask(text="do it"), seed_system_tools=False)
+    assert res.data.decode() == "done"
+    second = " ".join(m.get("content") or "" for m in sub.sent_conversations[1])
+    assert "were not valid JSON" in second and "'echo'" in second, second
+    assert "TRUNCATED" not in second, second
+
+
+def test_malformed_arguments_retries_are_bounded():
+    bad = ("", [{"id": "c1", "name": "echo", "arguments": "{nope"}], "tool_use")
+    sub = _NativeLLM(turns=[bad] * 10)
+    bot = ToolBot(agent_id="b")
+    bot.substrate = sub
+    res = run_think(bot, AgentTask(text="do it"), seed_system_tools=False)
+    assert res.type == "error" and "failing to parse as JSON" in res.data.decode()
+    assert sub.native_calls == react._MAX_TRUNCATION_RETRIES + 1
 
 
 # ── tool definitions ─────────────────────────────────────────────────────────

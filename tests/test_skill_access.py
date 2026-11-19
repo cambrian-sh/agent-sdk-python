@@ -111,3 +111,16 @@ def test_nudges_v3_keep_v2_sections_byte_identical():
         assert v3[name].body == frag.body, name
     assert {"skill-pending", "skill-denied", "skills-requestable"} <= set(v3)
     assert react._nudge("skill-denied", skill="'x'", detail="no").startswith("<note>Skill 'x' is not available")
+
+
+def test_nudges_v6_keep_v5_sections_byte_identical():
+    """react-nudges v6 only ADDS invalid-args (T-20261114-sdk-reports-malformed-native-tool-call)."""
+    from cambrian_agent_sdk import prompt_library as pl
+    v5, v6 = pl.sections(pl.get_version("react-nudges", 5)), pl.sections(pl.get_version("react-nudges", 6))
+    for name, frag in v5.items():
+        assert v6[name].body == frag.body, name
+    assert set(v6) - set(v5) == {"invalid-args"}
+    assert pl.get("react-nudges").version == 6
+    assert react._nudge("invalid-args", tool="'x'", error="Expecting value") == (
+        "<note>The arguments of your call to 'x' were not valid JSON (Expecting value), so it was "
+        "not executed. Call it again with its arguments as one well-formed JSON object.</note>")

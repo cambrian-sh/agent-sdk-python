@@ -28,6 +28,14 @@ described by their git history.
 
 ### Fixed
 
+- **Malformed native tool-call arguments are no longer reported as a truncation**
+  (ENG-1597). A native tool call whose `arguments` are not valid JSON was treated as cut
+  off at the output limit whatever the stop reason, and the model was told to chunk its
+  output. It is a truncation only when the provider stopped at `max_tokens`; otherwise the
+  loop returns `_invalid_args` and answers with the new react-nudges v6 `invalid-args` note
+  (the tool and the JSON error), bounded like the truncation retries. Every v5 nudge is
+  byte-identical.
+
 - **`safe_extra` renames `taskName` on every Python** (ENG-2230). `LogRecord` carries
   `taskName` only from Python 3.12, so on 3.10/3.11 an `extra={"taskName": ...}` field was
   not treated as reserved; the reserved set now lists it explicitly and behaves the same
