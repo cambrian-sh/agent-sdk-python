@@ -36,6 +36,7 @@ from .helpers import _esc  # v2: XML-escape for the rich trajectory renderer
 from .payload_fence import (
     PROVENANCE_RECALLED_MEMORY,
     PROVENANCE_TOOL_OUTPUT,
+    SOURCE_CLASSES,
     fence_untrusted,
 )
 
@@ -617,6 +618,15 @@ def memory_origin(r) -> str:
     return "system" if src == "System" else src
 
 
+def memory_source(r) -> str:
+    """A recalled memory's trust source for its fence's ``source`` (ENG-2223): the
+    kernel-stamped ``_source_class`` (``domain.MetaSourceClass``, ingested or
+    other-agent), or ``''`` — then the channel default, other-agent — when the kernel
+    sent none or a value outside the closed set."""
+    src = str(_memory_meta(r).get("_source_class", "") or "")
+    return src if src in SOURCE_CLASSES else ""
+
+
 def render_recalled_memory(r, indent: str = "") -> str:
     """One recalled memory as it reaches a prompt (ENG-94): the ``<memory>`` element
     with its provenance + freshness attributes (ADR-0048 A1), its TEXT inside the
@@ -627,7 +637,7 @@ def render_recalled_memory(r, indent: str = "") -> str:
     surface (memory_query steps and tool turns, the seed recall, the chat agent's
     seed recall) renders through here."""
     text = r.get("text", r) if isinstance(r, dict) else getattr(r, "text", r)
-    fenced = fence_untrusted(text, PROVENANCE_RECALLED_MEMORY, memory_origin(r))
+    fenced = fence_untrusted(text, PROVENANCE_RECALLED_MEMORY, memory_origin(r), source=memory_source(r))
     return f"{indent}<memory {memory_provenance_attrs(r)}>\n{fenced}\n{indent}</memory>"
 
 

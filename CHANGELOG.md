@@ -5,6 +5,18 @@ described by their git history.
 
 ## Unreleased
 
+### Changed
+
+- **The payload fence names the trust source** (ENG-2223). Every `<untrusted_data>` block
+  now carries `source="<class>"` after `provenance=`: the kernel's `domain.SourceClass`
+  (user, operator, web, tool, other-agent, ingested), the label the Rule-of-Two gate
+  reads, beside the rendering channel. `fence_untrusted` takes `source=`; without it the
+  channel's default applies (`default_source_class`: recalled memory and worker results
+  other-agent, ingested documents ingested, tool output web). A recalled memory names the
+  kernel-stamped `_source_class` of its record. Held byte for byte to the kernel renderer
+  by the shared fixture; a prompt that matched the old fence header exactly must allow
+  the new attribute.
+
 ### Fixed
 
 - **`safe_extra` renames `taskName` on every Python** (ENG-2230). `LogRecord` carries
