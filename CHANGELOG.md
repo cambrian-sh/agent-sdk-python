@@ -5,6 +5,15 @@ described by their git history.
 
 ## Unreleased
 
+### Deprecated
+
+- **`MemoryClient.recall_actions` returns `[]` without calling the kernel** (ENG-1645).
+  The kernel removed the ADR-0049 D4 actions lane: the action records it read are no
+  longer written (owner decision 2026-11-14, ENG-1595), and a current kernel answers
+  `x-lane=actions` from the fact lane, which would hand the caller facts labelled as its
+  own actions. The method stays (published API) and emits a `DeprecationWarning`, like
+  `recall_precedents`. Use `recall()` for facts.
+
 ### Changed
 
 - **The payload fence names the trust source** (ENG-2223). Every `<untrusted_data>` block

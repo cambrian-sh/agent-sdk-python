@@ -286,17 +286,24 @@ class MemoryClient:
 
     def recall_actions(self, query: str, top_k: int = 5, timeout_ms: int = 0,
                        session_token_id: str = "") -> List[dict]:
-        """Retrieve from the ACTIONS lane (ADR-0049 D4) — "what did I do" (action
-        records), a SEPARATE intent from :meth:`recall` ("what do I know") so action
-        breadcrumbs never re-bloat fact grounding. Routed by the ``x-lane=actions``
-        gRPC metadata; same server-side scope/relevance gating as fact recall."""
-        from ._proto import cambrian_pb2
+        """**Deprecated; always returns an empty list.** The kernel removed the
+        ADR-0049 D4 actions lane (ENG-1645): the action records it read are no longer
+        written since the owner decision of 2026-11-14 (ENG-1595), pending the redesign
+        of agent-experience memory. Like :meth:`recall_precedents`, this shim does NOT
+        call the kernel — a current kernel serves ``x-lane=actions`` from the fact lane,
+        which would hand the caller facts mislabelled as its own actions. Use
+        :meth:`recall` for facts.
 
-        req = cambrian_pb2.MemoryRequest(query=query, top_k=top_k)
-        md = self._identity_metadata() + [("x-lane", "actions")]
-        md = md + _lease_metadata(_lease_or_current(session_token_id))
-        resp = self._stub.QueryMemory(req, timeout=_secs(timeout_ms), metadata=md)
-        return [_result_dict(r) for r in resp.results]
+        Kept (it is published API surface) so existing callers keep working, and emits
+        a :class:`DeprecationWarning` on call. The arguments are accepted and ignored."""
+        warnings.warn(
+            "MemoryClient.recall_actions is deprecated: the kernel removed the actions "
+            "lane (ENG-1645). It returns [] without calling the kernel. Use recall() "
+            "for facts.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return []
 
     def recall_entity(self, kind_id: str, timeout_ms: int = 0,
                       session_token_id: str = "") -> List[dict]:

@@ -132,18 +132,19 @@ def test_recall_threads_session_id_for_d1_filter():
     assert md.get("x-agent-id") == "analyst"
 
 
-def test_recall_actions_routes_actions_lane():
-    """ADR-0049 D4: recall_actions is a separate intent — it sends x-lane=actions so
-    the kernel queries action records, not facts."""
+def test_recall_actions_is_a_deprecated_shim_that_never_calls_the_kernel():
+    """ENG-1645: the kernel removed the actions lane; recall_actions warns and returns
+    [] without a QueryMemory call (a current kernel would answer from the fact lane)."""
+    import warnings as _w
+
     stub = _FakeStub()
     mem = MemoryClient(stub=stub, agent_id="analyst")
-
-    mem.recall_actions("what did I write", session_token_id="sess-1")
-
-    md = dict(stub.calls["QueryMemory_metadata"] or [])
-    assert md.get("x-lane") == "actions"
-    assert md.get("x-agent-id") == "analyst"
-    assert md.get("x-session-id") == "sess-1"
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        got = mem.recall_actions("what did I write", session_token_id="sess-1")
+    assert got == []
+    assert any(issubclass(c.category, DeprecationWarning) for c in caught)
+    assert stub.calls.get("QueryMemory_metadata") is None
 
 
 def test_recall_does_not_send_actions_lane():
