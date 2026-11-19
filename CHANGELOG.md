@@ -5,21 +5,6 @@ described by their git history.
 
 ## Unreleased
 
-### Changed
-
-- **Vendored `cambrian_pb2` stubs match kernel contract 0111** (ENG-2143): additive. A large
-  `IngestMemory` is accepted at once and embedded in the background; the response gains
-  `document_id` and `status` (`IngestStatus`: state `accepted` | `embedding` | `searchable` |
-  `failed`, chunks embedded of total, error), and the new `GetIngestStatus` RPC reads a
-  document's progress (writer only) for a caller that needs read-your-writes. No SDK API
-  change: `remember()` returns the entity id as before.
-- **Vendored stubs match kernel contract 0112** (ENG-2170). `IngestMemoryRequest.labels`: the
-  writer's non-classification markers (a document revision's lifecycle `in-force` /
-  `superseded`, `rev<N>`, corpus and document ids), carried beside `tags`. The kernel stores
-  them on the document and every chunk, never treats them as classification (the write ceiling
-  never filters them), and reads `superseded` for the superseded-revision ranking. Additive;
-  no SDK API change.
-
 ## 0.1.8 (2026-11-18)
 
 Ships heartbeat liveness (ADR-0070 D3): a kernel-spawned daemon or pool worker that stays
@@ -29,10 +14,27 @@ nothing changes. Also fixes the skill menu breaking the prompt cache across chat
 (ENG-126), a pool worker whose class declares a different `agent_id` being refused by the
 kernel (ENG-2129), and a worker's gateway failure reaching the kernel as an opaque INTERNAL
 instead of the gateway's status code (ENG-2125); and the reasoning loop now recovers once
-from a context overflow by shrinking the newest oversized tool result (ENG-2128). The vendored
-`cambrian_pb2` stubs match kernel contract 0110 (ENG-2147).
+from a context overflow by shrinking the newest oversized tool result (ENG-2128). With a kernel
+at contract 0111+, `remember()` reports the ingest status of what it stored and
+`wait_until_searchable()` waits out a large document's background embedding (ENG-2143,
+ENG-2176). The vendored `cambrian_pb2` stubs match kernel contract 0112 (ENG-2147, ENG-2143,
+ENG-2170).
 
 ### Added
+
+- **`remember()` reports the ingest status; `wait_until_searchable()`** (ENG-2176, contract
+  0111, ENG-2143). A large document (at least the kernel's
+  `execution.ingestion.background_embed_min_chunks`, default 256 chunks) is accepted at once
+  and embedded in the background. `remember()` now returns a `RememberResult`: it IS the
+  source-doc entity id `str` it returned before (existing callers are unchanged), with
+  `.document_id` and `.status` (`IngestStatus`: `state` accepted | embedding | searchable |
+  failed, `chunks_embedded` of `chunks_total`, `error`); against an older kernel both are
+  empty. New `MemoryClient.ingest_status(document_id)` (`GetIngestStatus`; writer only, an
+  unknown or foreign id raises `IngestStatusNotFound`) and
+  `MemoryClient.wait_until_searchable(document_id_or_result, timeout=120, poll_interval=0.5)`,
+  which polls until searchable, raises `IngestFailedError` on failed and `TimeoutError`
+  (with `.status`) when the timeout passes. Exported: `IngestStatus`, `RememberResult`,
+  `IngestFailedError`, `IngestStatusNotFound`, `INGEST_STATES`.
 
 - **Heartbeat liveness** (ENG-1348, ADR-0070 D3). New `cambrian_agent_sdk.liveness`. When the
   kernel launches a long-lived process with `--heartbeat-interval-ms N`, the SDK sends a
@@ -65,10 +67,18 @@ from a context overflow by shrinking the newest oversized tool result (ENG-2128)
   context-window check. len/4 under-counted base64 2-3x, so compaction could report a prompt
   under budget that overflowed the model's window. Ordinary text is unchanged.
 
-- **Re-vendored `cambrian_pb2` for kernel contract 0110** (ENG-2147, ENG-2154): the
-  agent-plane `ErasureSelector.memory_note_ids` (name entries of the run principal's own memory
-  notes) and `ErasureReceipt.redacted_messages` (the chat replies an erase redacted). Additive;
-  no SDK API changes.
+- **Re-vendored `cambrian_pb2` for kernel contracts 0110-0112**, all additive:
+  - 0110 (ENG-2147, ENG-2154): the agent-plane `ErasureSelector.memory_note_ids` (name entries
+    of the run principal's own memory notes) and `ErasureReceipt.redacted_messages` (the chat
+    replies an erase redacted).
+  - 0111 (ENG-2143): background embedding of large ingests — `IngestMemoryResponse.document_id`
+    and `status` (`IngestStatus`) and the `GetIngestStatus` RPC (surfaced by the ENG-2176
+    helpers above).
+  - 0112 (ENG-2170): `IngestMemoryRequest.labels`, the writer's non-classification markers (a
+    document revision's lifecycle `in-force` / `superseded`, `rev<N>`, corpus and document
+    ids), carried beside `tags`; the kernel stores them on the document and every chunk, never
+    treats them as classification, and reads `superseded` for the superseded-revision ranking.
+    No SDK API change.
 
 ### Fixed
 

@@ -14,8 +14,10 @@ Error surfaces: a coined hint → :class:`InvalidTagError`; a scope-denied read 
 
 from __future__ import annotations
 
+import time
 import warnings
 from contextlib import contextmanager
+from dataclasses import dataclass
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Sequence, Tuple
@@ -93,6 +95,81 @@ class ArtifactNotFound(Exception):
 
 class SelfDelegationError(Exception):
     """An agent attempted to delegate a task back to itself (recursion guard)."""
+
+
+#: The ingest states the kernel reports (contract 0111, ENG-2143).
+INGEST_STATES = ("accepted", "embedding", "searchable", "failed")
+
+
+@dataclass(frozen=True)
+class IngestStatus:
+    """Where an ingested document stands (contract 0111, ENG-2143).
+
+    A large document (at least the kernel's
+    ``execution.ingestion.background_embed_min_chunks`` chunks, default 256) is
+    ACCEPTED at once and embedded in the background: ``accepted`` →
+    ``embedding`` (``chunks_embedded`` of ``chunks_total``) → ``searchable``, or
+    ``failed`` with ``error``. A smaller document is ``searchable`` when
+    ``remember()`` returns."""
+
+    document_id: str
+    state: str
+    chunks_total: int = 0
+    chunks_embedded: int = 0
+    error: str = ""
+
+    @property
+    def searchable(self) -> bool:
+        return self.state == "searchable"
+
+    @property
+    def failed(self) -> bool:
+        return self.state == "failed"
+
+    @property
+    def terminal(self) -> bool:
+        """True when the state no longer changes on its own."""
+        return self.searchable or self.failed
+
+    @classmethod
+    def _from_pb(cls, st) -> "IngestStatus":
+        return cls(document_id=st.document_id, state=st.state, chunks_total=st.chunks_total,
+                   chunks_embedded=st.chunks_embedded, error=st.error)
+
+
+class RememberResult(str):
+    """What ``remember()`` returns: the source-doc entity id, as before (it IS that
+    ``str``, so existing callers keep working), plus the stored document's
+    ``document_id`` and its ingest ``status`` (:class:`IngestStatus`). Against a
+    kernel older than contract 0111 ``document_id`` is ``""`` and ``status`` is
+    ``None``."""
+
+    document_id: str
+    status: Optional[IngestStatus]
+
+    def __new__(cls, doc_id: str, document_id: str = "", status: Optional[IngestStatus] = None):
+        obj = super().__new__(cls, doc_id)
+        obj.document_id = document_id
+        obj.status = status
+        return obj
+
+    @property
+    def doc_id(self) -> str:
+        return str(self)
+
+
+class IngestFailedError(Exception):
+    """The kernel gave up embedding the document (state ``failed``); ``status``
+    carries the reason in ``status.error``."""
+
+    def __init__(self, status: IngestStatus) -> None:
+        super().__init__(f"ingest of {status.document_id} failed: {status.error or 'no reason given'}")
+        self.status = status
+
+
+class IngestStatusNotFound(LookupError):
+    """No document of this agent carries the id (the kernel answers NOT_FOUND for an
+    unknown id and for another writer's document alike)."""
 
 
 def _lease_metadata(lease_id: str) -> list:
@@ -287,7 +364,7 @@ class MemoryClient:
         source_kind: str = "",
         title: str = "",
         author: str = "",
-    ) -> str:
+    ) -> "RememberResult":
         """Persist a synthesized insight. ``hint`` is a **narrow-only** classification
         hint (never authoritative tags); the kernel derives the real classification.
         Returns the new doc ID. A coined hint raises :class:`InvalidTagError`.
@@ -322,7 +399,13 @@ class MemoryClient:
 
         The kernel trims each value, cuts it to a configured length, and rejects one
         containing a control character (raised as :class:`InvalidTagError`, the SDK's
-        INVALID_ARGUMENT mapping)."""
+        INVALID_ARGUMENT mapping).
+
+        Returns a :class:`RememberResult`: the source-doc entity id (a ``str``, as
+        before) with ``.document_id`` and ``.status`` (:class:`IngestStatus`). A large
+        document comes back ``accepted`` and is embedded in the background; a caller
+        that must read its own write waits with :meth:`wait_until_searchable`
+        (contract 0111, ENG-2143)."""
         from ._proto import cambrian_pb2
 
         _check_precision(time_precision)
@@ -355,7 +438,54 @@ class MemoryClient:
             if _is_invalid_argument(exc):
                 raise InvalidTagError(str(exc)) from exc
             raise
-        return resp.doc_id
+        status = IngestStatus._from_pb(resp.status) if resp.HasField("status") else None
+        return RememberResult(resp.doc_id, document_id=resp.document_id, status=status)
+
+    def ingest_status(self, document_id) -> IngestStatus:
+        """Read where an ingested document stands (``GetIngestStatus``, contract 0111).
+        ``document_id`` is :attr:`RememberResult.document_id` (a :class:`RememberResult`
+        itself is accepted). Only the document's writer may read it: another agent's
+        document, like an unknown id, raises :class:`IngestStatusNotFound`."""
+        from ._proto import cambrian_pb2
+
+        doc = _ingest_document_id(document_id)
+        try:
+            st = self._stub.GetIngestStatus(cambrian_pb2.GetIngestStatusRequest(document_id=doc),
+                                            metadata=self._identity_metadata())
+        except Exception as exc:
+            if _is_not_found(exc):
+                raise IngestStatusNotFound(doc) from exc
+            raise
+        return IngestStatus._from_pb(st)
+
+    def wait_until_searchable(self, document_id, timeout: float = 120.0,
+                              poll_interval: float = 0.5) -> IngestStatus:
+        """Block until the document is searchable — read-your-writes after a large
+        ``remember()`` that came back ``accepted`` (contract 0111, ENG-2143).
+
+        Polls :meth:`ingest_status` every ``poll_interval`` seconds. Returns the
+        searchable status at once for a document that already is (every small
+        ingest). Raises :class:`IngestFailedError` when the kernel reports
+        ``failed``, :class:`TimeoutError` (carrying the last status) when ``timeout``
+        seconds pass first, and :class:`IngestStatusNotFound` for an unknown id."""
+        doc = _ingest_document_id(document_id)
+        if timeout <= 0:
+            raise ValueError("timeout must be > 0 seconds")
+        deadline = _monotonic() + timeout
+        while True:
+            st = self.ingest_status(doc)
+            if st.searchable:
+                return st
+            if st.failed:
+                raise IngestFailedError(st)
+            left = deadline - _monotonic()
+            if left <= 0:
+                err = TimeoutError(
+                    f"{doc} not searchable after {timeout:g}s: {st.state} "
+                    f"({st.chunks_embedded}/{st.chunks_total} chunks embedded)")
+                err.status = st  # type: ignore[attr-defined]
+                raise err
+            _sleep(min(max(poll_interval, 0.01), left))
 
     def _identity_metadata(self):
         """gRPC metadata carrying the agent principal. The server derives the
@@ -455,3 +585,28 @@ class WorkingMemory:
 
 def _secs(timeout_ms: int):
     return (timeout_ms / 1000.0) if timeout_ms and timeout_ms > 0 else None
+
+
+# Indirections so tests drive wait_until_searchable without real sleeps.
+_monotonic = time.monotonic
+_sleep = time.sleep
+
+
+def _ingest_document_id(document_id) -> str:
+    """The stored document id to read a status for: a RememberResult's document_id
+    (its str value is the entity id, never the document id) or the id itself."""
+    if isinstance(document_id, RememberResult):
+        doc = document_id.document_id
+        if not doc:
+            raise ValueError("this remember() result carries no document_id "
+                             "(the kernel predates contract 0111: no ingest status)")
+        return doc
+    if not document_id:
+        raise ValueError("document_id is required")
+    return str(document_id)
+
+
+def _is_not_found(exc) -> bool:
+    import grpc
+
+    return isinstance(exc, grpc.RpcError) and exc.code() == grpc.StatusCode.NOT_FOUND
