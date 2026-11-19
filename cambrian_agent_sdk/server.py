@@ -11,14 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
-import signal
 import sys
-from typing import TYPE_CHECKING
-
-import grpc
-
-if TYPE_CHECKING:  # annotation only; base imports this module at run time
-    from .base import DaemonAgent
 
 logger = logging.getLogger("cambrian.server")
 
@@ -117,113 +110,6 @@ def _parse_daemon_cli() -> tuple[str, str, dict]:
             except json.JSONDecodeError:
                 logger.warning("--daemon-params: invalid JSON, using empty dict")
     return stream_id, substrate_addr, params
-
-
-def start_daemon(agent: "DaemonAgent") -> None:
-    """Start the agent in daemon mode — opens a persistent SignalStream instead
-    of an AgentService gRPC server. ADR-0033.
-
-    The agent emits signals by calling ``agent.send_signal(payload, raw_text)``.
-    This function blocks until SIGTERM or max retries exhausted.
-    """
-    import time as _time
-
-    stream_id, substrate_addr, params = _parse_daemon_cli()
-    agent.stream_id = stream_id
-    agent.params = params
-
-    def _build_channel():
-        # ADR-0130 D4: credential + transport from the environment (channel.py).
-        from .channel import build_channel
-
-        return build_channel(
-            substrate_addr,
-            options=[
-                ("grpc.max_send_message_length", 50 * 1024 * 1024),
-                ("grpc.max_receive_message_length", 50 * 1024 * 1024),
-            ],
-            agent_id=agent.agent_id,
-        )
-
-    from ._proto import cambrian_pb2, cambrian_pb2_grpc
-
-    _shutdown = False
-
-    def _handle_sigterm(*_):
-        nonlocal _shutdown
-        logger.info("SIGTERM received — stopping daemon '%s'", agent.agent_id)
-        _shutdown = True
-
-    signal.signal(signal.SIGTERM, _handle_sigterm)
-    if sys.platform != "win32":
-        signal.signal(signal.SIGHUP, _handle_sigterm)
-
-    # Signal-queue for send_signal calls from the daemon loop.
-    import queue
-    _signal_queue: queue.Queue = queue.Queue()
-
-    def _send_signal(payload: dict, raw_text: str = "") -> None:
-        """Enqueue a signal for emission on the open SignalStream."""
-        _signal_queue.put((payload, raw_text))
-
-    # Rebinds the instance's send_signal to this stream's queue on purpose.
-    agent.send_signal = _send_signal  # type: ignore[method-assign]
-
-    max_retries = 5
-    retry = 0
-    backoff = 1.0
-
-    while not _shutdown and retry <= max_retries:
-        try:
-            channel = _build_channel()
-            stub = cambrian_pb2_grpc.OrchestratorStub(channel)
-            logger.info("Daemon '%s' opening SignalStream (stream_id=%s)", agent.agent_id, stream_id)
-
-            def _request_iter():
-                while not _shutdown:
-                    try:
-                        payload_dict, raw_text = _signal_queue.get(timeout=0.1)
-                        hs = cambrian_pb2.Handoff(
-                            from_agent=agent.agent_id,
-                            metadata={
-                                "_stream_id": stream_id,
-                                "_signal_type": stream_id,
-                            },
-                            payload=cambrian_pb2.Object(
-                                type="signal",
-                                data=json.dumps(payload_dict).encode(),
-                            ),
-                        )
-                        yield hs
-                    except queue.Empty:
-                        continue
-
-            # Call daemon_loop if the agent defines it (non-blocking thread).
-            if hasattr(agent, "daemon_loop"):
-                import threading
-                t = threading.Thread(target=agent.daemon_loop, daemon=True)
-                t.start()
-
-            for _response in stub.SignalStream(_request_iter()):
-                pass  # responses from Substrate (plan telemetry) are fire-and-forget
-
-            retry = 0
-            backoff = 1.0
-        except grpc.RpcError as exc:
-            if _shutdown:
-                break
-            logger.warning("SignalStream disconnected (%s) — retry %d/%d in %.1fs",
-                           exc.code(), retry, max_retries, backoff)
-            _time.sleep(backoff)
-            backoff = min(backoff * 2, 30.0)
-            retry += 1
-        finally:
-            try:
-                channel.close()
-            except Exception:
-                pass
-
-    logger.info("Daemon '%s' stopped", agent.agent_id)
 
 
 def _wire_health(server, agent_id: str) -> None:
