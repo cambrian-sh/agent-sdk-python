@@ -5,6 +5,21 @@ described by their git history.
 
 ## Unreleased
 
+## 0.1.8 (2026-11-18)
+
+Ships heartbeat liveness (ADR-0070 D3): a kernel-spawned daemon or pool worker that stays
+alive but can serve nobody is now detected and replaced by the kernel. Needs a kernel that
+passes `--heartbeat-interval-ms` (cambrian-core with ENG-1348); against an older kernel
+nothing changes. Also fixes the skill menu breaking the prompt cache across chat turns
+(ENG-126), a pool worker whose class declares a different `agent_id` being refused by the
+kernel (ENG-2129), and a worker's gateway failure reaching the kernel as an opaque INTERNAL
+instead of the gateway's status code (ENG-2125); and the reasoning loop now recovers once
+from a context overflow by shrinking the newest oversized tool result (ENG-2128). With a kernel
+at contract 0111+, `remember()` reports the ingest status of what it stored and
+`wait_until_searchable()` waits out a large document's background embedding (ENG-2143,
+ENG-2176). The vendored `cambrian_pb2` stubs match kernel contract 0112 (ENG-2147, ENG-2143,
+ENG-2170).
+
 ### Security
 
 - **Recalled memory and tool output reach the model inside the payload fence** (ENG-94,
@@ -21,21 +36,6 @@ described by their git history.
   under a per-process secret, so the history the loop re-sends every round stays
   byte-identical (the provider cache keeps its prefix). Prompts that quoted tool output
   or memory text verbatim now carry it JSON-encoded inside the fence.
-
-## 0.1.8 (2026-11-18)
-
-Ships heartbeat liveness (ADR-0070 D3): a kernel-spawned daemon or pool worker that stays
-alive but can serve nobody is now detected and replaced by the kernel. Needs a kernel that
-passes `--heartbeat-interval-ms` (cambrian-core with ENG-1348); against an older kernel
-nothing changes. Also fixes the skill menu breaking the prompt cache across chat turns
-(ENG-126), a pool worker whose class declares a different `agent_id` being refused by the
-kernel (ENG-2129), and a worker's gateway failure reaching the kernel as an opaque INTERNAL
-instead of the gateway's status code (ENG-2125); and the reasoning loop now recovers once
-from a context overflow by shrinking the newest oversized tool result (ENG-2128). With a kernel
-at contract 0111+, `remember()` reports the ingest status of what it stored and
-`wait_until_searchable()` waits out a large document's background embedding (ENG-2143,
-ENG-2176). The vendored `cambrian_pb2` stubs match kernel contract 0112 (ENG-2147, ENG-2143,
-ENG-2170).
 
 ### Added
 
