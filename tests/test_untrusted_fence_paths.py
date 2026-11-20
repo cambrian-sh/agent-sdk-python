@@ -128,7 +128,9 @@ def test_recalled_memory_fence_names_the_kernel_stamped_source_class():
 
 def test_fence_source_default_and_explicit():
     from cambrian_agent_sdk.payload_fence import SOURCE_CLASSES, default_source_class, fence_untrusted
-    head = lambda block: block.split(chr(10))[0]
+    def head(block):
+        return block.split(chr(10))[0]
+
     assert 'source="web"' in head(fence_untrusted("x", "tool_output"))
     assert 'source="tool"' in head(fence_untrusted("x", "tool_output", source="tool"))
     assert "source=" not in head(fence_untrusted("x", ""))
