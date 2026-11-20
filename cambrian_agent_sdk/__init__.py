@@ -1253,6 +1253,40 @@ class SubstrateClient:
                 "created": resp.created, "approval_id": resp.approval_id,
                 "approval_state": resp.approval_state}
 
+    def request_knowledge_commit(
+        self,
+        session_token_id: str,
+        candidate_id: str,
+        *,
+        reason: str = "",
+    ) -> Optional[Dict]:
+        """Ask for an EXISTING knowledge candidate to be committed
+        (Orchestrator/RequestKnowledgeCommit, contract 0115).
+
+        Raises the same ``knowledge_commit`` approval ``propose_knowledge(...,
+        request_commit=True)`` raises for a new proposal, for a candidate already
+        recorded (``candidate_id`` from an earlier proposal or a read). The kernel
+        takes who asks (this agent) and who it is for (the run's person) from the
+        lease, and refuses a candidate either of them cannot read exactly as an
+        unknown one. The approver becomes the committed value's asserter. Returns
+        ``{"accepted", "detail", "approval_id", "approval_state"}``; a refusal is
+        ``accepted=False`` with the reason. None when the kernel does not serve
+        knowledge proposals; an error dict for any other gRPC failure.
+        """
+        self._ensure()
+        from ._proto import cambrian_pb2
+
+        if not candidate_id:
+            return {"accepted": False, "detail": "request_knowledge_commit needs a candidate_id"}
+        req = cambrian_pb2.RequestKnowledgeCommitRequest(
+            lease_id=session_token_id, candidate_id=str(candidate_id), reason=reason or "")
+        try:
+            resp = self._stub.RequestKnowledgeCommit(req, metadata=self._lease_md(session_token_id))
+        except Exception as exc:  # noqa: BLE001 — a refusal is data for the loop
+            return self._rpc_failure(exc)
+        return {"accepted": resp.accepted, "detail": resp.detail,
+                "approval_id": resp.approval_id, "approval_state": resp.approval_state}
+
     def propose_ontology_change(
         self,
         session_token_id: str,

@@ -5,6 +5,15 @@ described by their git history.
 
 ## Unreleased
 
+### Added
+
+- **`SubstrateClient.request_knowledge_commit(lease, candidate_id, reason=)`** (ENG-1768,
+  kernel contract 0115): asks for an EXISTING knowledge candidate to be committed
+  (Orchestrator/RequestKnowledgeCommit) — the `knowledge_commit` approval
+  `propose_knowledge(request_commit=True)` raises for a new proposal. The kernel resolves
+  who asks and for whom from the lease and refuses a candidate either cannot read; the
+  vendored `_proto` stubs are regenerated.
+
 ### Deprecated
 
 - **`MemoryClient.recall_actions` returns `[]` without calling the kernel** (ENG-1645).

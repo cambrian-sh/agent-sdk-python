@@ -174,6 +174,11 @@ class OrchestratorStub:
                 request_serializer=cambrian__pb2.ProposeKnowledgeRequest.SerializeToString,
                 response_deserializer=cambrian__pb2.ProposeKnowledgeResponse.FromString,
                 _registered_method=True)
+        self.RequestKnowledgeCommit = channel.unary_unary(
+                '/cambrian.Orchestrator/RequestKnowledgeCommit',
+                request_serializer=cambrian__pb2.RequestKnowledgeCommitRequest.SerializeToString,
+                response_deserializer=cambrian__pb2.RequestKnowledgeCommitResponse.FromString,
+                _registered_method=True)
         self.ProposeOntologyChange = channel.unary_unary(
                 '/cambrian.Orchestrator/ProposeOntologyChange',
                 request_serializer=cambrian__pb2.ProposeOntologyChangeRequest.SerializeToString,
@@ -290,8 +295,9 @@ class OrchestratorServicer:
         raise NotImplementedError('Method not implemented!')
 
     def GetArtifact(self, request, context):
-        """Get an artifact by content hash; returns empty when the caller's effective
-        scope does not permit the artifact's tags (fail-closed).
+        """Get an artifact by its reference (the run-ledger id UploadArtifact returned,
+        ADR-0157 S4); returns empty when the caller's effective scope does not
+        permit the artifact's tags (fail-closed).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -498,6 +504,23 @@ class OrchestratorServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def RequestKnowledgeCommit(self, request, context):
+        """Ask for an EXISTING candidate to be committed (ENG-1768; contract 0115, additive):
+        the knowledge_commit approval ProposeKnowledge's request_commit raises for a new
+        proposal, for a candidate that is already recorded — so an app or agent acting for
+        a person can bring a candidate to that person (or the approver the policy routes
+        to) for confirmation. The requester is the calling agent and the commit is for the
+        lease's run principal (both resolved from the lease, never request fields), and
+        the candidate must be readable by BOTH under their own read scope; an unreadable
+        candidate answers exactly like an unknown one. The approver becomes the committed
+        item's asserter. Same grant as ProposeKnowledge (verb propose_knowledge). A
+        refusal is an OK response with accepted=false and a detail; UNIMPLEMENTED when the
+        kernel has no knowledge bridge.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def ProposeOntologyChange(self, request, context):
         """Ontology drafts (ADR-0149 D2; T-20261113-agent-drafted-ontology-changes-have-no-approval;
         additive within contract 0101). An agent DRAFTS a change to a namespace's kind and
@@ -689,6 +712,11 @@ def add_OrchestratorServicer_to_server(servicer, server):
                     servicer.ProposeKnowledge,
                     request_deserializer=cambrian__pb2.ProposeKnowledgeRequest.FromString,
                     response_serializer=cambrian__pb2.ProposeKnowledgeResponse.SerializeToString,
+            ),
+            'RequestKnowledgeCommit': grpc.unary_unary_rpc_method_handler(
+                    servicer.RequestKnowledgeCommit,
+                    request_deserializer=cambrian__pb2.RequestKnowledgeCommitRequest.FromString,
+                    response_serializer=cambrian__pb2.RequestKnowledgeCommitResponse.SerializeToString,
             ),
             'ProposeOntologyChange': grpc.unary_unary_rpc_method_handler(
                     servicer.ProposeOntologyChange,
@@ -1467,6 +1495,33 @@ class Orchestrator:
             '/cambrian.Orchestrator/ProposeKnowledge',
             cambrian__pb2.ProposeKnowledgeRequest.SerializeToString,
             cambrian__pb2.ProposeKnowledgeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RequestKnowledgeCommit(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cambrian.Orchestrator/RequestKnowledgeCommit',
+            cambrian__pb2.RequestKnowledgeCommitRequest.SerializeToString,
+            cambrian__pb2.RequestKnowledgeCommitResponse.FromString,
             options,
             channel_credentials,
             insecure,

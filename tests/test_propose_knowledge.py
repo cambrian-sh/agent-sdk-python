@@ -30,6 +30,12 @@ class _Stub:
     def __init__(self, reply=None, raise_code=None):
         self.reply, self.raise_code, self.calls = reply, raise_code, []
 
+    def RequestKnowledgeCommit(self, req, metadata=None):
+        self.calls.append((req, dict(metadata or [])))
+        if self.raise_code is not None:
+            raise _RpcError(self.raise_code)
+        return self.reply
+
     def ProposeKnowledge(self, req, metadata=None):
         self.calls.append((req, dict(metadata or [])))
         if self.raise_code is not None:
@@ -124,3 +130,28 @@ def test_a_refusal_reaches_the_model_as_data():
     assert lease == "lease" and kw["request_commit"] is True and kw["link"] is None
     assert kw["item"]["values"][0]["value"] == "closed"
     assert "verb='propose_knowledge'" in obs and "is not declared" in obs
+
+
+def test_request_knowledge_commit_maps_the_candidate_and_carries_no_actor():
+    stub = _Stub(cambrian_pb2.RequestKnowledgeCommitResponse(
+        accepted=True, approval_id="ap9", approval_state="pending"))
+    res = SubstrateClient(stub=stub, agent_id="w").request_knowledge_commit("lease-1", "ki_7", reason="confirm")
+    req, md = stub.calls[0]
+    assert req.lease_id == "lease-1" and md["x-lease-id"] == "lease-1"
+    assert req.candidate_id == "ki_7" and req.reason == "confirm"
+    # Nothing in the request could name who asks or for whom: the kernel takes both from the lease.
+    names = {f.name for f in cambrian_pb2.RequestKnowledgeCommitRequest.DESCRIPTOR.fields}
+    assert names == {"lease_id", "candidate_id", "reason"}
+    assert res == {"accepted": True, "detail": "", "approval_id": "ap9", "approval_state": "pending"}
+
+
+def test_request_knowledge_commit_refusal_unimplemented_and_missing_candidate():
+    stub = _Stub(cambrian_pb2.RequestKnowledgeCommitResponse(
+        accepted=False, detail='candidate "ki_x" is unknown or not readable by agent:w'))
+    res = SubstrateClient(stub=stub).request_knowledge_commit("l", "ki_x")
+    assert res["accepted"] is False and "not readable" in res["detail"]
+    assert SubstrateClient(stub=_Stub(raise_code=grpc.StatusCode.UNIMPLEMENTED)).request_knowledge_commit("l", "ki") is None
+    err = SubstrateClient(stub=_Stub(raise_code=grpc.StatusCode.PERMISSION_DENIED)).request_knowledge_commit("l", "ki")
+    assert err["code"] == "PERMISSION_DENIED"
+    empty = _Stub()
+    assert SubstrateClient(stub=empty).request_knowledge_commit("l", "")["accepted"] is False and empty.calls == []
